@@ -89,6 +89,14 @@ def _grad_norm_by_loss(losses, model):
     return norms
 
 
+def _update_meter(meters, key, value, batch_size):
+    if key not in meters:
+        meters[key] = AverageMeter()
+    if torch.is_tensor(value):
+        value = value.detach().item()
+    meters[key].update(value, batch_size)
+
+
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
              scheduler, checkpointer):
 
@@ -105,11 +113,6 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
 
     meters = {
         "loss": AverageMeter(),
-        "supid_loss": AverageMeter(),
-        "cotrl_loss": AverageMeter(),
-        "cid_loss": AverageMeter(),
-        "proto_id_loss": AverageMeter(),
-        "proto_rank_loss": AverageMeter(),
     }
 
     tb_writer = SummaryWriter(log_dir=args.output_dir)
@@ -145,18 +148,13 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             grad_loss_components = {k: v for k, v in loss_components.items() if v.requires_grad}
             total_loss = sum(loss_components.values())
             batch_size = batch['images'].shape[0]
-            meters['loss'].update(total_loss.item(), batch_size)
-            meters['supid_loss'].update(ret.get('supid_loss', 0), batch_size)
-            meters['cotrl_loss'].update(ret.get('cotrl_loss', 0), batch_size)
-            meters['cid_loss'].update(ret.get('cid_loss', 0), batch_size)
-            meters['proto_id_loss'].update(ret.get('proto_id_loss', 0), batch_size)
-            meters['proto_rank_loss'].update(ret.get('proto_rank_loss', 0), batch_size)
+            _update_meter(meters, 'loss', total_loss, batch_size)
+            for loss_key, loss_value in loss_components.items():
+                _update_meter(meters, loss_key, loss_value, batch_size)
             if (n_iter + 1) % log_period == 0:
                 grad_norms = _grad_norm_by_loss(grad_loss_components, model)
                 for grad_key, grad_norm in grad_norms.items():
-                    if grad_key not in meters:
-                        meters[grad_key] = AverageMeter()
-                    meters[grad_key].update(grad_norm, batch_size)
+                    _update_meter(meters, grad_key, grad_norm, batch_size)
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
@@ -165,7 +163,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 info_str = f"Epoch[{epoch}] Iteration[{n_iter + 1}/{len(train_loader)}]"
                 # log loss and acc info
                 for k, v in meters.items():
-                    if v.avg > 0:
+                    if v.count > 0:
                         info_str += f", {k}: {v.avg:.4f}"
                 info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
                 logger.info(info_str)
@@ -173,7 +171,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         tb_writer.add_scalar('lr', scheduler.get_lr()[0], epoch)
         tb_writer.add_scalar('temperature', ret['temperature'], epoch)
         for k, v in meters.items():
-            if v.avg > 0:
+            if v.count > 0:
                 tb_writer.add_scalar(k, v.avg, epoch)
 
         scheduler.step()
