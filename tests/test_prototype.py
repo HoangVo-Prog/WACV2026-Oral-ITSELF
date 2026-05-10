@@ -96,6 +96,8 @@ def test_branch_forward_and_score_shapes():
         prototype_tau=0.05,
         prototype_hard_k=1,
         prototype_margin=0.2,
+        use_loss_id=True,
+        use_loss_rank=True,
     )
     branch = PrototypeBranch(args, num_classes=2, feature_dim=4)
     image_features = torch.randn(4, 4)
@@ -109,10 +111,14 @@ def test_branch_forward_and_score_shapes():
     image_projected, text_projected = branch.project_for_memory(image_features, text_features)
     branch.initialize_projected(image_projected, text_projected, pids)
     warm_ret = branch(image_features, text_features, pids)
+    id_only_ret = branch(image_features, text_features, pids, use_loss_id=True, use_loss_rank=False)
+    rank_only_ret = branch(image_features, text_features, pids, use_loss_id=False, use_loss_rank=True)
     scores = branch.score(text_features, image_features)
 
     assert torch.isfinite(warm_ret["proto_id_loss"])
     assert torch.isfinite(warm_ret["proto_rank_loss"])
+    assert list(id_only_ret.keys()) == ["proto_id_loss"]
+    assert list(rank_only_ret.keys()) == ["proto_rank_loss"]
     assert scores.shape == (4, 4)
 
 

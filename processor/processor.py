@@ -18,6 +18,14 @@ def _prototype_ready(model):
     return branch is not None and branch.is_ready()
 
 
+def _prototype_requested(args):
+    return (
+        getattr(args, "prototype", False)
+        or getattr(args, "use_loss_id", False)
+        or getattr(args, "use_loss_rank", False)
+    )
+
+
 @torch.no_grad()
 def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     model_without_ddp = _unwrap_model(model)
@@ -52,6 +60,33 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     pids = torch.cat(pids, dim=0)
     branch.initialize_projected(image_features, text_features, pids)
     logger.info("Prototype banks initialized with {} samples".format(pids.numel()))
+
+
+def _loss_components(ret):
+    return {
+        key: value
+        for key, value in ret.items()
+        if "loss" in key and torch.is_tensor(value)
+    }
+
+
+def _grad_norm_by_loss(losses, model):
+    params = [p for p in _unwrap_model(model).parameters() if p.requires_grad]
+    norms = {}
+    if not params:
+        return norms
+
+    for name, loss in losses.items():
+        grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+        grad_sq_sum = loss.new_zeros(())
+        has_grad = False
+        for grad in grads:
+            if grad is None:
+                continue
+            has_grad = True
+            grad_sq_sum = grad_sq_sum + grad.detach().float().pow(2).sum()
+        norms[f"{name}_grad_norm"] = grad_sq_sum.sqrt().item() if has_grad else 0.0
+    return norms
 
 
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
@@ -91,7 +126,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         for meter in meters.values():
             meter.reset()
 
-        if getattr(args, "prototype", False) or "proto" in args.loss_names:
+        if _prototype_requested(args):
             if epoch > getattr(args, "prototype_warmup_epochs", 1) and not _prototype_ready(model):
                 maybe_initialize_prototypes(model, train_loader, args, device, logger)
 
@@ -106,7 +141,9 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 ret = model(batch, epoch, current_step=current_steps)
             else:
                 ret = model(batch, epoch)
-            total_loss = sum([v for k, v in ret.items() if "loss" in k])
+            loss_components = _loss_components(ret)
+            grad_loss_components = {k: v for k, v in loss_components.items() if v.requires_grad}
+            total_loss = sum(loss_components.values())
             batch_size = batch['images'].shape[0]
             meters['loss'].update(total_loss.item(), batch_size)
             meters['supid_loss'].update(ret.get('supid_loss', 0), batch_size)
@@ -114,6 +151,12 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             meters['cid_loss'].update(ret.get('cid_loss', 0), batch_size)
             meters['proto_id_loss'].update(ret.get('proto_id_loss', 0), batch_size)
             meters['proto_rank_loss'].update(ret.get('proto_rank_loss', 0), batch_size)
+            if (n_iter + 1) % log_period == 0:
+                grad_norms = _grad_norm_by_loss(grad_loss_components, model)
+                for grad_key, grad_norm in grad_norms.items():
+                    if grad_key not in meters:
+                        meters[grad_key] = AverageMeter()
+                    meters[grad_key].update(grad_norm, batch_size)
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()

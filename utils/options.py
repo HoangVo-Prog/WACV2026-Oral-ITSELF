@@ -31,6 +31,8 @@ def get_args():
 
     ######################## prototype settings ########################
     parser.add_argument("--prototype", default=False, action='store_true')
+    parser.add_argument("--use_loss_id", default=False, action='store_true')
+    parser.add_argument("--use_loss_rank", default=False, action='store_true')
     parser.add_argument("--prototype_feature", type=str, default="auto", choices=["auto", "local", "global"])
     parser.add_argument("--prototype_per_id", type=int, default=2)
     parser.add_argument("--prototype_dim", type=int, default=512)
