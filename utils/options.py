@@ -18,6 +18,8 @@ def get_args():
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
     parser.add_argument("--finetune", type=str, default="")
     parser.add_argument("--pretrain", type=str, default="") # unused
+    parser.add_argument("--nohup", default=False, action='store_true',
+                        help="redirect stdout/stderr to a timestamped .log file in output_dir")
 
 
     ######################## model general settings ########################

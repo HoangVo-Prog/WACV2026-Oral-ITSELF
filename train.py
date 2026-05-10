@@ -1,5 +1,6 @@
 import os
 import os.path as op
+import sys
 import torch
 import numpy as np
 import random
@@ -16,6 +17,19 @@ from utils.options import get_args
 from utils.comm import get_rank, synchronize
 import warnings
 warnings.filterwarnings("ignore")
+
+
+def enable_nohup_logging(log_dir, cur_time, rank=0):
+    if not op.exists(log_dir):
+        os.makedirs(log_dir)
+
+    log_name = f"{cur_time}.log" if rank == 0 else f"{cur_time}_rank{rank}.log"
+    log_path = op.join(log_dir, log_name)
+    log_file = open(log_path, "a", buffering=1)
+    sys.stdout = log_file
+    sys.stderr = log_file
+    return log_path, log_file
+
 
 def set_seed(seed=1):
     torch.manual_seed(seed)
@@ -42,7 +56,12 @@ if __name__ == '__main__':
     device = "cuda"
     cur_time = time.strftime("%Y%m%d_%H%M%S", time.localtime())
     args.output_dir = op.join(args.output_dir, args.dataset_name, f'{cur_time}_{name}_{args.loss_names}')
+    nohup_log_file = None
+    if args.nohup:
+        nohup_log_path, nohup_log_file = enable_nohup_logging(args.output_dir, cur_time, get_rank())
     logger = setup_logger('ITSELF', save_dir=args.output_dir, if_train=args.training, distributed_rank=get_rank())
+    if args.nohup:
+        logger.info(f"Nohup log file: {nohup_log_path}")
     logger.info("Using {} GPUs".format(num_gpus))
     logger.info(str(args).replace(',', '\n'))
     save_train_configs(args.output_dir, args)
