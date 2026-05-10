@@ -85,6 +85,26 @@ def test_prototype_score_prefers_positive_pairs():
     assert torch.isfinite(loss)
 
 
+def test_training_score_keeps_rank_loss_differentiable():
+    memory = PrototypeMemory(num_classes=2, prototypes_per_id=1, dim=2)
+    image_bank = F.normalize(torch.tensor([[1.0, 0.0], [0.0, 1.0]]), p=2, dim=1)
+    text_bank = image_bank.clone()
+    memory.image_prototypes.copy_(image_bank)
+    memory.text_prototypes.copy_(text_bank)
+    memory.text_to_image.copy_(image_bank)
+    memory.image_to_text.copy_(text_bank)
+    memory.initialized.fill_(True)
+
+    image_features = image_bank.clone().requires_grad_(True)
+    text_features = text_bank.clone().requires_grad_(True)
+    scores = memory.training_score_matrix(text_features, image_features)
+    loss = prototype_pair_ranking_loss(scores, torch.tensor([0, 1]), hard_k=1)
+    grads = torch.autograd.grad(loss, [image_features, text_features], allow_unused=True)
+
+    assert loss.requires_grad
+    assert all(grad is not None for grad in grads)
+
+
 def test_branch_forward_and_score_shapes():
     args = SimpleNamespace(
         only_global=True,
@@ -117,8 +137,39 @@ def test_branch_forward_and_score_shapes():
 
     assert torch.isfinite(warm_ret["proto_id_loss"])
     assert torch.isfinite(warm_ret["proto_rank_loss"])
+    assert warm_ret["proto_rank_loss"].requires_grad
     assert list(id_only_ret.keys()) == ["proto_id_loss"]
     assert list(rank_only_ret.keys()) == ["proto_rank_loss"]
+    assert scores.shape == (4, 4)
+
+
+def test_branch_score_accepts_cpu_features_when_module_is_cuda():
+    if not torch.cuda.is_available():
+        return
+
+    args = SimpleNamespace(
+        only_global=True,
+        prototype_feature="auto",
+        prototype_dim=3,
+        prototype_per_id=1,
+        prototype_momentum=0.2,
+        prototype_kmeans_iters=2,
+        prototype_tau=0.05,
+        prototype_hard_k=1,
+        prototype_margin=0.2,
+        use_loss_id=True,
+        use_loss_rank=True,
+    )
+    branch = PrototypeBranch(args, num_classes=2, feature_dim=4).cuda()
+    image_features = torch.randn(4, 4)
+    text_features = torch.randn(4, 4)
+    pids = torch.tensor([0, 0, 1, 1])
+
+    image_projected, text_projected = branch.project_for_memory(image_features.cuda(), text_features.cuda())
+    branch.initialize_projected(image_projected.cpu(), text_projected.cpu(), pids)
+    scores = branch.score(text_features.cpu(), image_features.cpu())
+
+    assert scores.is_cuda
     assert scores.shape == (4, 4)
 
 
@@ -127,4 +178,6 @@ if __name__ == "__main__":
     test_identity_assignment_stays_inside_identity_slots()
     test_pbt_empty_slots_fall_back_to_same_side_prototypes()
     test_prototype_score_prefers_positive_pairs()
+    test_training_score_keeps_rank_loss_differentiable()
     test_branch_forward_and_score_shapes()
+    test_branch_score_accepts_cpu_features_when_module_is_cuda()

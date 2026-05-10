@@ -140,3 +140,20 @@ class PrototypeMemory(nn.Module):
         visual_scores = F.normalize(visual_pbt, p=2, dim=1) @ F.normalize(visual_cluster, p=2, dim=1).t()
         text_scores = F.normalize(text_cluster, p=2, dim=1) @ F.normalize(text_pbt, p=2, dim=1).t()
         return visual_scores + text_scores
+
+    def training_score_matrix(self, text_features, image_features):
+        if not self.is_ready():
+            return text_features.new_zeros((text_features.shape[0], image_features.shape[0]))
+
+        text_features = F.normalize(text_features.float(), p=2, dim=1)
+        image_features = F.normalize(image_features.float(), p=2, dim=1)
+        with torch.no_grad():
+            text_idx = self.assign_global(text_features.detach(), self.text_prototypes)
+            image_idx = self.assign_global(image_features.detach(), self.image_prototypes)
+
+        visual_pbt = self.text_to_image.to(image_features.device).float()[text_idx]
+        text_pbt = self.image_to_text.to(text_features.device).float()[image_idx]
+
+        visual_scores = F.normalize(visual_pbt, p=2, dim=1) @ image_features.t()
+        text_scores = text_features @ F.normalize(text_pbt, p=2, dim=1).t()
+        return visual_scores + text_scores

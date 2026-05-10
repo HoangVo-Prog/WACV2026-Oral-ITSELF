@@ -77,6 +77,9 @@ def _grad_norm_by_loss(losses, model):
         return norms
 
     for name, loss in losses.items():
+        if not loss.requires_grad:
+            norms[f"{name}_grad_norm"] = 0.0
+            continue
         grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
         grad_sq_sum = loss.new_zeros(())
         has_grad = False
@@ -145,14 +148,13 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             else:
                 ret = model(batch, epoch)
             loss_components = _loss_components(ret)
-            grad_loss_components = {k: v for k, v in loss_components.items() if v.requires_grad}
             total_loss = sum(loss_components.values())
             batch_size = batch['images'].shape[0]
             _update_meter(meters, 'loss', total_loss, batch_size)
             for loss_key, loss_value in loss_components.items():
                 _update_meter(meters, loss_key, loss_value, batch_size)
             if (n_iter + 1) % log_period == 0:
-                grad_norms = _grad_norm_by_loss(grad_loss_components, model)
+                grad_norms = _grad_norm_by_loss(loss_components, model)
                 for grad_key, grad_norm in grad_norms.items():
                     _update_meter(meters, grad_key, grad_norm, batch_size)
             optimizer.zero_grad()

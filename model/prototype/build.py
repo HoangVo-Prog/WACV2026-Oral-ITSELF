@@ -37,8 +37,11 @@ class PrototypeBranch(nn.Module):
     def _project(self, image_features, text_features):
         self.image_projector.float()
         self.text_projector.float()
-        image_features = F.normalize(self.image_projector(image_features.float()), p=2, dim=1)
-        text_features = F.normalize(self.text_projector(text_features.float()), p=2, dim=1)
+        device = next(self.image_projector.parameters()).device
+        image_features = image_features.to(device=device, dtype=torch.float32, non_blocking=True)
+        text_features = text_features.to(device=device, dtype=torch.float32, non_blocking=True)
+        image_features = F.normalize(self.image_projector(image_features), p=2, dim=1)
+        text_features = F.normalize(self.text_projector(text_features), p=2, dim=1)
         return image_features, text_features
 
     @torch.no_grad()
@@ -83,7 +86,7 @@ class PrototypeBranch(nn.Module):
             )
 
         if use_loss_rank:
-            proto_scores = self.memory.prototype_score_matrix(text_features, image_features)
+            proto_scores = self.memory.training_score_matrix(text_features, image_features)
             host_scores = F.normalize(text_features, p=2, dim=1) @ F.normalize(image_features, p=2, dim=1).t()
             ret["proto_rank_loss"] = prototype_pair_ranking_loss(
                 proto_scores,
@@ -100,7 +103,9 @@ class PrototypeBranch(nn.Module):
     def score(self, text_features, image_features):
         was_training = self.training
         self.eval()
-        image_features, text_features = self._project(image_features, text_features)
-        scores = self.memory.prototype_score_matrix(text_features, image_features)
-        self.train(was_training)
+        try:
+            image_features, text_features = self._project(image_features, text_features)
+            scores = self.memory.prototype_score_matrix(text_features, image_features)
+        finally:
+            self.train(was_training)
         return scores
