@@ -17,6 +17,17 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 
 
+def _unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def _prototype_branch(model):
+    model = _unwrap_model(model)
+    branch = getattr(model, "prototype_branch", None)
+    if branch is None or not branch.is_ready():
+        return None
+    return branch
+
 
 def rank(similarity, q_pids, g_pids, max_rank=10, get_mAP=True):
     if get_mAP:
@@ -121,15 +132,24 @@ class Evaluator():
 
     def eval(self, model, i2t_metric=False):
         qfeats, gfeats, qids, gids = self._compute_embedding(model)
+        qfeats_raw, gfeats_raw = qfeats, gfeats
         qfeats = F.normalize(qfeats, p=2, dim=1) # text features
         gfeats = F.normalize(gfeats, p=2, dim=1) # image features
         sims_global = qfeats @ gfeats.t()
 
+        proto_sims = None
+        branch = _prototype_branch(model)
         if not self.args.only_global:
             vq_feats, vg_feats, _, _ = self._compute_embedding_grab(model)
+            vq_feats_raw, vg_feats_raw = vq_feats, vg_feats
             vq_feats = F.normalize(vq_feats, p=2, dim=1) # text features
             vg_feats = F.normalize(vg_feats, p=2, dim=1) # image features
             sims_grab = vq_feats@vg_feats.t()
+            if branch is not None and branch.use_local:
+                proto_sims = branch.score(vq_feats_raw, vg_feats_raw).cpu()
+
+        if branch is not None and proto_sims is None:
+            proto_sims = branch.score(qfeats_raw, gfeats_raw).cpu()
 
         if self.args.only_global:
             sims_dict = {
@@ -151,6 +171,13 @@ class Evaluator():
                 'global+grab(0.68)': 0.68 * sims_global + 0.32 * sims_grab, # alpha = 0.68
                 'global+grab(0.32)': 0.32 * sims_global + 0.68 * sims_grab # alpha = 0.32
             }
+
+        if proto_sims is not None:
+            weighted_proto = getattr(self.args, "prototype_score_weight", 0.1) * proto_sims
+            proto_rows = {}
+            for key, sims in sims_dict.items():
+                proto_rows[f'{key}+proto'] = sims + weighted_proto
+            sims_dict.update(proto_rows)
 
         table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP","rSum"])
 

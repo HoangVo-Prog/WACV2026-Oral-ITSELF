@@ -8,6 +8,51 @@ from utils.comm import get_rank, synchronize
 from torch.utils.tensorboard import SummaryWriter
 
 
+def _unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def _prototype_ready(model):
+    model = _unwrap_model(model)
+    branch = getattr(model, "prototype_branch", None)
+    return branch is not None and branch.is_ready()
+
+
+@torch.no_grad()
+def maybe_initialize_prototypes(model, train_loader, args, device, logger):
+    model_without_ddp = _unwrap_model(model)
+    branch = getattr(model_without_ddp, "prototype_branch", None)
+    if branch is None or branch.is_ready():
+        return
+
+    logger.info("Initializing identity-aware PBT prototypes from train embeddings")
+    was_training = model_without_ddp.training
+    model_without_ddp.eval()
+
+    dataset = getattr(train_loader, "dataset", None)
+    old_txt_aug = getattr(dataset, "txt_aug", None)
+    if old_txt_aug is not None:
+        dataset.txt_aug = False
+
+    image_features, text_features, pids = [], [], []
+    for batch in train_loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        image_feat, text_feat = model_without_ddp.extract_prototype_features(batch)
+        image_feat, text_feat = branch.project_for_memory(image_feat, text_feat)
+        image_features.append(image_feat.cpu())
+        text_features.append(text_feat.cpu())
+        pids.append(batch['pids'].cpu())
+
+    if old_txt_aug is not None:
+        dataset.txt_aug = old_txt_aug
+    model_without_ddp.train(was_training)
+
+    image_features = torch.cat(image_features, dim=0)
+    text_features = torch.cat(text_features, dim=0)
+    pids = torch.cat(pids, dim=0)
+    branch.initialize_projected(image_features, text_features, pids)
+    logger.info("Prototype banks initialized with {} samples".format(pids.numel()))
+
 
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
              scheduler, checkpointer):
@@ -28,6 +73,8 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         "supid_loss": AverageMeter(),
         "cotrl_loss": AverageMeter(),
         "cid_loss": AverageMeter(),
+        "proto_id_loss": AverageMeter(),
+        "proto_rank_loss": AverageMeter(),
     }
 
     tb_writer = SummaryWriter(log_dir=args.output_dir)
@@ -43,6 +90,10 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         start_time = time.time()
         for meter in meters.values():
             meter.reset()
+
+        if getattr(args, "prototype", False) or "proto" in args.loss_names:
+            if epoch > getattr(args, "prototype_warmup_epochs", 1) and not _prototype_ready(model):
+                maybe_initialize_prototypes(model, train_loader, args, device, logger)
 
         model.train()
         model.epoch = epoch
@@ -61,6 +112,8 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             meters['supid_loss'].update(ret.get('supid_loss', 0), batch_size)
             meters['cotrl_loss'].update(ret.get('cotrl_loss', 0), batch_size)
             meters['cid_loss'].update(ret.get('cid_loss', 0), batch_size)
+            meters['proto_id_loss'].update(ret.get('proto_id_loss', 0), batch_size)
+            meters['proto_rank_loss'].update(ret.get('proto_rank_loss', 0), batch_size)
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()

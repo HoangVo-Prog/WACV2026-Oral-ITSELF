@@ -17,7 +17,7 @@ def get_args():
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
     parser.add_argument("--finetune", type=str, default="")
-    parser.add_argument("--pretrain", type=str, default="")
+    parser.add_argument("--pretrain", type=str, default="") # unused
 
 
     ######################## model general settings ########################
@@ -28,6 +28,21 @@ def get_args():
     
     ######################## loss settings ########################
     parser.add_argument("--loss_names", default='tal+cid', help="which loss to use ['cid, tal']")
+
+    ######################## prototype settings ########################
+    parser.add_argument("--prototype", default=False, action='store_true')
+    parser.add_argument("--prototype_feature", type=str, default="auto", choices=["auto", "local", "global"])
+    parser.add_argument("--prototype_per_id", type=int, default=2)
+    parser.add_argument("--prototype_dim", type=int, default=512)
+    parser.add_argument("--prototype_kmeans_iters", type=int, default=20)
+    parser.add_argument("--prototype_warmup_epochs", type=int, default=1)
+    parser.add_argument("--prototype_tau", type=float, default=0.05)
+    parser.add_argument("--prototype_margin", type=float, default=0.2)
+    parser.add_argument("--prototype_hard_k", type=int, default=16)
+    parser.add_argument("--prototype_id_weight", type=float, default=0.2)
+    parser.add_argument("--prototype_rank_weight", type=float, default=0.5)
+    parser.add_argument("--prototype_score_weight", type=float, default=0.1)
+    parser.add_argument("--prototype_momentum", type=float, default=0.2)
 
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))

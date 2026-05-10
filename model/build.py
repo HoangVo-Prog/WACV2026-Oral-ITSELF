@@ -4,6 +4,7 @@ from .clip_model import Transformer, LayerNorm, build_CLIP_from_openai_pretraine
 import torch
 import torch.nn as nn
 from .grab import TexualEmbeddingLayer, VisualEmbeddingLayer
+from .prototype import PrototypeBranch
 from torch.cuda.amp import autocast
 
 
@@ -73,7 +74,11 @@ class ITSELF(nn.Module):
         self.embed_dim = base_cfg['embed_dim']
         self.grab_embed_dim = 4096
         self.args = args
-        if 'cid' in args.loss_names:
+        self.train_num_classes = num_classes
+        self.prototype_enabled = getattr(args, "prototype", False) or "proto" in self.current_task
+        prototype_feature = getattr(args, "prototype_feature", "auto")
+        use_proto_local = self.prototype_enabled and not args.only_global and prototype_feature in ("auto", "local")
+        if 'cid' in self.current_task:
             self.num_classes = num_classes + 1
             self.classifier_global = nn.Linear(self.embed_dim , self.num_classes)
             nn.init.normal_(self.classifier_global.weight.data, std=0.001)
@@ -92,6 +97,16 @@ class ITSELF(nn.Module):
                 nn.init.constant_(self.classifier_id_grab.bias.data, val=0.0)
                 self.visul_emb_layer = VisualEmbeddingLayer(ratio=args.select_ratio)
                 self.texual_emb_layer = TexualEmbeddingLayer(ratio=args.select_ratio)
+
+        if not args.only_global and not hasattr(self, "visul_emb_layer") and ('tal' in self.current_task or use_proto_local):
+            self.visul_emb_layer = VisualEmbeddingLayer(ratio=args.select_ratio)
+            self.texual_emb_layer = TexualEmbeddingLayer(ratio=args.select_ratio)
+
+        if self.prototype_enabled:
+            prototype_feature_dim = self.grab_embed_dim if use_proto_local else self.embed_dim
+            self.prototype_branch = PrototypeBranch(args, num_classes, prototype_feature_dim)
+        else:
+            self.prototype_branch = None
                 
         self.logit_scale = torch.ones([]) * (1 / args.temperature) 
   
@@ -168,21 +183,7 @@ class ITSELF(nn.Module):
 
         return result  # [B, N, N]
 
-    def forward(self, batch, epoch=None, current_step=None):
-        ret = dict()
-        device = "cuda"
-
-        if 'cid' in self.current_task:
-            self.mlp_global = self.mlp_global.float()
-            self.classifier_global = self.classifier_global.float()
-            if not self.args.only_global:
-                self.mlp_grab = self.mlp_grab.float()
-                self.classifier_grab = self.classifier_grab.float()
-        
-        ret.update({'temperature': 1 / self.logit_scale})
-        images = batch['images']
-        caption_ids = batch['caption_ids']
-        
+    def _compute_host_embeddings(self, images, caption_ids, current_step=None):
         if self.args.return_all:
             image_feats, atten_i, text_feats, atten_t = self.base_model(images, caption_ids, return_all=True, average_attn_weights = self.args.average_attn_weights)
             i_feats = image_feats[:, 0, :].float()
@@ -191,7 +192,7 @@ class ITSELF(nn.Module):
                 atten_i = torch.stack(atten_i, dim=0)
                 atten_t = torch.stack(atten_t, dim=0)
                 atten_i = atten_i.mean(0)
-                atten_t = atten_t.mean(0) 
+                atten_t = atten_t.mean(0)
                 if current_step is not None:
                     i_grab_f = self.visul_emb_layer(image_feats, atten_i, current_step)
                     t_grab_f = self.texual_emb_layer(text_feats, caption_ids, atten_t, current_step)
@@ -210,7 +211,6 @@ class ITSELF(nn.Module):
                     i_grab_f = self.visul_emb_layer(image_feats, atten_i)
                     t_grab_f = self.texual_emb_layer(text_feats, caption_ids, atten_t)
             elif self.args.topk_type == 'layer_index' and self.args.layer_index is not None:
-                # layer_index from 0 to 11 (12 layers)
                 atten_i = atten_i[self.args.layer_index]
                 atten_t = atten_t[self.args.layer_index]
                 if current_step is not None:
@@ -220,9 +220,8 @@ class ITSELF(nn.Module):
                     i_grab_f = self.visul_emb_layer(image_feats, atten_i)
                     t_grab_f = self.texual_emb_layer(text_feats, caption_ids, atten_t)
             elif self.args.topk_type == 'custom':
-                atten_i = torch.stack(atten_i, dim=0)  # [L, B, N, N]
-                atten_t = torch.stack(atten_t, dim=0)  # [L, B, N, N]
-
+                atten_i = torch.stack(atten_i, dim=0)
+                atten_t = torch.stack(atten_t, dim=0)
                 atten_i = self.rollout(atten_i)
                 atten_t = self.rollout(atten_t)
                 if not self.args.only_global:
@@ -232,14 +231,53 @@ class ITSELF(nn.Module):
                     else:
                         i_grab_f = self.visul_emb_layer(image_feats, atten_i)
                         t_grab_f = self.texual_emb_layer(text_feats, caption_ids, atten_t)
+            else:
+                if not self.args.only_global:
+                    i_grab_f = self.visul_emb_layer(image_feats, atten_i)
+                    t_grab_f = self.texual_emb_layer(text_feats, caption_ids, atten_t)
         else:
             image_feats, atten_i, text_feats, atten_t = self.base_model(images, caption_ids)
             i_feats = image_feats[:, 0, :].float()
-            # i_feats = image_feats.float() # for CLIP ResNet visual model
             t_feats = text_feats[torch.arange(text_feats.shape[0]), caption_ids.argmax(dim=-1)].float()
             if not self.args.only_global:
                 i_grab_f = self.visul_emb_layer(image_feats, atten_i)
                 t_grab_f = self.texual_emb_layer(text_feats, caption_ids, atten_t)
+
+        features = {"i_feats": i_feats, "t_feats": t_feats}
+        if not self.args.only_global:
+            features.update({"i_grab_f": i_grab_f.float(), "t_grab_f": t_grab_f.float()})
+        return features
+
+    def _select_prototype_features(self, features):
+        if self.prototype_branch is not None and self.prototype_branch.use_local and not self.args.only_global:
+            return features["i_grab_f"], features["t_grab_f"]
+        return features["i_feats"], features["t_feats"]
+
+    @torch.no_grad()
+    def extract_prototype_features(self, batch, current_step=None):
+        features = self._compute_host_embeddings(batch['images'], batch['caption_ids'], current_step=current_step)
+        return self._select_prototype_features(features)
+
+    def forward(self, batch, epoch=None, current_step=None):
+        ret = dict()
+        device = "cuda"
+
+        if 'cid' in self.current_task:
+            self.mlp_global = self.mlp_global.float()
+            self.classifier_global = self.classifier_global.float()
+            if not self.args.only_global:
+                self.mlp_grab = self.mlp_grab.float()
+                self.classifier_grab = self.classifier_grab.float()
+        
+        ret.update({'temperature': 1 / self.logit_scale})
+        images = batch['images']
+        caption_ids = batch['caption_ids']
+        features = self._compute_host_embeddings(images, caption_ids, current_step=current_step)
+        i_feats = features["i_feats"]
+        t_feats = features["t_feats"]
+        if not self.args.only_global:
+            i_grab_f = features["i_grab_f"]
+            t_grab_f = features["t_grab_f"]
 
         if 'cid' in self.current_task:
             S = objectives.cosine_similarity_matrix(i_feats, t_feats)
@@ -290,6 +328,14 @@ class ITSELF(nn.Module):
                 ret.update({'tal_loss': TAL_global_loss + TAL_grab_loss}) 
             else:
                 ret.update({'tal_loss': TAL_global_loss})
+
+        if self.prototype_enabled and self.prototype_branch is not None:
+            proto_image_feats, proto_text_feats = self._select_prototype_features(features)
+            proto_ret = self.prototype_branch(proto_image_feats, proto_text_feats, batch['pids'])
+            ret.update({
+                'proto_id_loss': proto_ret['proto_id_loss'] * getattr(self.args, "prototype_id_weight", 0.2),
+                'proto_rank_loss': proto_ret['proto_rank_loss'] * getattr(self.args, "prototype_rank_weight", 0.5),
+            })
 
         return ret
 

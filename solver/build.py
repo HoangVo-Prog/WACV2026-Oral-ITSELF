@@ -22,6 +22,8 @@ def build_optimizer(args, model):
             weight_decay = args.weight_decay_bias
         if "classifier" in key or "mlm_head" in key:
             lr = args.lr * args.lr_factor
+        if "prototype_branch" in key:
+            lr = args.lr * args.lr_factor
 
         if "visul_emb_layer" in key:
             lr =  0.001
