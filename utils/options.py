@@ -11,6 +11,8 @@ def get_args():
     parser.add_argument("--local_rank", default=0, type=int)
     parser.add_argument("--output_dir", default="run_logs")
     parser.add_argument("--name", default="ITSELF", help="experiment name to save")
+    parser.add_argument("--run_time", default="",
+                        help="timestamp used in run output paths; defaults to current time")
     parser.add_argument("--log_period", default=20)
     parser.add_argument("--eval_period", default=1)
     parser.add_argument("--val_dataset", default="test") # use val set when evaluate, if test use test set
