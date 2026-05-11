@@ -70,6 +70,13 @@ def get_metrics(similarity, qids, gids, n_, retur_indices=False):
         return [n_, t2i_cmc[0], t2i_cmc[4], t2i_cmc[9], t2i_mAP, t2i_mINP, t2i_cmc[0]+ t2i_cmc[4]+ t2i_cmc[9]]
 
 
+def _prototype_score_weights(args):
+    weights = getattr(args, "prototype_score_weights", None)
+    if weights is None:
+        weights = [getattr(args, "prototype_score_weight", 0.1)]
+    return [float(weight) for weight in weights]
+
+
 class Evaluator():
     def __init__(self, img_loader, txt_loader, args):
         self.img_loader = img_loader # gallery
@@ -173,10 +180,14 @@ class Evaluator():
             }
 
         if proto_sims is not None:
-            weighted_proto = getattr(self.args, "prototype_score_weight", 0.1) * proto_sims
             proto_rows = {}
-            for key, sims in sims_dict.items():
-                proto_rows[f'{key}+proto'] = sims + weighted_proto
+            proto_weights = _prototype_score_weights(self.args)
+            single_default_weight = len(proto_weights) == 1 and getattr(self.args, "prototype_score_weights", None) is None
+            for weight in proto_weights:
+                weighted_proto = weight * proto_sims
+                for key, sims in sims_dict.items():
+                    proto_key = f'{key}+proto' if single_default_weight else f'{key}+proto({weight:g})'
+                    proto_rows[proto_key] = sims + weighted_proto
             sims_dict.update(proto_rows)
 
         table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP","rSum"])
