@@ -184,10 +184,9 @@ class Evaluator():
             proto_weights = _prototype_score_weights(self.args)
             single_default_weight = len(proto_weights) == 1 and getattr(self.args, "prototype_score_weights", None) is None
             for weight in proto_weights:
-                weighted_proto = weight * proto_sims
                 for key, sims in sims_dict.items():
                     proto_key = f'{key}+proto' if single_default_weight else f'{key}+proto({weight:g})'
-                    proto_rows[proto_key] = sims + weighted_proto
+                    proto_rows[proto_key] = (1.0 - weight) * sims + weight * proto_sims
             sims_dict.update(proto_rows)
 
         table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP","rSum"])
