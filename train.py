@@ -1,5 +1,6 @@
 import os
 import os.path as op
+import subprocess
 import sys
 import torch
 import numpy as np
@@ -17,6 +18,50 @@ from utils.options import get_args
 from utils.comm import get_rank, synchronize
 import warnings
 warnings.filterwarnings("ignore")
+
+
+NOHUP_CHILD_ENV = "ITSELF_NOHUP_CHILD"
+
+
+def get_session_name(cur_time, name, loss_names):
+    return f'{cur_time}_{name}_{loss_names}'
+
+
+def get_nohup_log_path(args, cur_time, name, rank=0):
+    session_name = get_session_name(cur_time, name, args.loss_names)
+    log_dir = op.join(args.nohup_log_dir, args.dataset_name, session_name)
+    log_name = f"{cur_time}.log" if rank == 0 else f"{cur_time}_rank{rank}.log"
+    return op.join(log_dir, log_name)
+
+
+def detach_nohup_process(args, cur_time, name):
+    if not args.nohup or os.environ.get(NOHUP_CHILD_ENV) == "1":
+        return
+
+    log_path = get_nohup_log_path(args, cur_time, name)
+    os.makedirs(op.dirname(log_path), exist_ok=True)
+
+    child_cmd = [sys.executable] + sys.argv
+    if not args.run_time:
+        child_cmd.extend(["--run_time", cur_time])
+
+    child_env = os.environ.copy()
+    child_env[NOHUP_CHILD_ENV] = "1"
+
+    with open(log_path, "a", buffering=1) as log_file:
+        process = subprocess.Popen(
+            child_cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=log_file,
+            env=child_env,
+            close_fds=True,
+            start_new_session=True,
+        )
+
+    print(f"PID: {process.pid}")
+    print(f"Log file: {log_path}")
+    raise SystemExit(0)
 
 
 def enable_nohup_logging(log_dir, cur_time, rank=0):
@@ -41,8 +86,12 @@ def set_seed(seed=1):
 
 if __name__ == '__main__':
     args = get_args()
-    set_seed(1+get_rank())
     name = "ITSELF"
+    cur_time = args.run_time or time.strftime("%Y%m%d_%H%M%S", time.localtime())
+
+    detach_nohup_process(args, cur_time, name)
+
+    set_seed(1+get_rank())
 
     num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
     args.distributed = num_gpus > 1
@@ -53,8 +102,7 @@ if __name__ == '__main__':
         synchronize()
     
     device = "cuda"
-    cur_time = args.run_time or time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    session_name = f'{cur_time}_{name}_{args.loss_names}'
+    session_name = get_session_name(cur_time, name, args.loss_names)
     args.output_dir = op.join(args.output_dir, args.dataset_name, session_name)
     nohup_log_file = None
     if args.nohup:
