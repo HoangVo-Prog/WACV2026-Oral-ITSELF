@@ -2,7 +2,7 @@ import logging
 import os
 import random
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import torch
@@ -54,6 +54,13 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
         return
 
     logger.info("Initializing identity-aware PBT prototypes from train embeddings")
+    logger.info(
+        "Prototype ablation settings: kmeans_init={}, group_mean_impl={}, advance_rng_state={}".format(
+            getattr(args, "prototype_kmeans_init", "deterministic"),
+            getattr(args, "prototype_group_mean_impl", "deterministic"),
+            getattr(args, "prototype_advance_rng_state", False),
+        )
+    )
     was_training = model_without_ddp.training
 
     dataset = getattr(train_loader, "dataset", None)
@@ -65,7 +72,12 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
         if old_txt_aug is not None:
             dataset.txt_aug = False
 
-        with _preserve_rng_state():
+        rng_context = (
+            nullcontext()
+            if getattr(args, "prototype_advance_rng_state", False)
+            else _preserve_rng_state()
+        )
+        with rng_context:
             for batch in train_loader:
                 batch = {k: v.to(device) for k, v in batch.items()}
                 image_feat, text_feat = model_without_ddp.extract_prototype_features(batch)

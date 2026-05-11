@@ -6,12 +6,15 @@ from .kmeans import identity_kmeans
 
 
 class PrototypeMemory(nn.Module):
-    def __init__(self, num_classes, prototypes_per_id, dim, momentum=0.2):
+    def __init__(self, num_classes, prototypes_per_id, dim, momentum=0.2, group_mean_impl="deterministic"):
         super().__init__()
+        if group_mean_impl not in ("deterministic", "scatter"):
+            raise ValueError("group_mean_impl must be 'deterministic' or 'scatter'")
         self.num_classes = num_classes
         self.prototypes_per_id = prototypes_per_id
         self.dim = dim
         self.momentum = momentum
+        self.group_mean_impl = group_mean_impl
         total = num_classes * prototypes_per_id
 
         self.register_buffer("image_prototypes", torch.zeros(total, dim))
@@ -29,16 +32,26 @@ class PrototypeMemory(nn.Module):
         return bool(self.initialized.item())
 
     @torch.no_grad()
-    def initialize(self, image_features, text_features, pids, num_iters=20):
+    def initialize(self, image_features, text_features, pids, num_iters=20, kmeans_init="deterministic"):
         image_features = F.normalize(image_features.float(), p=2, dim=1)
         text_features = F.normalize(text_features.float(), p=2, dim=1)
         pids = pids.long()
 
         image_bank = identity_kmeans(
-            image_features, pids, self.num_classes, self.prototypes_per_id, num_iters=num_iters
+            image_features,
+            pids,
+            self.num_classes,
+            self.prototypes_per_id,
+            num_iters=num_iters,
+            init_method=kmeans_init,
         )
         text_bank = identity_kmeans(
-            text_features, pids, self.num_classes, self.prototypes_per_id, num_iters=num_iters
+            text_features,
+            pids,
+            self.num_classes,
+            self.prototypes_per_id,
+            num_iters=num_iters,
+            init_method=kmeans_init,
         )
 
         self.image_prototypes.copy_(image_bank.to(self.image_prototypes.device))
@@ -78,15 +91,40 @@ class PrototypeMemory(nn.Module):
 
     @torch.no_grad()
     def _mean_scatter(self, bank, assignments, features):
-        valid, means = self._deterministic_group_means(assignments, features, bank)
+        valid, means = self._group_means(assignments, features, bank)
         if valid.numel() > 0:
             bank[valid] = means
 
     @torch.no_grad()
     def _ema_scatter(self, bank, assignments, features):
-        valid, means = self._deterministic_group_means(assignments, features, bank)
+        valid, means = self._group_means(assignments, features, bank)
         if valid.numel() > 0:
             bank[valid] = F.normalize((1.0 - self.momentum) * bank[valid] + self.momentum * means, p=2, dim=1)
+
+    @torch.no_grad()
+    def _group_means(self, assignments, features, bank):
+        if self.group_mean_impl == "scatter":
+            return self._scatter_group_means(assignments, features, bank)
+        return self._deterministic_group_means(assignments, features, bank)
+
+    @torch.no_grad()
+    def _scatter_group_means(self, assignments, features, bank):
+        assignments = assignments.to(bank.device).long()
+        features = features.to(bank.device, dtype=bank.dtype)
+        sums = torch.zeros_like(bank)
+        counts = torch.zeros(bank.shape[0], 1, device=bank.device, dtype=bank.dtype)
+        sums.index_add_(0, assignments, features)
+        counts.index_add_(
+            0,
+            assignments,
+            torch.ones(assignments.shape[0], 1, device=bank.device, dtype=bank.dtype),
+        )
+        valid_mask = counts.squeeze(1) > 0
+        valid = valid_mask.nonzero(as_tuple=False).flatten()
+        if valid.numel() == 0:
+            return valid, bank.new_empty((0, bank.shape[1]))
+        means = sums[valid] / counts[valid].clamp_min(1.0)
+        return valid, F.normalize(means, p=2, dim=1)
 
     @torch.no_grad()
     def _deterministic_group_means(self, assignments, features, bank):

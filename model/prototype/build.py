@@ -29,6 +29,7 @@ class PrototypeBranch(nn.Module):
             prototypes_per_id=getattr(args, "prototype_per_id", 2),
             dim=self.prototype_dim,
             momentum=getattr(args, "prototype_momentum", 0.2),
+            group_mean_impl=getattr(args, "prototype_group_mean_impl", "deterministic"),
         )
 
     def is_ready(self):
@@ -56,6 +57,7 @@ class PrototypeBranch(nn.Module):
             F.normalize(text_features.float(), p=2, dim=1).detach(),
             pids.detach(),
             num_iters=getattr(self.args, "prototype_kmeans_iters", 20),
+            kmeans_init=getattr(self.args, "prototype_kmeans_init", "deterministic"),
         )
 
     @torch.no_grad()
