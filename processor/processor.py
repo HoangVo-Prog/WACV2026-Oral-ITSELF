@@ -190,7 +190,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 for k, v in meters.items():
                     if v.count > 0:
                         info_str += f", {k}: {v.avg:.4f}"
-                info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
+                info_str += f", Base Lr: {args.lr:.2e}"
                 logger.info(info_str)
 
         tb_writer.add_scalar('lr', scheduler.get_lr()[0], epoch)
