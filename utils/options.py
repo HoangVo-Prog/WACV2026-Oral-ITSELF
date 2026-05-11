@@ -68,6 +68,8 @@ def get_args():
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--bias_lr_factor", type=float, default=2.)
     parser.add_argument("--lr_factor", type=float, default=5.0, help="lr factor for random init self implement module")
+    parser.add_argument("--prototype_lr", type=float, default=None,
+                        help="absolute learning rate for prototype_branch; defaults to lr * lr_factor")
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight_decay", type=float, default=4e-5)
     parser.add_argument("--weight_decay_bias", type=float, default=0.)
