@@ -2,6 +2,25 @@ import torch
 import torch.nn.functional as F
 
 
+def _initial_centroids(features, num_clusters):
+    indices = torch.linspace(
+        0,
+        features.shape[0] - 1,
+        steps=num_clusters,
+        device=features.device,
+    ).round().long()
+    return features[indices].clone()
+
+
+def _cluster_means(features, assignments, centroids):
+    new_centroids = centroids.clone()
+    for cluster_idx in range(centroids.shape[0]):
+        cluster_features = features[assignments == cluster_idx]
+        if cluster_features.numel() > 0:
+            new_centroids[cluster_idx] = cluster_features.mean(dim=0)
+    return F.normalize(new_centroids, p=2, dim=1)
+
+
 @torch.no_grad()
 def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096):
     """Spherical K-Means over L2-normalized features."""
@@ -11,7 +30,7 @@ def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096):
         raise ValueError("num_clusters must be positive")
 
     features = F.normalize(features.float(), p=2, dim=1)
-    num_samples, dim = features.shape
+    num_samples = features.shape[0]
     if num_samples == 0:
         raise ValueError("cannot run k-means on an empty tensor")
 
@@ -20,8 +39,7 @@ def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096):
         centroids = features.repeat(repeats, 1)[:num_clusters].clone()
         return F.normalize(centroids, p=2, dim=1)
 
-    perm = torch.randperm(num_samples, device=features.device)[:num_clusters]
-    centroids = features[perm].clone()
+    centroids = _initial_centroids(features, num_clusters)
 
     for _ in range(num_iters):
         assignments = []
@@ -30,15 +48,7 @@ def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096):
             assignments.append(sims.argmax(dim=1))
         assignments = torch.cat(assignments, dim=0)
 
-        new_centroids = torch.zeros(num_clusters, dim, device=features.device, dtype=features.dtype)
-        counts = torch.zeros(num_clusters, 1, device=features.device, dtype=features.dtype)
-        new_centroids.index_add_(0, assignments, features)
-        counts.index_add_(0, assignments, torch.ones(num_samples, 1, device=features.device, dtype=features.dtype))
-
-        non_empty = counts.squeeze(1) > 0
-        new_centroids[non_empty] = new_centroids[non_empty] / counts[non_empty].clamp_min(1.0)
-        new_centroids[~non_empty] = centroids[~non_empty]
-        centroids = F.normalize(new_centroids, p=2, dim=1)
+        centroids = _cluster_means(features, assignments, centroids)
 
     return centroids
 

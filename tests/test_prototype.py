@@ -32,6 +32,16 @@ def test_torch_kmeans_shape_and_normalization():
     assert torch.allclose(centroids.norm(dim=1), torch.ones(3), atol=1e-5)
 
 
+def test_torch_kmeans_does_not_consume_rng_state():
+    features = torch.arange(60, dtype=torch.float32).reshape(12, 5)
+    torch.manual_seed(7)
+    rng_before = torch.get_rng_state()
+
+    _ = torch_kmeans(features, num_clusters=3, num_iters=3)
+
+    assert torch.equal(torch.get_rng_state(), rng_before)
+
+
 def test_identity_assignment_stays_inside_identity_slots():
     features = F.normalize(
         torch.tensor(
@@ -175,6 +185,7 @@ def test_branch_score_accepts_cpu_features_when_module_is_cuda():
 
 if __name__ == "__main__":
     test_torch_kmeans_shape_and_normalization()
+    test_torch_kmeans_does_not_consume_rng_state()
     test_identity_assignment_stays_inside_identity_slots()
     test_pbt_empty_slots_fall_back_to_same_side_prototypes()
     test_prototype_score_prefers_positive_pairs()

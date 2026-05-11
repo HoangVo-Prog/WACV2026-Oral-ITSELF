@@ -78,32 +78,27 @@ class PrototypeMemory(nn.Module):
 
     @torch.no_grad()
     def _mean_scatter(self, bank, assignments, features):
-        sums = torch.zeros_like(bank)
-        counts = torch.zeros(bank.shape[0], 1, device=bank.device, dtype=bank.dtype)
-        sums.index_add_(0, assignments, features.to(bank.device, dtype=bank.dtype))
-        counts.index_add_(
-            0,
-            assignments,
-            torch.ones(assignments.shape[0], 1, device=bank.device, dtype=bank.dtype),
-        )
-        valid = counts.squeeze(1) > 0
-        if valid.any():
-            bank[valid] = F.normalize(sums[valid] / counts[valid].clamp_min(1.0), p=2, dim=1)
+        valid, means = self._deterministic_group_means(assignments, features, bank)
+        if valid.numel() > 0:
+            bank[valid] = means
 
     @torch.no_grad()
     def _ema_scatter(self, bank, assignments, features):
-        sums = torch.zeros_like(bank)
-        counts = torch.zeros(bank.shape[0], 1, device=bank.device, dtype=bank.dtype)
-        sums.index_add_(0, assignments, features.to(bank.device, dtype=bank.dtype))
-        counts.index_add_(
-            0,
-            assignments,
-            torch.ones(assignments.shape[0], 1, device=bank.device, dtype=bank.dtype),
-        )
-        valid = counts.squeeze(1) > 0
-        if valid.any():
-            means = F.normalize(sums[valid] / counts[valid].clamp_min(1.0), p=2, dim=1)
+        valid, means = self._deterministic_group_means(assignments, features, bank)
+        if valid.numel() > 0:
             bank[valid] = F.normalize((1.0 - self.momentum) * bank[valid] + self.momentum * means, p=2, dim=1)
+
+    @torch.no_grad()
+    def _deterministic_group_means(self, assignments, features, bank):
+        assignments = assignments.detach().to("cpu").long()
+        features = features.detach().to("cpu", dtype=torch.float32)
+        valid = torch.unique(assignments, sorted=True)
+        means = []
+        for idx in valid.tolist():
+            means.append(features[assignments == idx].mean(dim=0))
+        means = torch.stack(means, dim=0).to(bank.device, dtype=bank.dtype)
+        valid = valid.to(bank.device)
+        return valid, F.normalize(means, p=2, dim=1)
 
     def assign_identity(self, features, pids, bank):
         features = F.normalize(features.float(), p=2, dim=1)

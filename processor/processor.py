@@ -1,6 +1,10 @@
 import logging
 import os
+import random
 import time
+from contextlib import contextmanager
+
+import numpy as np
 import torch
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
@@ -26,6 +30,22 @@ def _prototype_requested(args):
     )
 
 
+@contextmanager
+def _preserve_rng_state():
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
 @torch.no_grad()
 def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     model_without_ddp = _unwrap_model(model)
@@ -35,25 +55,28 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
 
     logger.info("Initializing identity-aware PBT prototypes from train embeddings")
     was_training = model_without_ddp.training
-    model_without_ddp.eval()
 
     dataset = getattr(train_loader, "dataset", None)
     old_txt_aug = getattr(dataset, "txt_aug", None)
-    if old_txt_aug is not None:
-        dataset.txt_aug = False
-
     image_features, text_features, pids = [], [], []
-    for batch in train_loader:
-        batch = {k: v.to(device) for k, v in batch.items()}
-        image_feat, text_feat = model_without_ddp.extract_prototype_features(batch)
-        image_feat, text_feat = branch.project_for_memory(image_feat, text_feat)
-        image_features.append(image_feat.cpu())
-        text_features.append(text_feat.cpu())
-        pids.append(batch['pids'].cpu())
 
-    if old_txt_aug is not None:
-        dataset.txt_aug = old_txt_aug
-    model_without_ddp.train(was_training)
+    try:
+        model_without_ddp.eval()
+        if old_txt_aug is not None:
+            dataset.txt_aug = False
+
+        with _preserve_rng_state():
+            for batch in train_loader:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                image_feat, text_feat = model_without_ddp.extract_prototype_features(batch)
+                image_feat, text_feat = branch.project_for_memory(image_feat, text_feat)
+                image_features.append(image_feat.cpu())
+                text_features.append(text_feat.cpu())
+                pids.append(batch['pids'].cpu())
+    finally:
+        if old_txt_aug is not None:
+            dataset.txt_aug = old_txt_aug
+        model_without_ddp.train(was_training)
 
     image_features = torch.cat(image_features, dim=0)
     text_features = torch.cat(text_features, dim=0)
