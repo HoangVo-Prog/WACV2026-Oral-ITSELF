@@ -20,8 +20,7 @@ warnings.filterwarnings("ignore")
 
 
 def enable_nohup_logging(log_dir, cur_time, rank=0):
-    if not op.exists(log_dir):
-        os.makedirs(log_dir)
+    os.makedirs(log_dir, exist_ok=True)
 
     log_name = f"{cur_time}.log" if rank == 0 else f"{cur_time}_rank{rank}.log"
     log_path = op.join(log_dir, log_name)
@@ -55,10 +54,12 @@ if __name__ == '__main__':
     
     device = "cuda"
     cur_time = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    args.output_dir = op.join(args.output_dir, args.dataset_name, f'{cur_time}_{name}_{args.loss_names}')
+    session_name = f'{cur_time}_{name}_{args.loss_names}'
+    args.output_dir = op.join(args.output_dir, args.dataset_name, session_name)
     nohup_log_file = None
     if args.nohup:
-        nohup_log_path, nohup_log_file = enable_nohup_logging(args.output_dir, cur_time, get_rank())
+        nohup_log_dir = op.join(args.nohup_log_dir, args.dataset_name, session_name)
+        nohup_log_path, nohup_log_file = enable_nohup_logging(nohup_log_dir, cur_time, get_rank())
     logger = setup_logger('ITSELF', save_dir=args.output_dir, if_train=args.training, distributed_rank=get_rank())
     if args.nohup:
         logger.info(f"Nohup log file: {nohup_log_path}")
