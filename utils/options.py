@@ -55,6 +55,8 @@ def get_args():
     parser.add_argument("--prototype_score_weights", type=float, nargs='+',
                         default=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
                         help="Inference-time prototype score weights for interpolation ablation.")
+    parser.add_argument("--prototype_inference_score", type=str, default="training", choices=["training", "assigned"],
+                        help="prototype score formula used at inference")
     parser.add_argument("--prototype_momentum", type=float, default=0.2)
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))

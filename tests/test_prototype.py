@@ -160,6 +160,7 @@ def test_branch_forward_and_score_shapes():
         prototype_tau=0.05,
         prototype_hard_k=1,
         prototype_margin=0.2,
+        prototype_inference_score="training",
         use_loss_id=True,
         use_loss_rank=True,
     )
@@ -185,6 +186,45 @@ def test_branch_forward_and_score_shapes():
     assert list(id_only_ret.keys()) == ["proto_id_loss"]
     assert list(rank_only_ret.keys()) == ["proto_rank_loss"]
     assert scores.shape == (4, 4)
+
+
+def test_branch_inference_score_can_use_training_or_assigned_formula():
+    args = SimpleNamespace(
+        only_global=True,
+        prototype_feature="auto",
+        prototype_dim=2,
+        prototype_per_id=1,
+        prototype_momentum=0.2,
+        prototype_kmeans_iters=2,
+        prototype_inference_score="training",
+    )
+    branch = PrototypeBranch(args, num_classes=2, feature_dim=2)
+    image_projector = torch.nn.Linear(2, 2, bias=False)
+    text_projector = torch.nn.Linear(2, 2, bias=False)
+    image_projector.weight.data.copy_(torch.eye(2))
+    text_projector.weight.data.copy_(torch.eye(2))
+    branch.image_projector = torch.nn.Sequential(image_projector)
+    branch.text_projector = torch.nn.Sequential(text_projector)
+
+    image_bank = F.normalize(torch.tensor([[1.0, 0.0], [0.0, 1.0]]), p=2, dim=1)
+    text_bank = image_bank.clone()
+    branch.memory.image_prototypes.copy_(image_bank)
+    branch.memory.text_prototypes.copy_(text_bank)
+    branch.memory.text_to_image.copy_(image_bank)
+    branch.memory.image_to_text.copy_(text_bank)
+    branch.memory.initialized.fill_(True)
+
+    image_features = F.normalize(torch.tensor([[0.8, 0.2], [0.1, 0.9]]), p=2, dim=1)
+    text_features = F.normalize(torch.tensor([[0.6, 0.4], [0.3, 0.7]]), p=2, dim=1)
+
+    training_scores = branch.score(text_features, image_features)
+    expected_training = branch.memory.training_score_matrix(text_features, image_features)
+    assert torch.allclose(training_scores, expected_training)
+
+    args.prototype_inference_score = "assigned"
+    assigned_scores = branch.score(text_features, image_features)
+    expected_assigned = branch.memory.prototype_score_matrix(text_features, image_features)
+    assert torch.allclose(assigned_scores, expected_assigned)
 
 
 def test_rank_hard_negative_source_can_use_host_or_projected_scores():

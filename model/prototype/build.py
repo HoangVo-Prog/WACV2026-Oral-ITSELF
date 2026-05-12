@@ -121,7 +121,11 @@ class PrototypeBranch(nn.Module):
         self.eval()
         try:
             image_features, text_features = self._project(image_features, text_features)
-            scores = self.memory.prototype_score_matrix(text_features, image_features)
+            score_mode = getattr(self.args, "prototype_inference_score", "training")
+            if score_mode == "assigned":
+                scores = self.memory.prototype_score_matrix(text_features, image_features)
+            else:
+                scores = self.memory.training_score_matrix(text_features, image_features)
         finally:
             self.train(was_training)
         return scores
