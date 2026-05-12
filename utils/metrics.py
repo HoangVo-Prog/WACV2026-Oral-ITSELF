@@ -1,32 +1,35 @@
-from prettytable import PrettyTable
 import torch
 import torch.nn.functional as F
 import logging
-# from nnn import NNNRetriever, NNNRanker
-import matplotlib.pyplot as plt
-from PIL import Image
-import numpy as np
-import os
-from skimage.transform import resize
-import cv2
-import torchvision.transforms as T
-import json
 
-import numpy as np
-import matplotlib.pyplot as plt
-from collections import defaultdict
+try:
+    from prettytable import PrettyTable
+except ImportError:
+    class PrettyTable:
+        def __init__(self, field_names):
+            self.field_names = field_names
+            self.rows = []
+            self.custom_format = {}
 
+        def add_row(self, row):
+            self.rows.append(row)
 
-def _unwrap_model(model):
-    return model.module if hasattr(model, "module") else model
+        def _format_value(self, name, value):
+            formatter = self.custom_format.get(name)
+            if formatter is not None:
+                return formatter(None, value)
+            return str(value)
 
-
-def _prototype_branch(model):
-    model = _unwrap_model(model)
-    branch = getattr(model, "prototype_branch", None)
-    if branch is None or not branch.is_ready():
-        return None
-    return branch
+        def __str__(self):
+            lines = ["\t".join(self.field_names)]
+            for row in self.rows:
+                lines.append(
+                    "\t".join(
+                        self._format_value(name, value)
+                        for name, value in zip(self.field_names, row)
+                    )
+                )
+            return "\n".join(lines)
 
 
 def rank(similarity, q_pids, g_pids, max_rank=10, get_mAP=True):
@@ -70,13 +73,6 @@ def get_metrics(similarity, qids, gids, n_, retur_indices=False):
         return [n_, t2i_cmc[0], t2i_cmc[4], t2i_cmc[9], t2i_mAP, t2i_mINP, t2i_cmc[0]+ t2i_cmc[4]+ t2i_cmc[9]]
 
 
-def _prototype_score_weights(args):
-    weights = getattr(args, "prototype_score_weights", None)
-    if weights is None:
-        weights = [getattr(args, "prototype_score_weight", 0.1)]
-    return [float(weight) for weight in weights]
-
-
 class Evaluator():
     def __init__(self, img_loader, txt_loader, args):
         self.img_loader = img_loader # gallery
@@ -111,105 +107,29 @@ class Evaluator():
 
         return qfeats.cpu(), gfeats.cpu(), qids.cpu(), gids.cpu()
 
-    def _compute_embedding_grab(self, model):
-        model = model.eval()
-        device = next(model.parameters()).device
-
-        qids, gids, qfeats, gfeats = [], [], [], []
-        # text
-        for pid, caption in self.txt_loader:
-            caption = caption.to(device)
-            with torch.no_grad():
-                text_feat = model.encode_text_grab(caption).cpu()
-            qids.append(pid.view(-1)) # flatten
-            qfeats.append(text_feat)
-        qids = torch.cat(qids, 0)
-        qfeats = torch.cat(qfeats, 0)
-
-        # image
-        for pid, img in self.img_loader:
-            img = img.to(device)
-            with torch.no_grad():
-                img_feat = model.encode_image_grab(img).cpu()
-            gids.append(pid.view(-1)) # flatten
-            gfeats.append(img_feat)
-        gids = torch.cat(gids, 0)
-        gfeats = torch.cat(gfeats, 0)
-        return qfeats.cpu(), gfeats.cpu(), qids.cpu(), gids.cpu()
-
     def eval(self, model, i2t_metric=False):
+        """Evaluate host global retrieval only; prototype scoring is training-only."""
         qfeats, gfeats, qids, gids = self._compute_embedding(model)
-        qfeats_raw, gfeats_raw = qfeats, gfeats
         qfeats = F.normalize(qfeats, p=2, dim=1) # text features
         gfeats = F.normalize(gfeats, p=2, dim=1) # image features
-        sims_global = qfeats @ gfeats.t()
-
-        proto_sims = None
-        branch = _prototype_branch(model)
-        if not self.args.only_global:
-            vq_feats, vg_feats, _, _ = self._compute_embedding_grab(model)
-            vq_feats_raw, vg_feats_raw = vq_feats, vg_feats
-            vq_feats = F.normalize(vq_feats, p=2, dim=1) # text features
-            vg_feats = F.normalize(vg_feats, p=2, dim=1) # image features
-            sims_grab = vq_feats@vg_feats.t()
-            if branch is not None and branch.use_local:
-                proto_sims = branch.score(vq_feats_raw, vg_feats_raw).cpu()
-
-        if branch is not None and proto_sims is None:
-            proto_sims = branch.score(qfeats_raw, gfeats_raw).cpu()
-
-        if self.args.only_global:
-            sims_dict = {
-                'global': sims_global
-            }
-        else:
-            sims_dict = {
-                'global': sims_global, # alpha = 1
-                'grab': sims_grab, # alpha = 0
-                'global+grab(0.1)': 0.1 * sims_global + 0.9 * sims_grab, # alpha = 0.1
-                'global+grab(0.2)': 0.2 * sims_global + 0.8 * sims_grab, # alpha = 0.2
-                'global+grab(0.3)': 0.3 * sims_global + 0.7 * sims_grab, # alpha = 0.3
-                'global+grab(0.4)': 0.4 * sims_global + 0.6 * sims_grab, # alpha = 0.4
-                'global+grab(0.5)': 0.5 * sims_global + 0.5 * sims_grab, # alpha = 0.5
-                'global+grab(0.6)': 0.6 * sims_global + 0.4 * sims_grab, # alpha = 0.6
-                'global+grab(0.7)': 0.7 * sims_global + 0.3 * sims_grab, # alpha = 0.7
-                'global+grab(0.8)': 0.8 * sims_global + 0.2 * sims_grab, # alpha = 0.8
-                'global+grab(0.9)': 0.9 * sims_global + 0.1 * sims_grab, # alpha = 0.9
-                'global+grab(0.68)': 0.68 * sims_global + 0.32 * sims_grab, # alpha = 0.68
-                'global+grab(0.32)': 0.32 * sims_global + 0.68 * sims_grab # alpha = 0.32
-            }
-
-        if proto_sims is not None:
-            proto_rows = {}
-            proto_weights = _prototype_score_weights(self.args)
-            single_default_weight = len(proto_weights) == 1 and getattr(self.args, "prototype_score_weights", None) is None
-            for weight in proto_weights:
-                for key, sims in sims_dict.items():
-                    proto_key = f'{key}+proto' if single_default_weight else f'{key}+proto({weight:g})'
-                    proto_rows[proto_key] = (1.0 - weight) * sims + weight * proto_sims
-            sims_dict.update(proto_rows)
+        sims = qfeats @ gfeats.t()
 
         table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP","rSum"])
+        rs = get_metrics(sims, qids, gids, 'global-t2i', False)
+        table.add_row(rs)
+        if i2t_metric:
+            i2t_cmc, i2t_mAP, i2t_mINP, _ = rank(similarity=sims.t(), q_pids=gids, g_pids=qids, max_rank=10, get_mAP=True)
+            i2t_cmc, i2t_mAP, i2t_mINP = i2t_cmc.numpy(), i2t_mAP.numpy(), i2t_mINP.numpy()
+            table.add_row(['global-i2t', i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP])
 
-        top1 = 0
-
-        for key in sims_dict.keys():
-            sims = sims_dict[key]
-            rs = get_metrics(sims, qids, gids, f'{key}-t2i',False)
-            table.add_row(rs)
-            if i2t_metric:
-                i2t_cmc, i2t_mAP, i2t_mINP, _ = rank(similarity=sims.t(), q_pids=gids, g_pids=qids, max_rank=10, get_mAP=True)
-                i2t_cmc, i2t_mAP, i2t_mINP = i2t_cmc.numpy(), i2t_mAP.numpy(), i2t_mINP.numpy()
-                table.add_row(['i2t', i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP])
-
-            top1 = max(top1,rs[1])
+        top1 = rs[1]
 
         table.custom_format["R1"] = lambda f, v: f"{v:.2f}"
         table.custom_format["R5"] = lambda f, v: f"{v:.2f}"
         table.custom_format["R10"] = lambda f, v: f"{v:.2f}"
         table.custom_format["mAP"] = lambda f, v: f"{v:.2f}"
         table.custom_format["mINP"] = lambda f, v: f"{v:.2f}"
-        table.custom_format["RSum"] = lambda f, v: f"{v:.2f}"
+        table.custom_format["rSum"] = lambda f, v: f"{v:.2f}"
         self.logger.info('\n' + str(table))
         self.logger.info('\n' + "best R1 = " + str(top1))
 

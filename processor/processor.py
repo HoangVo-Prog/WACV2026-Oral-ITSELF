@@ -23,7 +23,6 @@ def _prototype_requested(args):
     return (
         getattr(args, "prototype", False)
         or getattr(args, "use_loss_id", False)
-        or getattr(args, "use_loss_rank", False)
     )
 
 

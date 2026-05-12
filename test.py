@@ -9,6 +9,7 @@ from utils.logger import setup_logger
 from model import build_model
 import argparse
 from utils.iotools import load_train_configs
+from utils.options import sanitize_prototype_args
 
 def get_args():
     parser = argparse.ArgumentParser(description="TranTextReID Text")
@@ -26,6 +27,7 @@ def get_args():
 if __name__ == '__main__':
     args = get_args()
     logger = setup_logger('ITSELF', save_dir=args.output_dir, if_train=args.training)
+    sanitize_prototype_args(args, logger.warning)
     logger.info(args)
     device = "cuda"
 

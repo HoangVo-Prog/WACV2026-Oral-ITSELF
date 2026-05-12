@@ -2,11 +2,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .losses import prototype_pair_ranking_loss, symmetric_identity_proxy_loss
+from .losses import symmetric_identity_proxy_loss
 from .memory import PrototypeMemory
 
 
 class PrototypeBranch(nn.Module):
+    """Training-only prototype ID regularizer branch.
+
+    The branch owns memory initialization/update and the prototype ID loss. It
+    intentionally has no inference scoring API.
+    """
+
     def __init__(self, args, num_classes, feature_dim):
         super().__init__()
         self.args = args
@@ -62,31 +68,13 @@ class PrototypeBranch(nn.Module):
     def project_for_memory(self, image_features, text_features):
         return self._project(image_features, text_features)
 
-    def _projected_selection_scores(self, text_features, image_features):
-        return F.normalize(text_features, p=2, dim=1) @ F.normalize(image_features, p=2, dim=1).t()
-
-    def _rank_selection_scores(self, text_features, image_features, host_scores=None):
-        source = getattr(self.args, "prototype_hard_negative_source", "host")
-        if source == "projected" or host_scores is None:
-            return self._projected_selection_scores(text_features, image_features)
-
-        host_scores = host_scores.to(device=text_features.device, dtype=torch.float32)
-        expected_shape = (text_features.shape[0], image_features.shape[0])
-        if host_scores.shape != expected_shape:
-            raise ValueError(
-                "host_scores must have shape {}, got {}".format(expected_shape, tuple(host_scores.shape))
-            )
-        return host_scores
-
-    def forward(self, image_features, text_features, pids, use_loss_id=True, use_loss_rank=True, host_scores=None):
+    def forward(self, image_features, text_features, pids, use_loss_id=True):
         image_features, text_features = self._project(image_features, text_features)
         zero = image_features.sum() * 0.0
         if not self.is_ready():
             ret = {}
             if use_loss_id:
                 ret["proto_id_loss"] = zero
-            if use_loss_rank:
-                ret["proto_rank_loss"] = zero
             return ret
 
         pids = pids.long()
@@ -101,31 +89,5 @@ class PrototypeBranch(nn.Module):
                 hard_k=getattr(self.args, "prototype_hard_k", 16),
             )
 
-        if use_loss_rank:
-            proto_scores = self.memory.training_score_matrix(text_features, image_features)
-            selection_scores = self._rank_selection_scores(text_features, image_features, host_scores=host_scores)
-            ret["proto_rank_loss"] = prototype_pair_ranking_loss(
-                proto_scores,
-                pids,
-                host_scores=selection_scores,
-                margin=getattr(self.args, "prototype_margin", 0.2),
-                hard_k=getattr(self.args, "prototype_hard_k", 16),
-            )
-
         self.memory.ema_update(image_features.detach(), text_features.detach(), pids.detach())
         return ret
-
-    @torch.no_grad()
-    def score(self, text_features, image_features):
-        was_training = self.training
-        self.eval()
-        try:
-            image_features, text_features = self._project(image_features, text_features)
-            score_mode = getattr(self.args, "prototype_inference_score", "training")
-            if score_mode == "assigned":
-                scores = self.memory.prototype_score_matrix(text_features, image_features)
-            else:
-                scores = self.memory.training_score_matrix(text_features, image_features)
-        finally:
-            self.train(was_training)
-        return scores

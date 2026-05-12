@@ -158,6 +158,8 @@ if __name__ == '__main__':
     logger = setup_logger('ITSELF', save_dir=args.output_dir, if_train=args.training, distributed_rank=get_rank())
     if args.nohup:
         logger.info(f"Nohup log file: {nohup_log_path}")
+    if getattr(args, "prototype", False) or getattr(args, "use_loss_id", False):
+        logger.info("Prototype branch mode: training-time ID regularizer only; retrieval scoring and fusion are disabled.")
     logger.info("Using {} GPUs".format(num_gpus))
     logger.info(str(args).replace(',', '\n'))
     save_train_configs(args.output_dir, args)

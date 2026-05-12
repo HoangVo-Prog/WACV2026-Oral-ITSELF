@@ -1,4 +1,43 @@
 import argparse
+
+
+_ACTIVE_PROTOTYPE_CONFIG_KEYS = {
+    "prototype",
+    "use_loss_id",
+    "prototype_feature",
+    "prototype_per_id",
+    "prototype_dim",
+    "prototype_kmeans_iters",
+    "prototype_warmup_epochs",
+    "prototype_tau",
+    "prototype_hard_k",
+    "prototype_id_weight",
+    "prototype_momentum",
+    "prototype_lr",
+}
+
+
+def sanitize_prototype_args(args, warn_fn=None):
+    """Remove stale prototype rank/retrieval fields from loaded configs."""
+    removed_fields = []
+    for attr in list(vars(args)):
+        is_removed_loss_field = attr.startswith("use_loss_") and attr not in _ACTIVE_PROTOTYPE_CONFIG_KEYS
+        is_removed_prototype_field = attr.startswith("prototype_") and attr not in _ACTIVE_PROTOTYPE_CONFIG_KEYS
+        if not is_removed_loss_field and not is_removed_prototype_field:
+            continue
+        removed_fields.append(attr)
+        delattr(args, attr)
+
+    if removed_fields and warn_fn is not None:
+        warn_fn(
+            "Removing stale prototype rank/retrieval config fields: {}. "
+            "Current CLI supports the training-only prototype ID regularizer.".format(
+                ", ".join(sorted(removed_fields))
+            )
+        )
+    return removed_fields
+
+
 def get_args():
     parser = argparse.ArgumentParser(description="ITSELF Args")
     parser.add_argument("--tau", default=0.015, type=float)
@@ -38,27 +77,22 @@ def get_args():
     parser.add_argument("--loss_names", default='tal+cid', help="which loss to use ['cid, tal']")
 
     ######################## prototype settings ########################
-    parser.add_argument("--prototype", default=False, action='store_true')
+    parser.add_argument(
+        "--prototype",
+        default=False,
+        action='store_true',
+        help="enable the training-only prototype regularizer branch",
+    )
     parser.add_argument("--use_loss_id", default=False, action='store_true')
-    parser.add_argument("--use_loss_rank", default=False, action='store_true')
     parser.add_argument("--prototype_feature", type=str, default="auto", choices=["auto", "local", "global"])
     parser.add_argument("--prototype_per_id", type=int, default=2)
     parser.add_argument("--prototype_dim", type=int, default=512)
     parser.add_argument("--prototype_kmeans_iters", type=int, default=20)
     parser.add_argument("--prototype_warmup_epochs", type=int, default=0)
     parser.add_argument("--prototype_tau", type=float, default=0.05)
-    parser.add_argument("--prototype_margin", type=float, default=0.2)
-    parser.add_argument("--prototype_hard_k", type=int, default=16)
-    parser.add_argument("--prototype_hard_negative_source", type=str, default="host", choices=["host", "projected"],
-                        help="source used to select hard negatives for prototype rank loss")
+    parser.add_argument("--prototype_hard_k", type=int, default=16,
+                        help="top hard negative prototypes used by the prototype ID regularizer")
     parser.add_argument("--prototype_id_weight", type=float, default=0.2)
-    parser.add_argument("--prototype_rank_weight", type=float, default=0.5)
-    parser.add_argument("--prototype_score_weight", type=float, default=0.1)
-    parser.add_argument("--prototype_score_weights", type=float, nargs='+',
-                        default=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-                        help="Inference-time prototype score weights for interpolation ablation.")
-    parser.add_argument("--prototype_inference_score", type=str, default="training", choices=["training", "assigned"],
-                        help="prototype score formula used at inference")
     parser.add_argument("--prototype_momentum", type=float, default=0.2)
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))

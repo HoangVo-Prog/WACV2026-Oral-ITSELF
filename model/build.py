@@ -3,7 +3,6 @@ from model import objectives
 from .clip_model import Transformer, LayerNorm, build_CLIP_from_openai_pretrained, convert_weights,tokenize
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from .grab import TexualEmbeddingLayer, VisualEmbeddingLayer
 from .prototype import PrototypeBranch
 from torch.cuda.amp import autocast
@@ -79,7 +78,6 @@ class ITSELF(nn.Module):
         self.prototype_enabled = (
             getattr(args, "prototype", False)
             or getattr(args, "use_loss_id", False)
-            or getattr(args, "use_loss_rank", False)
         )
         prototype_feature = getattr(args, "prototype_feature", "auto")
         use_proto_local = self.prototype_enabled and not args.only_global and prototype_feature in ("auto", "local")
@@ -336,25 +334,14 @@ class ITSELF(nn.Module):
 
         if self.prototype_enabled and self.prototype_branch is not None:
             proto_image_feats, proto_text_feats = self._select_prototype_features(features)
-            proto_host_scores = None
-            if getattr(self.args, "use_loss_rank", False) and getattr(
-                self.args, "prototype_hard_negative_source", "host"
-            ) == "host":
-                proto_host_scores = F.normalize(proto_text_feats.float(), p=2, dim=1) @ F.normalize(
-                    proto_image_feats.float(), p=2, dim=1
-                ).t()
             proto_ret = self.prototype_branch(
                 proto_image_feats,
                 proto_text_feats,
                 batch['pids'],
                 use_loss_id=getattr(self.args, "use_loss_id", False),
-                use_loss_rank=getattr(self.args, "use_loss_rank", False),
-                host_scores=proto_host_scores,
             )
             if "proto_id_loss" in proto_ret:
                 ret["proto_id_loss"] = proto_ret["proto_id_loss"] * getattr(self.args, "prototype_id_weight", 0.2)
-            if "proto_rank_loss" in proto_ret:
-                ret["proto_rank_loss"] = proto_ret["proto_rank_loss"] * getattr(self.args, "prototype_rank_weight", 0.5)
 
         return ret
 
