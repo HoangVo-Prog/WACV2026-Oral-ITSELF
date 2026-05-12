@@ -29,10 +29,15 @@ class PrototypeMemory(nn.Module):
         return bool(self.initialized.item())
 
     @torch.no_grad()
-    def initialize(self, image_features, text_features, pids, num_iters=20):
+    def initialize(self, image_features, text_features, pids, num_iters=20, kmeans_seed=None):
         image_features = F.normalize(image_features.float(), p=2, dim=1)
         text_features = F.normalize(text_features.float(), p=2, dim=1)
         pids = pids.long()
+        image_generator = self._make_generator(image_features.device, kmeans_seed)
+        text_generator = self._make_generator(
+            text_features.device,
+            None if kmeans_seed is None else kmeans_seed + 1,
+        )
 
         image_bank = identity_kmeans(
             image_features,
@@ -40,6 +45,7 @@ class PrototypeMemory(nn.Module):
             self.num_classes,
             self.prototypes_per_id,
             num_iters=num_iters,
+            generator=image_generator,
         )
         text_bank = identity_kmeans(
             text_features,
@@ -47,12 +53,58 @@ class PrototypeMemory(nn.Module):
             self.num_classes,
             self.prototypes_per_id,
             num_iters=num_iters,
+            generator=text_generator,
         )
+
+        if kmeans_seed is not None:
+            text_to_image, image_to_text = self._rebuild_pbt_deterministic(
+                image_features.cpu(),
+                text_features.cpu(),
+                pids.cpu(),
+                image_bank.cpu(),
+                text_bank.cpu(),
+            )
+            self.image_prototypes.copy_(image_bank.to(self.image_prototypes.device))
+            self.text_prototypes.copy_(text_bank.to(self.text_prototypes.device))
+            self.text_to_image.copy_(text_to_image.to(self.text_to_image.device))
+            self.image_to_text.copy_(image_to_text.to(self.image_to_text.device))
+            self.initialized.fill_(True)
+            return
 
         self.image_prototypes.copy_(image_bank.to(self.image_prototypes.device))
         self.text_prototypes.copy_(text_bank.to(self.text_prototypes.device))
         self._rebuild_pbt(image_features, text_features, pids)
         self.initialized.fill_(True)
+
+    def _make_generator(self, device, seed):
+        if seed is None:
+            return None
+        if device.type == "cuda":
+            generator = torch.Generator(device=device)
+        else:
+            generator = torch.Generator()
+        generator.manual_seed(seed)
+        return generator
+
+    @torch.no_grad()
+    def _rebuild_pbt_deterministic(self, image_features, text_features, pids, image_bank, text_bank):
+        pids = pids.long()
+        image_assign = self.assign_identity(image_features, pids, image_bank)
+        text_assign = self.assign_identity(text_features, pids, text_bank)
+        text_to_image = self._mean_scatter_deterministic(image_bank, text_assign, image_features)
+        image_to_text = self._mean_scatter_deterministic(text_bank, image_assign, text_features)
+        return text_to_image, image_to_text
+
+    @torch.no_grad()
+    def _mean_scatter_deterministic(self, bank, assignments, features):
+        bank = bank.clone()
+        assignments = assignments.cpu().long()
+        features = features.cpu().float()
+        for assignment in assignments.unique(sorted=True):
+            mask = assignments == assignment
+            mean = features[mask].mean(dim=0, keepdim=True)
+            bank[int(assignment.item())] = F.normalize(mean, p=2, dim=1).squeeze(0)
+        return bank
 
     @torch.no_grad()
     def ema_update(self, image_features, text_features, pids):

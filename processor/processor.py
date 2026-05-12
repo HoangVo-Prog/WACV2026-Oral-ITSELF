@@ -1,8 +1,11 @@
 import logging
 import os
+import random
 import time
 
+import numpy as np
 import torch
+from datasets.build import build_prototype_init_loader
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
 from utils.comm import get_rank, synchronize
@@ -26,6 +29,60 @@ def _prototype_requested(args):
     )
 
 
+def _capture_rng_state():
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def _seed_prototype_init(seed):
+    random.seed(seed)
+    np.random.seed(seed % (2 ** 32))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _get_train_source(train_loader):
+    dataset = getattr(train_loader, "dataset", None)
+    train_source = getattr(dataset, "dataset", None)
+    if train_source is None:
+        raise RuntimeError(
+            "--prototype_isolated_init requires train_loader.dataset.dataset to build the isolated prototype loader"
+        )
+    return train_source
+
+
+@torch.no_grad()
+def _collect_prototype_features(model_without_ddp, branch, loader, device):
+    image_features, text_features, pids = [], [], []
+    for batch in loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        image_feat, text_feat = model_without_ddp.extract_prototype_features(batch)
+        image_feat, text_feat = branch.project_for_memory(image_feat, text_feat)
+        image_features.append(image_feat.cpu())
+        text_features.append(text_feat.cpu())
+        pids.append(batch['pids'].cpu())
+    return (
+        torch.cat(image_features, dim=0),
+        torch.cat(text_features, dim=0),
+        torch.cat(pids, dim=0),
+    )
+
+
 @torch.no_grad()
 def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     model_without_ddp = _unwrap_model(model)
@@ -36,30 +93,38 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     logger.info("Initializing identity-aware PBT prototypes from train embeddings")
     was_training = model_without_ddp.training
 
+    if getattr(args, "prototype_isolated_init", False):
+        rng_state = _capture_rng_state()
+        seed = getattr(args, "prototype_init_seed", 1)
+        try:
+            _seed_prototype_init(seed)
+            model_without_ddp.eval()
+            init_loader = build_prototype_init_loader(args, _get_train_source(train_loader), seed)
+            image_features, text_features, pids = _collect_prototype_features(
+                model_without_ddp, branch, init_loader, device
+            )
+            branch.initialize_projected(image_features, text_features, pids, kmeans_seed=seed)
+        finally:
+            model_without_ddp.train(was_training)
+            _restore_rng_state(rng_state)
+        logger.info("Prototype banks initialized with {} samples".format(pids.numel()))
+        return
+
     dataset = getattr(train_loader, "dataset", None)
     old_txt_aug = getattr(dataset, "txt_aug", None)
-    image_features, text_features, pids = [], [], []
-
     try:
         model_without_ddp.eval()
         if old_txt_aug is not None:
             dataset.txt_aug = False
 
-        for batch in train_loader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            image_feat, text_feat = model_without_ddp.extract_prototype_features(batch)
-            image_feat, text_feat = branch.project_for_memory(image_feat, text_feat)
-            image_features.append(image_feat.cpu())
-            text_features.append(text_feat.cpu())
-            pids.append(batch['pids'].cpu())
+        image_features, text_features, pids = _collect_prototype_features(
+            model_without_ddp, branch, train_loader, device
+        )
     finally:
         if old_txt_aug is not None:
             dataset.txt_aug = old_txt_aug
         model_without_ddp.train(was_training)
 
-    image_features = torch.cat(image_features, dim=0)
-    text_features = torch.cat(text_features, dim=0)
-    pids = torch.cat(pids, dim=0)
     branch.initialize_projected(image_features, text_features, pids)
     logger.info("Prototype banks initialized with {} samples".format(pids.numel()))
 

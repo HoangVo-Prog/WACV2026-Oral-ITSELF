@@ -1,4 +1,6 @@
 import logging
+import copy
+from functools import partial
 import torch
 import torchvision.transforms as T
 from torch.utils.data import DataLoader
@@ -14,6 +16,13 @@ from .icfgpedes import ICFGPEDES
 from .rstpreid import RSTPReid
 
 __factory = {'CUHK-PEDES': CUHKPEDES, 'ICFG-PEDES': ICFGPEDES, 'RSTPReid': RSTPReid}
+
+
+def _seed_worker(worker_id, seed):
+    worker_seed = (seed + worker_id) % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
 
 
 def build_transforms(img_size=(384, 128), aug=False, is_train=True):
@@ -67,6 +76,36 @@ def collate(batch):
             raise TypeError(f"Unexpect data type: {type(v[0])} in a batch.")
 
     return batch_tensor_dict
+
+
+def build_prototype_init_loader(args, train_data, seed):
+    prototype_args = copy.copy(args)
+    prototype_args.img_aug = False
+    prototype_args.txt_aug = False
+
+    transforms = build_transforms(img_size=args.img_size, is_train=False)
+    dataset = ImageTextDataset(
+        train_data,
+        prototype_args,
+        transforms,
+        text_length=args.text_length,
+    )
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    batch_size = getattr(args, "prototype_init_batch_size", None) or args.batch_size
+    num_workers = getattr(args, "prototype_init_num_workers", None)
+    if num_workers is None:
+        num_workers = args.num_workers
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate,
+        worker_init_fn=partial(_seed_worker, seed=seed),
+        generator=generator,
+    )
 
 
 def build_dataloader(args, tranforms=None):

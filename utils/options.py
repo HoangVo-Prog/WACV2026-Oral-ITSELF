@@ -14,6 +14,10 @@ _ACTIVE_PROTOTYPE_CONFIG_KEYS = {
     "prototype_id_weight",
     "prototype_momentum",
     "prototype_lr",
+    "prototype_isolated_init",
+    "prototype_init_seed",
+    "prototype_init_batch_size",
+    "prototype_init_num_workers",
 }
 
 
@@ -94,6 +98,15 @@ def get_args():
                         help="top hard negative prototypes used by the prototype ID regularizer")
     parser.add_argument("--prototype_id_weight", type=float, default=0.2)
     parser.add_argument("--prototype_momentum", type=float, default=0.2)
+    parser.add_argument(
+        "--prototype_isolated_init",
+        default=False,
+        action='store_true',
+        help="initialize prototypes with an isolated deterministic no-augmentation loader",
+    )
+    parser.add_argument("--prototype_init_seed", type=int, default=1)
+    parser.add_argument("--prototype_init_batch_size", type=int, default=None)
+    parser.add_argument("--prototype_init_num_workers", type=int, default=None)
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))
     parser.add_argument("--stride_size", type=int, default=16)

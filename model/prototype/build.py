@@ -56,12 +56,13 @@ class PrototypeBranch(nn.Module):
         self.initialize_projected(image_features, text_features, pids)
 
     @torch.no_grad()
-    def initialize_projected(self, image_features, text_features, pids):
+    def initialize_projected(self, image_features, text_features, pids, kmeans_seed=None):
         self.memory.initialize(
             F.normalize(image_features.float(), p=2, dim=1).detach(),
             F.normalize(text_features.float(), p=2, dim=1).detach(),
             pids.detach(),
             num_iters=getattr(self.args, "prototype_kmeans_iters", 20),
+            kmeans_seed=kmeans_seed,
         )
 
     @torch.no_grad()
