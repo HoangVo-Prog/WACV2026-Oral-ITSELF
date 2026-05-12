@@ -62,7 +62,23 @@ class PrototypeBranch(nn.Module):
     def project_for_memory(self, image_features, text_features):
         return self._project(image_features, text_features)
 
-    def forward(self, image_features, text_features, pids, use_loss_id=True, use_loss_rank=True):
+    def _projected_selection_scores(self, text_features, image_features):
+        return F.normalize(text_features, p=2, dim=1) @ F.normalize(image_features, p=2, dim=1).t()
+
+    def _rank_selection_scores(self, text_features, image_features, host_scores=None):
+        source = getattr(self.args, "prototype_hard_negative_source", "host")
+        if source == "projected" or host_scores is None:
+            return self._projected_selection_scores(text_features, image_features)
+
+        host_scores = host_scores.to(device=text_features.device, dtype=torch.float32)
+        expected_shape = (text_features.shape[0], image_features.shape[0])
+        if host_scores.shape != expected_shape:
+            raise ValueError(
+                "host_scores must have shape {}, got {}".format(expected_shape, tuple(host_scores.shape))
+            )
+        return host_scores
+
+    def forward(self, image_features, text_features, pids, use_loss_id=True, use_loss_rank=True, host_scores=None):
         image_features, text_features = self._project(image_features, text_features)
         zero = image_features.sum() * 0.0
         if not self.is_ready():
@@ -87,11 +103,11 @@ class PrototypeBranch(nn.Module):
 
         if use_loss_rank:
             proto_scores = self.memory.training_score_matrix(text_features, image_features)
-            host_scores = F.normalize(text_features, p=2, dim=1) @ F.normalize(image_features, p=2, dim=1).t()
+            selection_scores = self._rank_selection_scores(text_features, image_features, host_scores=host_scores)
             ret["proto_rank_loss"] = prototype_pair_ranking_loss(
                 proto_scores,
                 pids,
-                host_scores=host_scores,
+                host_scores=selection_scores,
                 margin=getattr(self.args, "prototype_margin", 0.2),
                 hard_k=getattr(self.args, "prototype_hard_k", 16),
             )

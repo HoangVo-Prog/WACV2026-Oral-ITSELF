@@ -335,12 +335,20 @@ class ITSELF(nn.Module):
 
         if self.prototype_enabled and self.prototype_branch is not None:
             proto_image_feats, proto_text_feats = self._select_prototype_features(features)
+            proto_host_scores = None
+            if getattr(self.args, "use_loss_rank", False) and getattr(
+                self.args, "prototype_hard_negative_source", "host"
+            ) == "host":
+                proto_host_scores = F.normalize(proto_text_feats.float(), p=2, dim=1) @ F.normalize(
+                    proto_image_feats.float(), p=2, dim=1
+                ).t()
             proto_ret = self.prototype_branch(
                 proto_image_feats,
                 proto_text_feats,
                 batch['pids'],
                 use_loss_id=getattr(self.args, "use_loss_id", False),
                 use_loss_rank=getattr(self.args, "use_loss_rank", False),
+                host_scores=proto_host_scores,
             )
             if "proto_id_loss" in proto_ret:
                 ret["proto_id_loss"] = proto_ret["proto_id_loss"] * getattr(self.args, "prototype_id_weight", 0.2)

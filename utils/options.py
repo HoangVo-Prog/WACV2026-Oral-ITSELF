@@ -47,6 +47,8 @@ def get_args():
     parser.add_argument("--prototype_tau", type=float, default=0.05)
     parser.add_argument("--prototype_margin", type=float, default=0.2)
     parser.add_argument("--prototype_hard_k", type=int, default=16)
+    parser.add_argument("--prototype_hard_negative_source", type=str, default="host", choices=["host", "projected"],
+                        help="source used to select hard negatives for prototype rank loss")
     parser.add_argument("--prototype_id_weight", type=float, default=0.2)
     parser.add_argument("--prototype_rank_weight", type=float, default=0.5)
     parser.add_argument("--prototype_score_weight", type=float, default=0.1)

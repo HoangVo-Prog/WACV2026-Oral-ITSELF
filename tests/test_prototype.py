@@ -187,6 +187,29 @@ def test_branch_forward_and_score_shapes():
     assert scores.shape == (4, 4)
 
 
+def test_rank_hard_negative_source_can_use_host_or_projected_scores():
+    args = SimpleNamespace(
+        only_global=True,
+        prototype_feature="auto",
+        prototype_dim=3,
+        prototype_per_id=1,
+        prototype_momentum=0.2,
+        prototype_hard_negative_source="host",
+    )
+    branch = PrototypeBranch(args, num_classes=2, feature_dim=4)
+    image_features = F.normalize(torch.randn(4, 3), p=2, dim=1)
+    text_features = F.normalize(torch.randn(4, 3), p=2, dim=1)
+    host_scores = torch.randn(4, 4)
+
+    selected = branch._rank_selection_scores(text_features, image_features, host_scores=host_scores)
+    assert torch.allclose(selected, host_scores)
+
+    args.prototype_hard_negative_source = "projected"
+    projected = branch._rank_selection_scores(text_features, image_features, host_scores=host_scores)
+    expected_projected = text_features @ image_features.t()
+    assert torch.allclose(projected, expected_projected)
+
+
 def test_branch_score_accepts_cpu_features_when_module_is_cuda():
     if not torch.cuda.is_available():
         return
