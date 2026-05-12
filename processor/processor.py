@@ -1,10 +1,7 @@
 import logging
 import os
-import random
 import time
-from contextlib import contextmanager, nullcontext
 
-import numpy as np
 import torch
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
@@ -30,22 +27,6 @@ def _prototype_requested(args):
     )
 
 
-@contextmanager
-def _preserve_rng_state():
-    python_state = random.getstate()
-    numpy_state = np.random.get_state()
-    torch_state = torch.get_rng_state()
-    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    try:
-        yield
-    finally:
-        random.setstate(python_state)
-        np.random.set_state(numpy_state)
-        torch.set_rng_state(torch_state)
-        if cuda_states is not None:
-            torch.cuda.set_rng_state_all(cuda_states)
-
-
 @torch.no_grad()
 def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     model_without_ddp = _unwrap_model(model)
@@ -54,13 +35,6 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
         return
 
     logger.info("Initializing identity-aware PBT prototypes from train embeddings")
-    logger.info(
-        "Prototype ablation settings: kmeans_init={}, group_mean_impl={}, advance_rng_state={}".format(
-            getattr(args, "prototype_kmeans_init", "deterministic"),
-            getattr(args, "prototype_group_mean_impl", "deterministic"),
-            getattr(args, "prototype_advance_rng_state", False),
-        )
-    )
     was_training = model_without_ddp.training
 
     dataset = getattr(train_loader, "dataset", None)
@@ -72,19 +46,13 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
         if old_txt_aug is not None:
             dataset.txt_aug = False
 
-        rng_context = (
-            nullcontext()
-            if getattr(args, "prototype_advance_rng_state", False)
-            else _preserve_rng_state()
-        )
-        with rng_context:
-            for batch in train_loader:
-                batch = {k: v.to(device) for k, v in batch.items()}
-                image_feat, text_feat = model_without_ddp.extract_prototype_features(batch)
-                image_feat, text_feat = branch.project_for_memory(image_feat, text_feat)
-                image_features.append(image_feat.cpu())
-                text_features.append(text_feat.cpu())
-                pids.append(batch['pids'].cpu())
+        for batch in train_loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            image_feat, text_feat = model_without_ddp.extract_prototype_features(batch)
+            image_feat, text_feat = branch.project_for_memory(image_feat, text_feat)
+            image_features.append(image_feat.cpu())
+            text_features.append(text_feat.cpu())
+            pids.append(batch['pids'].cpu())
     finally:
         if old_txt_aug is not None:
             dataset.txt_aug = old_txt_aug

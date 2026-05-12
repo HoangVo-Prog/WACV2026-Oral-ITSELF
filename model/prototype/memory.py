@@ -6,15 +6,12 @@ from .kmeans import identity_kmeans
 
 
 class PrototypeMemory(nn.Module):
-    def __init__(self, num_classes, prototypes_per_id, dim, momentum=0.2, group_mean_impl="deterministic"):
+    def __init__(self, num_classes, prototypes_per_id, dim, momentum=0.2):
         super().__init__()
-        if group_mean_impl not in ("deterministic", "scatter"):
-            raise ValueError("group_mean_impl must be 'deterministic' or 'scatter'")
         self.num_classes = num_classes
         self.prototypes_per_id = prototypes_per_id
         self.dim = dim
         self.momentum = momentum
-        self.group_mean_impl = group_mean_impl
         total = num_classes * prototypes_per_id
 
         self.register_buffer("image_prototypes", torch.zeros(total, dim))
@@ -32,7 +29,7 @@ class PrototypeMemory(nn.Module):
         return bool(self.initialized.item())
 
     @torch.no_grad()
-    def initialize(self, image_features, text_features, pids, num_iters=20, kmeans_init="deterministic"):
+    def initialize(self, image_features, text_features, pids, num_iters=20):
         image_features = F.normalize(image_features.float(), p=2, dim=1)
         text_features = F.normalize(text_features.float(), p=2, dim=1)
         pids = pids.long()
@@ -43,7 +40,6 @@ class PrototypeMemory(nn.Module):
             self.num_classes,
             self.prototypes_per_id,
             num_iters=num_iters,
-            init_method=kmeans_init,
         )
         text_bank = identity_kmeans(
             text_features,
@@ -51,7 +47,6 @@ class PrototypeMemory(nn.Module):
             self.num_classes,
             self.prototypes_per_id,
             num_iters=num_iters,
-            init_method=kmeans_init,
         )
 
         self.image_prototypes.copy_(image_bank.to(self.image_prototypes.device))
@@ -103,9 +98,7 @@ class PrototypeMemory(nn.Module):
 
     @torch.no_grad()
     def _group_means(self, assignments, features, bank):
-        if self.group_mean_impl == "scatter":
-            return self._scatter_group_means(assignments, features, bank)
-        return self._deterministic_group_means(assignments, features, bank)
+        return self._scatter_group_means(assignments, features, bank)
 
     @torch.no_grad()
     def _scatter_group_means(self, assignments, features, bank):
@@ -124,18 +117,6 @@ class PrototypeMemory(nn.Module):
         if valid.numel() == 0:
             return valid, bank.new_empty((0, bank.shape[1]))
         means = sums[valid] / counts[valid].clamp_min(1.0)
-        return valid, F.normalize(means, p=2, dim=1)
-
-    @torch.no_grad()
-    def _deterministic_group_means(self, assignments, features, bank):
-        assignments = assignments.detach().to("cpu").long()
-        features = features.detach().to("cpu", dtype=torch.float32)
-        valid = torch.unique(assignments, sorted=True)
-        means = []
-        for idx in valid.tolist():
-            means.append(features[assignments == idx].mean(dim=0))
-        means = torch.stack(means, dim=0).to(bank.device, dtype=bank.dtype)
-        valid = valid.to(bank.device)
         return valid, F.normalize(means, p=2, dim=1)
 
     def assign_identity(self, features, pids, bank):

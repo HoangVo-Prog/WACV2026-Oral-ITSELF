@@ -2,20 +2,9 @@ import torch
 import torch.nn.functional as F
 
 
-def _initial_centroids(features, num_clusters, init_method="deterministic"):
-    if init_method == "random":
-        perm = torch.randperm(features.shape[0], device=features.device)[:num_clusters]
-        return features[perm].clone()
-    if init_method != "deterministic":
-        raise ValueError("init_method must be 'deterministic' or 'random'")
-
-    indices = torch.linspace(
-        0,
-        features.shape[0] - 1,
-        steps=num_clusters,
-        device=features.device,
-    ).round().long()
-    return features[indices].clone()
+def _initial_centroids(features, num_clusters):
+    perm = torch.randperm(features.shape[0], device=features.device)[:num_clusters]
+    return features[perm].clone()
 
 
 def _cluster_means(features, assignments, centroids):
@@ -28,7 +17,7 @@ def _cluster_means(features, assignments, centroids):
 
 
 @torch.no_grad()
-def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096, init_method="deterministic"):
+def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096):
     """Spherical K-Means over L2-normalized features."""
     if features.ndim != 2:
         raise ValueError("features must be a 2D tensor")
@@ -45,7 +34,7 @@ def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096, init_met
         centroids = features.repeat(repeats, 1)[:num_clusters].clone()
         return F.normalize(centroids, p=2, dim=1)
 
-    centroids = _initial_centroids(features, num_clusters, init_method=init_method)
+    centroids = _initial_centroids(features, num_clusters)
 
     for _ in range(num_iters):
         assignments = []
@@ -60,7 +49,7 @@ def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096, init_met
 
 
 @torch.no_grad()
-def identity_kmeans(features, pids, num_classes, prototypes_per_id, num_iters=20, init_method="deterministic"):
+def identity_kmeans(features, pids, num_classes, prototypes_per_id, num_iters=20):
     """Build fixed-count prototypes for each identity."""
     features = F.normalize(features.float(), p=2, dim=1)
     pids = pids.long()
@@ -80,7 +69,6 @@ def identity_kmeans(features, pids, num_classes, prototypes_per_id, num_iters=20
                 identity_features,
                 prototypes_per_id,
                 num_iters=num_iters,
-                init_method=init_method,
             )
         banks.append(F.normalize(centroids.reshape(prototypes_per_id, dim), p=2, dim=1))
 
