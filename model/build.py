@@ -3,6 +3,7 @@ from model import objectives
 from .clip_model import Transformer, LayerNorm, build_CLIP_from_openai_pretrained, convert_weights,tokenize
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .grab import TexualEmbeddingLayer, VisualEmbeddingLayer
 from .prototype import PrototypeBranch
 from torch.cuda.amp import autocast
