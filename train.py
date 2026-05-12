@@ -84,6 +84,53 @@ def set_seed(seed=1):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
 
+
+def _strip_module_prefix(key):
+    return key[7:] if key.startswith("module.") else key
+
+
+def _checkpoint_model_state(checkpoint):
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        return checkpoint["model"]
+    return checkpoint
+
+
+def load_clip_finetune(model, checkpoint_path, logger):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    loaded_state = _checkpoint_model_state(checkpoint)
+    model_state = model.state_dict()
+    update_state = {}
+    skipped_proto = 0
+    skipped_missing = 0
+    skipped_shape = 0
+
+    for key, value in loaded_state.items():
+        key = _strip_module_prefix(key)
+        if key.startswith("prototype_branch."):
+            skipped_proto += 1
+            continue
+        if key not in model_state:
+            skipped_missing += 1
+            continue
+        if model_state[key].shape != value.shape:
+            skipped_shape += 1
+            continue
+        update_state[key] = value.detach().clone()
+
+    if not update_state:
+        raise RuntimeError(f"No compatible weights found in --finetune_clip checkpoint: {checkpoint_path}")
+
+    model_state.update(update_state)
+    model.load_state_dict(model_state)
+    logger.info(
+        "Loaded %d tensors from CLIP checkpoint %s; skipped %d prototype, %d missing, %d shape-mismatch tensors",
+        len(update_state),
+        checkpoint_path,
+        skipped_proto,
+        skipped_missing,
+        skipped_shape,
+    )
+
 if __name__ == '__main__':
     args = get_args()
     name = "ITSELF"
@@ -130,6 +177,8 @@ if __name__ == '__main__':
             param_dict[refine_k] = param_dict[k].detach().clone()
             del param_dict[k]
         model.load_state_dict(param_dict, False)
+    if args.finetune_clip:
+        load_clip_finetune(model, args.finetune_clip, logger)
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model,

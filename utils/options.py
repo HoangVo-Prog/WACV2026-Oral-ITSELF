@@ -19,6 +19,8 @@ def get_args():
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
     parser.add_argument("--finetune", type=str, default="")
+    parser.add_argument("--finetune_clip", type=str, default="",
+                        help="load weights from a CLIP-only ITSELF checkpoint into the current model")
     parser.add_argument("--pretrain", type=str, default="") # unused
     parser.add_argument("--nohup", default=False, action='store_true',
                         help="redirect stdout/stderr to a timestamped .log file")
