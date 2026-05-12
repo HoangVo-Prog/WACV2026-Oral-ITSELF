@@ -43,7 +43,7 @@ def get_args():
     parser.add_argument("--prototype_per_id", type=int, default=2)
     parser.add_argument("--prototype_dim", type=int, default=512)
     parser.add_argument("--prototype_kmeans_iters", type=int, default=20)
-    parser.add_argument("--prototype_warmup_epochs", type=int, default=1)
+    parser.add_argument("--prototype_warmup_epochs", type=int, default=0)
     parser.add_argument("--prototype_tau", type=float, default=0.05)
     parser.add_argument("--prototype_margin", type=float, default=0.2)
     parser.add_argument("--prototype_hard_k", type=int, default=16)
