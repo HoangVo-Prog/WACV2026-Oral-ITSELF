@@ -7,7 +7,9 @@ python3 train.py \
 --loss_names 'tal+cid' \
 --num_epoch 60 \
 --only_global \
---nohup
+--nohup \
+--prototype \
+--use_loss_id
 # --return_all \
 # --topk_type 'custom' \
 # --modify_k

@@ -78,7 +78,6 @@ class ITSELF(nn.Module):
         self.prototype_enabled = (
             getattr(args, "prototype", False)
             or getattr(args, "use_loss_id", False)
-            or getattr(args, "use_loss_rank", False)
         )
         prototype_feature = getattr(args, "prototype_feature", "auto")
         use_proto_local = self.prototype_enabled and not args.only_global and prototype_feature in ("auto", "local")
@@ -340,12 +339,9 @@ class ITSELF(nn.Module):
                 proto_text_feats,
                 batch['pids'],
                 use_loss_id=getattr(self.args, "use_loss_id", False),
-                use_loss_rank=getattr(self.args, "use_loss_rank", False),
             )
             if "proto_id_loss" in proto_ret:
                 ret["proto_id_loss"] = proto_ret["proto_id_loss"] * getattr(self.args, "prototype_id_weight", 0.2)
-            if "proto_rank_loss" in proto_ret:
-                ret["proto_rank_loss"] = proto_ret["proto_rank_loss"] * getattr(self.args, "prototype_rank_weight", 0.5)
 
         return ret
 
