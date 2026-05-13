@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 from datasets.sampler import RandomIdentitySampler
 from datasets.sampler_ddp import RandomIdentitySampler_DDP
 import random
-from utils.comm import get_world_size
+from utils.comm import get_world_size, get_rank
 import numpy as np
 from .bases import ImageDataset, TextDataset, ImageTextDataset
 
@@ -51,6 +51,18 @@ def build_transforms(img_size=(384, 128), aug=False, is_train=True):
     return transform
 
 
+def make_data_loader_generator(args, offset=0):
+    generator = torch.Generator()
+    base_seed = int(getattr(args, "seed", 1)) + get_rank() * 1000
+    generator.manual_seed(base_seed + int(offset))
+    return generator
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 
 def collate(batch):
     keys = set([key for b in batch for key in b.keys()])
@@ -77,7 +89,6 @@ def build_dataloader(args, tranforms=None):
     if args.dataset_name == 'Flickr' or args.dataset_name == 'MSCOCO':
         args.img_size = (224,224)
     num_classes = len(dataset.train_id_container)
-    random.seed(42)
     ds1 = dataset.train
     all_text = []
     all_id = []
@@ -115,10 +126,14 @@ def build_dataloader(args, tranforms=None):
                 train_loader = DataLoader(train_set,
                                           batch_size=args.batch_size,
                                           sampler=RandomIdentitySampler(
-                                              dataset.train, args.batch_size,
-                                              args.num_instance),
+                                              dataset.train,
+                                              args.batch_size,
+                                              args.num_instance,
+                                              seed=getattr(args, "seed", 1) + get_rank() * 1000),
                                           num_workers=num_workers,
-                                          collate_fn=collate)
+                                          collate_fn=collate,
+                                          worker_init_fn=seed_worker,
+                                          generator=make_data_loader_generator(args))
         elif args.sampler == 'random':
             # TODO add distributed condition
             logger.info('using random sampler')
@@ -126,7 +141,9 @@ def build_dataloader(args, tranforms=None):
                                       batch_size=args.batch_size,
                                       shuffle=True,
                                       num_workers=num_workers,
-                                      collate_fn=collate)
+                                      collate_fn=collate,
+                                      worker_init_fn=seed_worker,
+                                      generator=make_data_loader_generator(args))
         else:
             logger.error('unsupported sampler! expected softmax or triplet but got {}'.format(args.sampler))
 
@@ -141,11 +158,13 @@ def build_dataloader(args, tranforms=None):
         val_img_loader = DataLoader(val_img_set,
                                     batch_size=args.batch_size,
                                     shuffle=False,
-                                    num_workers=num_workers)
+                                    num_workers=num_workers,
+                                    worker_init_fn=seed_worker)
         val_txt_loader = DataLoader(val_txt_set,
                                     batch_size=args.batch_size,
                                     shuffle=False,
-                                    num_workers=num_workers)
+                                    num_workers=num_workers,
+                                    worker_init_fn=seed_worker)
 
         return train_loader, val_img_loader, val_txt_loader, num_classes
 
@@ -167,11 +186,13 @@ def build_dataloader(args, tranforms=None):
         test_img_loader = DataLoader(test_img_set,
                                      batch_size=args.test_batch_size,
                                      shuffle=False,
-                                     num_workers=num_workers)
+                                     num_workers=num_workers,
+                                     worker_init_fn=seed_worker)
         test_txt_loader = DataLoader(test_txt_set,
                                      batch_size=args.test_batch_size,
                                      shuffle=False,
-                                     num_workers=num_workers)
+                                     num_workers=num_workers,
+                                     worker_init_fn=seed_worker)
         test_img_loader.test_img_set = test_img_set
         test_txt_loader.test_txt_set = test_txt_set
         

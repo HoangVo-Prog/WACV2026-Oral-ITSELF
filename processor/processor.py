@@ -3,10 +3,13 @@ import os
 import time
 
 import torch
+from torch.utils.data import DataLoader
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
 from utils.comm import get_rank, synchronize
 from torch.utils.tensorboard import SummaryWriter
+from datasets.bases import ImageTextDataset
+from datasets.build import build_transforms, collate, make_data_loader_generator, seed_worker
 
 
 def _unwrap_model(model):
@@ -26,6 +29,44 @@ def _prototype_requested(args):
     )
 
 
+def _set_epoch_on_loader(loader, epoch):
+    sampler = getattr(loader, "sampler", None)
+    if sampler is not None and hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
+
+    batch_sampler = getattr(loader, "batch_sampler", None)
+    inner_sampler = getattr(batch_sampler, "sampler", None)
+    if inner_sampler is not None and hasattr(inner_sampler, "set_epoch"):
+        inner_sampler.set_epoch(epoch)
+
+
+def _build_prototype_init_loader(train_loader, args):
+    train_set = getattr(train_loader, "dataset", None)
+    source_dataset = getattr(train_set, "dataset", None)
+    if train_set is None or source_dataset is None:
+        return None
+
+    prototype_set = ImageTextDataset(
+        source_dataset,
+        args,
+        transform=build_transforms(img_size=args.img_size, aug=False, is_train=False),
+        text_length=getattr(train_set, "text_length", args.text_length),
+        truncate=getattr(train_set, "truncate", True),
+    )
+    prototype_set.txt_aug = False
+    prototype_set.img_aug = False
+
+    return DataLoader(
+        prototype_set,
+        batch_size=getattr(args, "test_batch_size", args.batch_size),
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate,
+        worker_init_fn=seed_worker,
+        generator=make_data_loader_generator(args, offset=4000),
+    )
+
+
 @torch.no_grad()
 def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     model_without_ddp = _unwrap_model(model)
@@ -36,7 +77,14 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     logger.info("Initializing identity-aware PBT prototypes from train embeddings")
     was_training = model_without_ddp.training
 
-    dataset = getattr(train_loader, "dataset", None)
+    prototype_loader = _build_prototype_init_loader(train_loader, args)
+    if prototype_loader is not None:
+        logger.info("Using a dedicated no-augmentation loader for prototype initialization")
+    else:
+        logger.warning("Falling back to the training loader for prototype initialization")
+        prototype_loader = train_loader
+
+    dataset = getattr(prototype_loader, "dataset", None)
     old_txt_aug = getattr(dataset, "txt_aug", None)
     image_features, text_features, pids = [], [], []
 
@@ -45,7 +93,7 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
         if old_txt_aug is not None:
             dataset.txt_aug = False
 
-        for batch in train_loader:
+        for batch in prototype_loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             image_feat, text_feat = model_without_ddp.extract_prototype_features(batch)
             image_feat, text_feat = branch.project_for_memory(image_feat, text_feat)
@@ -134,6 +182,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         for meter in meters.values():
             meter.reset()
 
+        _set_epoch_on_loader(train_loader, epoch)
         if _prototype_requested(args):
             if epoch > getattr(args, "prototype_warmup_epochs", 1) and not _prototype_ready(model):
                 maybe_initialize_prototypes(model, train_loader, args, device, logger)

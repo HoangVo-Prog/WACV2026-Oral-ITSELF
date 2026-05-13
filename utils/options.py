@@ -13,6 +13,10 @@ def get_args():
     parser.add_argument("--name", default="ITSELF", help="experiment name to save")
     parser.add_argument("--run_time", default="",
                         help="timestamp used in run output paths; defaults to current time")
+    parser.add_argument("--seed", default=1, type=int,
+                        help="base random seed for training, data loading, and prototype initialization")
+    parser.add_argument("--deterministic", default=False, action='store_true',
+                        help="enable deterministic training settings for reproducible runs")
     parser.add_argument("--log_period", default=20)
     parser.add_argument("--eval_period", default=1)
     parser.add_argument("--val_dataset", default="test") # use val set when evaluate, if test use test set

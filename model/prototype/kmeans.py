@@ -2,8 +2,8 @@ import torch
 import torch.nn.functional as F
 
 
-def _initial_centroids(features, num_clusters):
-    perm = torch.randperm(features.shape[0], device=features.device)[:num_clusters]
+def _initial_centroids(features, num_clusters, generator=None):
+    perm = torch.randperm(features.shape[0], device=features.device, generator=generator)[:num_clusters]
     return features[perm].clone()
 
 
@@ -17,7 +17,7 @@ def _cluster_means(features, assignments, centroids):
 
 
 @torch.no_grad()
-def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096):
+def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096, generator=None):
     """Spherical K-Means over L2-normalized features."""
     if features.ndim != 2:
         raise ValueError("features must be a 2D tensor")
@@ -34,7 +34,7 @@ def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096):
         centroids = features.repeat(repeats, 1)[:num_clusters].clone()
         return F.normalize(centroids, p=2, dim=1)
 
-    centroids = _initial_centroids(features, num_clusters)
+    centroids = _initial_centroids(features, num_clusters, generator=generator)
 
     for _ in range(num_iters):
         assignments = []
@@ -49,11 +49,15 @@ def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096):
 
 
 @torch.no_grad()
-def identity_kmeans(features, pids, num_classes, prototypes_per_id, num_iters=20):
+def identity_kmeans(features, pids, num_classes, prototypes_per_id, num_iters=20, seed=None):
     """Build fixed-count prototypes for each identity."""
     features = F.normalize(features.float(), p=2, dim=1)
     pids = pids.long()
     dim = features.shape[1]
+    generator = None
+    if seed is not None:
+        generator = torch.Generator() if features.device.type == "cpu" else torch.Generator(device=features.device.type)
+        generator.manual_seed(int(seed))
     global_fallback = F.normalize(features.mean(dim=0, keepdim=True), p=2, dim=1)
     banks = []
 
@@ -69,6 +73,7 @@ def identity_kmeans(features, pids, num_classes, prototypes_per_id, num_iters=20
                 identity_features,
                 prototypes_per_id,
                 num_iters=num_iters,
+                generator=generator,
             )
         banks.append(F.normalize(centroids.reshape(prototypes_per_id, dim), p=2, dim=1))
 

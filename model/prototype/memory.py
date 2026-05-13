@@ -29,7 +29,7 @@ class PrototypeMemory(nn.Module):
         return bool(self.initialized.item())
 
     @torch.no_grad()
-    def initialize(self, image_features, text_features, pids, num_iters=20):
+    def initialize(self, image_features, text_features, pids, num_iters=20, seed=None):
         image_features = F.normalize(image_features.float(), p=2, dim=1)
         text_features = F.normalize(text_features.float(), p=2, dim=1)
         pids = pids.long()
@@ -40,6 +40,7 @@ class PrototypeMemory(nn.Module):
             self.num_classes,
             self.prototypes_per_id,
             num_iters=num_iters,
+            seed=seed,
         )
         text_bank = identity_kmeans(
             text_features,
@@ -47,6 +48,7 @@ class PrototypeMemory(nn.Module):
             self.num_classes,
             self.prototypes_per_id,
             num_iters=num_iters,
+            seed=None if seed is None else int(seed) + 1,
         )
 
         self.image_prototypes.copy_(image_bank.to(self.image_prototypes.device))

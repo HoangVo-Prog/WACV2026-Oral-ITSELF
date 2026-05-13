@@ -4,8 +4,10 @@ python3 train.py \
 --name PPL \
 --output_dir 'ITSELF' \
 --dataset_name $DATASET_NAME \
+--seed 1 \
+--deterministic \
 --loss_names 'tal+cid' \
---num_epoch 60 \
+--num_epoch 15 \
 --only_global \
 --nohup \
 --prototype \

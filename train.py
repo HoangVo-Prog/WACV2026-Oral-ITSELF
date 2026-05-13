@@ -75,14 +75,34 @@ def enable_nohup_logging(log_dir, cur_time, rank=0):
     return log_path, log_file
 
 
-def set_seed(seed=1):
+def set_seed(seed=1, deterministic=False):
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = False
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.allow_tf32 = False
+        if hasattr(torch, "use_deterministic_algorithms"):
+            try:
+                torch.use_deterministic_algorithms(True, warn_only=True)
+            except TypeError:
+                torch.use_deterministic_algorithms(True)
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch, "use_deterministic_algorithms"):
+            try:
+                torch.use_deterministic_algorithms(False, warn_only=True)
+            except TypeError:
+                torch.use_deterministic_algorithms(False)
 
 
 def _strip_module_prefix(key):
@@ -138,7 +158,7 @@ if __name__ == '__main__':
 
     detach_nohup_process(args, cur_time, name)
 
-    set_seed(1+get_rank())
+    set_seed(args.seed + get_rank(), deterministic=args.deterministic)
 
     num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
     args.distributed = num_gpus > 1
