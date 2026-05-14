@@ -17,8 +17,8 @@ def get_args():
                         help="base random seed for training, data loading, and prototype initialization")
     parser.add_argument("--deterministic", default=False, action='store_true',
                         help="enable deterministic training settings for reproducible runs")
-    parser.add_argument("--log_period", default=20)
-    parser.add_argument("--eval_period", default=1)
+    parser.add_argument("--log_period", default=20, type=int)
+    parser.add_argument("--eval_period", default=1, type=int)
     parser.add_argument("--val_dataset", default="test") # use val set when evaluate, if test use test set
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
@@ -30,6 +30,18 @@ def get_args():
                         help="redirect stdout/stderr to a timestamped .log file")
     parser.add_argument("--nohup_log_dir", default="logs",
                         help="directory for --nohup stdout/stderr logs")
+    parser.add_argument("--wandb", default=False, action='store_true',
+                        help="enable Weights & Biases logging on rank 0")
+    parser.add_argument("--wandb_project", default="ITSELF",
+                        help="Weights & Biases project name")
+    parser.add_argument("--wandb_entity", default="",
+                        help="optional Weights & Biases entity")
+    parser.add_argument("--wandb_name", default="",
+                        help="optional Weights & Biases run name override; defaults to YYYYMMDD_HHMMSS")
+    parser.add_argument("--wandb_mode", default="online", choices=["online", "offline", "disabled"],
+                        help="Weights & Biases mode; --wandb defaults to online")
+    parser.add_argument("--wandb_tags", nargs="*", default=[],
+                        help="optional Weights & Biases run tags")
 
 
     ######################## model general settings ########################

@@ -282,6 +282,21 @@ class ITSELF(nn.Module):
             i_grab_f = features["i_grab_f"]
             t_grab_f = features["t_grab_f"]
 
+        if getattr(self.args, "track_train_diagnostics", True):
+            if not self.args.only_global:
+                host_image_feats, host_text_feats = i_grab_f, t_grab_f
+            else:
+                host_image_feats, host_text_feats = i_feats, t_feats
+            proto_image_feats, proto_text_feats = self._select_prototype_features(features)
+            ret["_diag"] = {
+                "host_image_feats": host_image_feats.detach(),
+                "host_text_feats": host_text_feats.detach(),
+                "proto_image_feats": proto_image_feats.detach(),
+                "proto_text_feats": proto_text_feats.detach(),
+                "pids": batch["pids"].detach(),
+                "indices": batch.get("index", None),
+            }
+
         if 'cid' in self.current_task:
             S = objectives.cosine_similarity_matrix(i_feats, t_feats)
             hard_negatives = objectives.sample_hard_negatives(S, batch['pids'])

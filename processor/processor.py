@@ -7,6 +7,8 @@ from torch.utils.data import DataLoader
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
 from utils.comm import get_rank, synchronize
+from utils.train_diagnostics import compute_train_diagnostics
+from utils.wandb_utils import wandb_log
 from torch.utils.tensorboard import SummaryWriter
 from datasets.bases import ImageTextDataset
 from datasets.build import build_transforms, collate, make_data_loader_generator, seed_worker
@@ -150,6 +152,53 @@ def _update_meter(meters, key, value, batch_size):
     meters[key].update(value, batch_size)
 
 
+def _prefix_metrics(prefix, metrics):
+    return {f"{prefix}/{key}": value for key, value in metrics.items()}
+
+
+def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_steps):
+    metrics = {
+        "train/epoch": epoch,
+        "train/iteration": current_steps,
+        "train/total_loss": meters["loss"].avg,
+        "train/weighted_loss": meters["loss"].avg,
+        "train/lr": optimizer.param_groups[0]["lr"],
+    }
+    lrs = [group["lr"] for group in optimizer.param_groups]
+    metrics["train/lr_min"] = min(lrs)
+    metrics["train/lr_max"] = max(lrs)
+
+    for loss_key in loss_components.keys():
+        if loss_key in meters and meters[loss_key].count > 0:
+            metrics[f"train/weighted_loss/{loss_key}"] = meters[loss_key].avg
+
+    for key, meter in meters.items():
+        if key.endswith("_grad_norm") and meter.count > 0:
+            loss_name = key[: -len("_grad_norm")]
+            metrics[f"train/loss_grad_norm/{loss_name}"] = meter.avg
+
+    dashboard_keys = [
+        "host_margin_mean",
+        "host_margin_p10",
+        "hard_pos_margin_mean",
+        "negative_intrusion_rate",
+        "mean_first_positive_rank",
+        "proto_margin_img_mean",
+        "proto_margin_txt_mean",
+        "negative_proto_margin_rate",
+        "dead_slot_rate",
+        "effective_slots_per_id",
+        "slot_redundancy",
+        "assignment_flip_rate",
+        "hard_negative_overlap",
+        "proto_to_host_margin_corr",
+    ]
+    for key in dashboard_keys:
+        if key in meters and meters[key].count > 0:
+            metrics[f"train/{key}"] = meters[key].avg
+    return metrics
+
+
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
              scheduler, checkpointer):
 
@@ -160,6 +209,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     arguments = {}
     arguments["num_epoch"] = num_epoch
     arguments["iteration"] = 0
+    arguments["epoch"] = start_epoch - 1
 
     logger = logging.getLogger("ITSELF.train")
     logger.info('start training')
@@ -171,11 +221,20 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     tb_writer = SummaryWriter(log_dir=args.output_dir)
 
     best_top1 = 0.0
-    evaluator.eval(model.eval())
+    initial_eval = evaluator.eval(model.eval(), return_metrics=(get_rank() == 0))
+    if get_rank() == 0 and isinstance(initial_eval, tuple):
+        initial_top1, initial_metrics = initial_eval
+        wandb_metrics = {
+            "val/epoch": 0,
+            "val/top1": initial_top1,
+        }
+        wandb_metrics.update(_prefix_metrics("val", initial_metrics))
+        wandb_log(wandb_metrics, step=0)
     # train
     now_top1 = 0
     current_epoch = 0
     current_steps = 0 
+    train_diag_state = {"assignments": {}}
     for epoch in range(start_epoch, num_epoch + 1):
         current_epoch += 1
         start_time = time.time()
@@ -208,6 +267,9 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 grad_norms = _grad_norm_by_loss(loss_components, model)
                 for grad_key, grad_norm in grad_norms.items():
                     _update_meter(meters, grad_key, grad_norm, batch_size)
+                train_diag_metrics = compute_train_diagnostics(model, ret, args, train_diag_state)
+                for diag_key, diag_value in train_diag_metrics.items():
+                    _update_meter(meters, diag_key, diag_value, batch_size)
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
@@ -220,6 +282,9 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                         info_str += f", {k}: {v.avg:.4f}"
                 info_str += f", Base Lr: {args.lr:.2e}"
                 logger.info(info_str)
+                if get_rank() == 0:
+                    wandb_log(_train_wandb_metrics(meters, loss_components, optimizer, epoch, current_steps),
+                              step=current_steps)
 
         tb_writer.add_scalar('lr', scheduler.get_lr()[0], epoch)
         tb_writer.add_scalar('temperature', ret['temperature'], epoch)
@@ -240,10 +305,17 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             if get_rank() == 0:
                 logger.info("Validation Results - Epoch: {}".format(epoch))
                 if args.distributed:
-                    top1 = evaluator.eval(model.module.eval())
+                    top1, val_metrics = evaluator.eval(model.module.eval(), return_metrics=True)
                 else:
-                    top1 = evaluator.eval(model.eval())
+                    top1, val_metrics = evaluator.eval(model.eval(), return_metrics=True)
                 now_top1 = max(now_top1,top1)
+                wandb_metrics = {
+                    "val/epoch": epoch,
+                    "val/top1": top1,
+                    "val/best_top1": max(best_top1, top1),
+                }
+                wandb_metrics.update(_prefix_metrics("val", val_metrics))
+                wandb_log(wandb_metrics, step=current_steps)
                 torch.cuda.empty_cache()
                 if best_top1 < top1:
                     best_top1 = top1

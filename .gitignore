@@ -221,3 +221,4 @@ __marimo__/
 tests/*
 logs/*
 docs/*
+wait_pid_then_train.sh
