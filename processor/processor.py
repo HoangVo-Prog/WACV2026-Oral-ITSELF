@@ -152,8 +152,14 @@ def _update_meter(meters, key, value, batch_size):
     meters[key].update(value, batch_size)
 
 
-def _prefix_metrics(prefix, metrics):
-    return {f"{prefix}/{key}": value for key, value in metrics.items()}
+def _best_val_wandb_metrics(best_metrics):
+    metrics = {}
+    for key in ("R1", "R5", "R10", "mAP", "mINP", "rSum"):
+        if key in best_metrics:
+            metrics[f"val/best_row/{key}"] = best_metrics[key]
+    if best_metrics.get("task"):
+        metrics["val/best_row_task"] = best_metrics["task"]
+    return metrics
 
 
 def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_steps):
@@ -199,6 +205,14 @@ def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_step
     return metrics
 
 
+def _train_console_metrics(meters, loss_components):
+    keys = ["loss"]
+    for loss_key in loss_components.keys():
+        keys.append(loss_key)
+        keys.append(f"{loss_key}_grad_norm")
+    return keys
+
+
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
              scheduler, checkpointer):
 
@@ -223,12 +237,12 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     best_top1 = 0.0
     initial_eval = evaluator.eval(model.eval(), return_metrics=(get_rank() == 0))
     if get_rank() == 0 and isinstance(initial_eval, tuple):
-        initial_top1, initial_metrics = initial_eval
+        initial_top1, _, initial_best_metrics = initial_eval
         wandb_metrics = {
             "val/epoch": 0,
             "val/top1": initial_top1,
         }
-        wandb_metrics.update(_prefix_metrics("val", initial_metrics))
+        wandb_metrics.update(_best_val_wandb_metrics(initial_best_metrics))
         wandb_log(wandb_metrics, step=0)
     # train
     now_top1 = 0
@@ -277,8 +291,9 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             if (n_iter + 1) % log_period == 0:
                 info_str = f"Epoch[{epoch}] Iteration[{n_iter + 1}/{len(train_loader)}]"
                 # log loss and acc info
-                for k, v in meters.items():
-                    if v.count > 0:
+                for k in _train_console_metrics(meters, loss_components):
+                    v = meters.get(k)
+                    if v is not None and v.count > 0:
                         info_str += f", {k}: {v.avg:.4f}"
                 info_str += f", Base Lr: {args.lr:.2e}"
                 logger.info(info_str)
@@ -305,16 +320,16 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
             if get_rank() == 0:
                 logger.info("Validation Results - Epoch: {}".format(epoch))
                 if args.distributed:
-                    top1, val_metrics = evaluator.eval(model.module.eval(), return_metrics=True)
+                    top1, _, best_val_metrics = evaluator.eval(model.module.eval(), return_metrics=True)
                 else:
-                    top1, val_metrics = evaluator.eval(model.eval(), return_metrics=True)
+                    top1, _, best_val_metrics = evaluator.eval(model.eval(), return_metrics=True)
                 now_top1 = max(now_top1,top1)
                 wandb_metrics = {
                     "val/epoch": epoch,
                     "val/top1": top1,
                     "val/best_top1": max(best_top1, top1),
                 }
-                wandb_metrics.update(_prefix_metrics("val", val_metrics))
+                wandb_metrics.update(_best_val_wandb_metrics(best_val_metrics))
                 wandb_log(wandb_metrics, step=current_steps)
                 torch.cuda.empty_cache()
                 if best_top1 < top1:

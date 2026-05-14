@@ -193,33 +193,46 @@ class Evaluator():
 
         top1 = 0
         metrics = {}
+        best_metrics = {}
 
         for key in sims_dict.keys():
             sims = sims_dict[key]
             rs = get_metrics(sims, qids, gids, f'{key}-t2i',False)
             table.add_row(rs)
-            metrics.update({
+            row_metrics = {
                 f"{rs[0]}/R1": float(rs[1]),
                 f"{rs[0]}/R5": float(rs[2]),
                 f"{rs[0]}/R10": float(rs[3]),
                 f"{rs[0]}/mAP": float(rs[4]),
                 f"{rs[0]}/mINP": float(rs[5]),
                 f"{rs[0]}/rSum": float(rs[6]),
-            })
+            }
+            metrics.update(row_metrics)
+            if float(rs[1]) >= float(top1):
+                best_metrics = {
+                    "task": rs[0],
+                    "R1": float(rs[1]),
+                    "R5": float(rs[2]),
+                    "R10": float(rs[3]),
+                    "mAP": float(rs[4]),
+                    "mINP": float(rs[5]),
+                    "rSum": float(rs[6]),
+                }
             if i2t_metric:
                 i2t_cmc, i2t_mAP, i2t_mINP, _ = rank(similarity=sims.t(), q_pids=gids, g_pids=qids, max_rank=10, get_mAP=True)
                 i2t_cmc, i2t_mAP, i2t_mINP = i2t_cmc.numpy(), i2t_mAP.numpy(), i2t_mINP.numpy()
                 i2t_name = f'{key}-i2t'
                 i2t_rsum = i2t_cmc[0] + i2t_cmc[4] + i2t_cmc[9]
                 table.add_row([i2t_name, i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP, i2t_rsum])
-                metrics.update({
+                row_metrics = {
                     f"{i2t_name}/R1": float(i2t_cmc[0]),
                     f"{i2t_name}/R5": float(i2t_cmc[4]),
                     f"{i2t_name}/R10": float(i2t_cmc[9]),
                     f"{i2t_name}/mAP": float(i2t_mAP),
                     f"{i2t_name}/mINP": float(i2t_mINP),
                     f"{i2t_name}/rSum": float(i2t_rsum),
-                })
+                }
+                metrics.update(row_metrics)
 
             top1 = max(top1,rs[1])
 
@@ -233,5 +246,5 @@ class Evaluator():
         self.logger.info('\n' + "best R1 = " + str(top1))
 
         if return_metrics:
-            return top1, metrics
+            return top1, metrics, best_metrics
         return top1
