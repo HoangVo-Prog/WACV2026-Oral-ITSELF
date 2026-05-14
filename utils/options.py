@@ -63,6 +63,8 @@ def get_args():
     parser.add_argument("--prototype_warmup_epochs", type=int, default=0)
     parser.add_argument("--prototype_tau", type=float, default=0.05)
     parser.add_argument("--prototype_hard_k", type=int, default=16)
+    parser.add_argument("--prototype_hard_k_mode", type=str, default="fixed", choices=["fixed", "adaptive"],
+                        help="Use fixed prototype_hard_k or modality-aware adaptive hard-negative scheduling.")
     parser.add_argument("--prototype_id_weight", type=float, default=0.2)
     parser.add_argument("--prototype_score_weight", type=float, default=0.1)
     parser.add_argument("--prototype_score_weights", type=float, nargs='+',
