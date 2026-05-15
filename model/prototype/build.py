@@ -66,7 +66,16 @@ class PrototypeBranch(nn.Module):
     def project_for_memory(self, image_features, text_features):
         return self._project(image_features, text_features)
 
-    def forward(self, image_features, text_features, pids, use_loss_id=True, epoch=None):
+    def forward(
+        self,
+        image_features,
+        text_features,
+        pids,
+        use_loss_id=True,
+        epoch=None,
+        host_image_features=None,
+        host_text_features=None,
+    ):
         image_features, text_features = self._project(image_features, text_features)
         zero = image_features.sum() * 0.0
         if not self.is_ready():
@@ -86,6 +95,9 @@ class PrototypeBranch(nn.Module):
                 tau=getattr(self.args, "prototype_tau", 0.05),
                 hard_k=getattr(self.args, "prototype_hard_k", 16),
                 hard_k_mode=getattr(self.args, "prototype_hard_k_mode", "fixed"),
+                pressure_mode=getattr(self.args, "prototype_pressure_mode", "fixed"),
+                host_image_features=host_image_features,
+                host_text_features=host_text_features,
                 epoch=epoch,
                 warmup_epochs=getattr(self.args, "prototype_warmup_epochs", 0),
                 return_details=True,

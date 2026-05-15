@@ -195,6 +195,12 @@ def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_step
         "negative_proto_margin_rate",
         "prototype_k_img",
         "prototype_k_txt",
+        "prototype_host_gate_img_mean",
+        "prototype_host_gate_img_p10",
+        "prototype_host_gate_img_p90",
+        "prototype_host_gate_txt_mean",
+        "prototype_host_gate_txt_p10",
+        "prototype_host_gate_txt_p90",
         "dead_slot_rate",
         "effective_slots_per_id",
         "slot_redundancy",
@@ -230,12 +236,14 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
 
     logger = logging.getLogger("ITSELF.train")
     logger.info('start training')
+    logger.info("Prototype pressure mode: %s", getattr(args, "prototype_pressure_mode", "fixed"))
 
     meters = {
         "loss": AverageMeter(),
     }
 
     tb_writer = SummaryWriter(log_dir=args.output_dir)
+    tb_writer.add_text("prototype_pressure_mode", getattr(args, "prototype_pressure_mode", "fixed"), 0)
 
     best_top1 = 0.0
     initial_eval = evaluator.eval(model.eval(), return_metrics=(get_rank() == 0))

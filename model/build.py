@@ -281,12 +281,11 @@ class ITSELF(nn.Module):
         if not self.args.only_global:
             i_grab_f = features["i_grab_f"]
             t_grab_f = features["t_grab_f"]
+            host_image_feats, host_text_feats = i_grab_f, t_grab_f
+        else:
+            host_image_feats, host_text_feats = i_feats, t_feats
 
         if getattr(self.args, "track_train_diagnostics", True):
-            if not self.args.only_global:
-                host_image_feats, host_text_feats = i_grab_f, t_grab_f
-            else:
-                host_image_feats, host_text_feats = i_feats, t_feats
             proto_image_feats, proto_text_feats = self._select_prototype_features(features)
             ret["_diag"] = {
                 "host_image_feats": host_image_feats.detach(),
@@ -355,6 +354,8 @@ class ITSELF(nn.Module):
                 batch['pids'],
                 use_loss_id=getattr(self.args, "use_loss_id", False),
                 epoch=epoch,
+                host_image_features=host_image_feats,
+                host_text_features=host_text_feats,
             )
             for key, value in proto_ret.items():
                 if key == "proto_id_loss":

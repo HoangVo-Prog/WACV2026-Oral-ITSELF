@@ -238,6 +238,17 @@ def compute_train_diagnostics(model, ret, args, state):
         "prototype_k_img": float(hard_k_img),
         "prototype_k_txt": float(hard_k_txt),
     })
+    for key in (
+        "prototype_host_gate_img_mean",
+        "prototype_host_gate_img_p10",
+        "prototype_host_gate_img_p90",
+        "prototype_host_gate_txt_mean",
+        "prototype_host_gate_txt_p10",
+        "prototype_host_gate_txt_p90",
+    ):
+        value = _to_float(ret.get(key))
+        if value is not None:
+            metrics[key] = value
     metrics.update(_assignment_metrics(
         memory,
         proto_image,
