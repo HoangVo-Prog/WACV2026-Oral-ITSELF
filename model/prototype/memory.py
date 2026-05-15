@@ -57,20 +57,22 @@ class PrototypeMemory(nn.Module):
         self.initialized.fill_(True)
 
     @torch.no_grad()
-    def ema_update(self, image_features, text_features, pids):
+    def ema_update(self, image_features, text_features, pids, image_to_text_weights=None):
         if not self.is_ready():
             return
 
         image_features = F.normalize(image_features.float(), p=2, dim=1)
         text_features = F.normalize(text_features.float(), p=2, dim=1)
         pids = pids.long()
+        if image_to_text_weights is not None:
+            image_to_text_weights = image_to_text_weights.detach().float().view(-1)
 
         image_assign = self.assign_identity(image_features, pids, self.image_prototypes)
         text_assign = self.assign_identity(text_features, pids, self.text_prototypes)
         self._ema_scatter(self.image_prototypes, image_assign, image_features)
         self._ema_scatter(self.text_prototypes, text_assign, text_features)
         self._ema_scatter(self.text_to_image, text_assign, image_features)
-        self._ema_scatter(self.image_to_text, image_assign, text_features)
+        self._ema_scatter(self.image_to_text, image_assign, text_features, weights=image_to_text_weights)
 
     @torch.no_grad()
     def _rebuild_pbt(self, image_features, text_features, pids):
@@ -93,26 +95,30 @@ class PrototypeMemory(nn.Module):
             bank[valid] = means
 
     @torch.no_grad()
-    def _ema_scatter(self, bank, assignments, features):
-        valid, means = self._group_means(assignments, features, bank)
+    def _ema_scatter(self, bank, assignments, features, weights=None):
+        valid, means = self._group_means(assignments, features, bank, weights=weights)
         if valid.numel() > 0:
             bank[valid] = F.normalize((1.0 - self.momentum) * bank[valid] + self.momentum * means, p=2, dim=1)
 
     @torch.no_grad()
-    def _group_means(self, assignments, features, bank):
-        return self._scatter_group_means(assignments, features, bank)
+    def _group_means(self, assignments, features, bank, weights=None):
+        return self._scatter_group_means(assignments, features, bank, weights=weights)
 
     @torch.no_grad()
-    def _scatter_group_means(self, assignments, features, bank):
+    def _scatter_group_means(self, assignments, features, bank, weights=None):
         assignments = assignments.to(bank.device).long()
         features = features.to(bank.device, dtype=bank.dtype)
         sums = torch.zeros_like(bank)
         counts = torch.zeros(bank.shape[0], 1, device=bank.device, dtype=bank.dtype)
-        sums.index_add_(0, assignments, features)
+        if weights is None:
+            sample_weights = torch.ones(assignments.shape[0], 1, device=bank.device, dtype=bank.dtype)
+        else:
+            sample_weights = weights.to(bank.device, dtype=bank.dtype).view(-1, 1).clamp_min(0.0)
+        sums.index_add_(0, assignments, features * sample_weights)
         counts.index_add_(
             0,
             assignments,
-            torch.ones(assignments.shape[0], 1, device=bank.device, dtype=bank.dtype),
+            sample_weights,
         )
         valid_mask = counts.squeeze(1) > 0
         valid = valid_mask.nonzero(as_tuple=False).flatten()

@@ -72,6 +72,51 @@ def test_scatter_group_means_match_deterministic_group_means_on_cpu():
     assert torch.allclose(means, expected, atol=1e-6)
 
 
+def test_weighted_image_to_text_update_only_changes_translated_text_bank():
+    memory = PrototypeMemory(num_classes=2, prototypes_per_id=1, dim=2, momentum=1.0)
+    bank = F.normalize(torch.tensor([[1.0, 0.0], [0.0, 1.0]]), p=2, dim=1)
+    memory.image_prototypes.copy_(bank)
+    memory.text_prototypes.copy_(bank)
+    memory.text_to_image.copy_(bank)
+    memory.image_to_text.copy_(bank)
+    memory.initialized.fill_(True)
+
+    image_features = F.normalize(
+        torch.tensor(
+            [
+                [1.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+            ]
+        ),
+        p=2,
+        dim=1,
+    )
+    text_features = F.normalize(
+        torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [1.0, 0.0],
+            ]
+        ),
+        p=2,
+        dim=1,
+    )
+    pids = torch.tensor([0, 0, 1, 1])
+    weights = torch.tensor([2.0, 0.5, 1.0, 1.0])
+
+    memory.ema_update(image_features, text_features, pids, image_to_text_weights=weights)
+
+    expected_weighted_text = F.normalize(torch.tensor([[2.0, 0.5]]), p=2, dim=1).squeeze(0)
+    expected_uniform_text = F.normalize(torch.tensor([[1.0, 1.0]]), p=2, dim=1).squeeze(0)
+    assert torch.allclose(memory.image_to_text[0], expected_weighted_text, atol=1e-6)
+    assert torch.allclose(memory.text_prototypes[0], expected_uniform_text, atol=1e-6)
+    assert torch.allclose(memory.text_to_image[0], torch.tensor([1.0, 0.0]), atol=1e-6)
+
+
 def test_identity_assignment_stays_inside_identity_slots():
     features = F.normalize(
         torch.tensor(
@@ -242,6 +287,7 @@ def test_branch_forward_and_score_shapes():
         prototype_hard_k=1,
         prototype_hard_k_mode="fixed",
         prototype_pressure_mode="fixed",
+        prototype_text_update_mode="uniform",
         prototype_warmup_epochs=0,
         use_loss_id=True,
     )
@@ -268,6 +314,62 @@ def test_branch_forward_and_score_shapes():
     assert scores.shape == (4, 4)
 
 
+def test_branch_confidence_weighted_text_update_logs_weight_stats():
+    args = SimpleNamespace(
+        only_global=True,
+        prototype_feature="auto",
+        prototype_dim=3,
+        prototype_per_id=1,
+        prototype_momentum=0.2,
+        prototype_kmeans_iters=2,
+        prototype_tau=0.05,
+        prototype_hard_k=1,
+        prototype_hard_k_mode="fixed",
+        prototype_pressure_mode="fixed",
+        prototype_text_update_mode="confidence_weighted",
+        prototype_warmup_epochs=0,
+        use_loss_id=True,
+    )
+    branch = PrototypeBranch(args, num_classes=2, feature_dim=3)
+    image_features = torch.randn(4, 3)
+    text_features = torch.randn(4, 3)
+    pids = torch.tensor([0, 1, 0, 1])
+    branch.initialize_projected(
+        F.normalize(torch.eye(3)[[0, 1, 0, 1]], p=2, dim=1),
+        F.normalize(torch.eye(3)[[0, 1, 0, 1]], p=2, dim=1),
+        pids,
+    )
+    host_image_features = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.2, 0.8, 0.0],
+            [0.9, 0.1, 0.0],
+            [0.0, 1.0, 0.0],
+        ]
+    )
+    host_text_features = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.6, 0.4, 0.0],
+            [0.4, 0.6, 0.0],
+        ]
+    )
+
+    ret = branch(
+        image_features,
+        text_features,
+        pids,
+        host_image_features=host_image_features,
+        host_text_features=host_text_features,
+    )
+
+    assert torch.isfinite(ret["proto_id_loss"])
+    assert torch.allclose(ret["prototype_text_update_weight_mean"], torch.tensor(1.0), atol=1e-6)
+    assert float(ret["prototype_text_update_weight_p90"]) > float(ret["prototype_text_update_weight_p10"])
+    assert float(ret["prototype_text_update_weight_uniform_fallback"]) == 0.0
+
+
 def test_branch_score_accepts_cpu_features_when_module_is_cuda():
     if not torch.cuda.is_available():
         return
@@ -283,6 +385,7 @@ def test_branch_score_accepts_cpu_features_when_module_is_cuda():
         prototype_hard_k=1,
         prototype_hard_k_mode="fixed",
         prototype_pressure_mode="fixed",
+        prototype_text_update_mode="uniform",
         prototype_warmup_epochs=0,
         use_loss_id=True,
     )
@@ -303,6 +406,7 @@ if __name__ == "__main__":
     test_torch_kmeans_shape_and_normalization()
     test_torch_kmeans_respects_explicit_generator()
     test_scatter_group_means_match_deterministic_group_means_on_cpu()
+    test_weighted_image_to_text_update_only_changes_translated_text_bank()
     test_identity_assignment_stays_inside_identity_slots()
     test_pbt_empty_slots_fall_back_to_same_side_prototypes()
     test_prototype_score_prefers_positive_pairs()
@@ -310,4 +414,5 @@ if __name__ == "__main__":
     test_host_aligned_pressure_uses_fixed_hard_k_and_logs_gates()
     test_host_aligned_pressure_ramps_from_uniform_gate()
     test_branch_forward_and_score_shapes()
+    test_branch_confidence_weighted_text_update_logs_weight_stats()
     test_branch_score_accepts_cpu_features_when_module_is_cuda()

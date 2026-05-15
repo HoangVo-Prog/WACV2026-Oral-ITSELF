@@ -246,6 +246,10 @@ def compute_train_diagnostics(model, ret, args, state):
         "prototype_host_gate_txt_p10",
         "prototype_host_gate_txt_p90",
         "prototype_host_gate_alpha",
+        "prototype_text_update_weight_mean",
+        "prototype_text_update_weight_p10",
+        "prototype_text_update_weight_p90",
+        "prototype_text_update_weight_uniform_fallback",
     ):
         value = _to_float(ret.get(key))
         if value is not None:

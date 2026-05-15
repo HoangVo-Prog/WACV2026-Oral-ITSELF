@@ -1,5 +1,5 @@
 import argparse
-def get_args():
+def get_args(argv=None):
     parser = argparse.ArgumentParser(description="ITSELF Args")
     parser.add_argument("--tau", default=0.015, type=float)
     parser.add_argument("--select_ratio", default=0.4, type=float)
@@ -67,6 +67,9 @@ def get_args():
                         help="Use fixed prototype_hard_k or modality-aware adaptive hard-negative scheduling.")
     parser.add_argument("--prototype_pressure_mode", type=str, default="fixed", choices=["fixed", "host_aligned"],
                         help="Use uniform prototype ID pressure or detached host-margin aligned pressure gates.")
+    parser.add_argument("--prototype_text_update_mode", type=str, default="uniform",
+                        choices=["uniform", "confidence_weighted"],
+                        help="Use uniform image_to_text EMA updates or detached host-margin confidence weighting.")
     parser.add_argument("--prototype_id_weight", type=float, default=0.2)
     parser.add_argument("--prototype_score_weight", type=float, default=0.1)
     parser.add_argument("--prototype_score_weights", type=float, nargs='+',
@@ -123,5 +126,5 @@ def get_args():
     parser.add_argument("--average_attn_weights", type=bool, default=True)
     parser.add_argument("--modify_k", action='store_true')
     
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     return args

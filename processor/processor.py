@@ -162,7 +162,7 @@ def _best_val_wandb_metrics(best_metrics):
     return metrics
 
 
-def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_steps):
+def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_steps, args=None):
     metrics = {
         "train/epoch": epoch,
         "train/iteration": current_steps,
@@ -170,6 +170,8 @@ def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_step
         "train/weighted_loss": meters["loss"].avg,
         "train/lr": optimizer.param_groups[0]["lr"],
     }
+    if args is not None:
+        metrics["train/prototype_text_update_mode"] = getattr(args, "prototype_text_update_mode", "uniform")
     lrs = [group["lr"] for group in optimizer.param_groups]
     metrics["train/lr_min"] = min(lrs)
     metrics["train/lr_max"] = max(lrs)
@@ -202,6 +204,10 @@ def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_step
         "prototype_host_gate_txt_p10",
         "prototype_host_gate_txt_p90",
         "prototype_host_gate_alpha",
+        "prototype_text_update_weight_mean",
+        "prototype_text_update_weight_p10",
+        "prototype_text_update_weight_p90",
+        "prototype_text_update_weight_uniform_fallback",
         "dead_slot_rate",
         "effective_slots_per_id",
         "slot_redundancy",
@@ -238,6 +244,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     logger = logging.getLogger("ITSELF.train")
     logger.info('start training')
     logger.info("Prototype pressure mode: %s", getattr(args, "prototype_pressure_mode", "fixed"))
+    logger.info("Prototype text update mode: %s", getattr(args, "prototype_text_update_mode", "uniform"))
 
     meters = {
         "loss": AverageMeter(),
@@ -245,6 +252,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
 
     tb_writer = SummaryWriter(log_dir=args.output_dir)
     tb_writer.add_text("prototype_pressure_mode", getattr(args, "prototype_pressure_mode", "fixed"), 0)
+    tb_writer.add_text("prototype_text_update_mode", getattr(args, "prototype_text_update_mode", "uniform"), 0)
 
     best_top1 = 0.0
     initial_eval = evaluator.eval(model.eval(), return_metrics=(get_rank() == 0))
@@ -310,7 +318,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 info_str += f", Base Lr: {args.lr:.2e}"
                 logger.info(info_str)
                 if get_rank() == 0:
-                    wandb_log(_train_wandb_metrics(meters, loss_components, optimizer, epoch, current_steps),
+                    wandb_log(_train_wandb_metrics(meters, loss_components, optimizer, epoch, current_steps, args=args),
                               step=current_steps)
 
         tb_writer.add_scalar('lr', scheduler.get_lr()[0], epoch)
