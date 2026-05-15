@@ -177,6 +177,8 @@ def test_host_aligned_pressure_uses_fixed_hard_k_and_logs_gates():
         pressure_mode="host_aligned",
         host_image_features=host_image_features,
         host_text_features=host_text_features,
+        epoch=3,
+        warmup_epochs=0,
         return_details=True,
     )
     grads = torch.autograd.grad(loss, [image_features, text_features], allow_unused=True)
@@ -187,6 +189,45 @@ def test_host_aligned_pressure_uses_fixed_hard_k_and_logs_gates():
     assert float(details["prototype_k_txt"]) == 1.0
     assert torch.allclose(details["prototype_host_gate_img_mean"], torch.tensor(1.0), atol=1e-6)
     assert torch.allclose(details["prototype_host_gate_txt_mean"], torch.tensor(1.0), atol=1e-6)
+    assert torch.allclose(details["prototype_host_gate_alpha"], torch.tensor(0.5), atol=1e-6)
+    assert float(details["prototype_host_gate_img_p10"]) > 0.6
+    assert float(details["prototype_host_gate_txt_p10"]) > 0.6
+    assert float(details["prototype_host_gate_img_p90"]) < 1.6
+    assert float(details["prototype_host_gate_txt_p90"]) < 1.6
+
+
+def test_host_aligned_pressure_ramps_from_uniform_gate():
+    memory = PrototypeMemory(num_classes=2, prototypes_per_id=1, dim=3)
+    bank = F.normalize(torch.eye(3)[:2], p=2, dim=1)
+    memory.text_to_image.copy_(bank)
+    memory.image_to_text.copy_(bank)
+    memory.initialized.fill_(True)
+
+    image_features = torch.randn(4, 3, requires_grad=True)
+    text_features = torch.randn(4, 3, requires_grad=True)
+    host_image_features = torch.randn(4, 3)
+    host_text_features = torch.randn(4, 3)
+    pids = torch.tensor([0, 1, 0, 1])
+
+    _, details = symmetric_identity_proxy_loss(
+        image_features,
+        text_features,
+        pids,
+        memory,
+        hard_k=1,
+        pressure_mode="host_aligned",
+        host_image_features=host_image_features,
+        host_text_features=host_text_features,
+        epoch=0,
+        warmup_epochs=0,
+        return_details=True,
+    )
+
+    assert torch.allclose(details["prototype_host_gate_alpha"], torch.tensor(0.0), atol=1e-6)
+    assert torch.allclose(details["prototype_host_gate_img_p10"], torch.tensor(1.0), atol=1e-6)
+    assert torch.allclose(details["prototype_host_gate_img_p90"], torch.tensor(1.0), atol=1e-6)
+    assert torch.allclose(details["prototype_host_gate_txt_p10"], torch.tensor(1.0), atol=1e-6)
+    assert torch.allclose(details["prototype_host_gate_txt_p90"], torch.tensor(1.0), atol=1e-6)
 
 
 def test_branch_forward_and_score_shapes():
@@ -267,5 +308,6 @@ if __name__ == "__main__":
     test_prototype_score_prefers_positive_pairs()
     test_per_sample_identity_proxy_matches_reduced_loss()
     test_host_aligned_pressure_uses_fixed_hard_k_and_logs_gates()
+    test_host_aligned_pressure_ramps_from_uniform_gate()
     test_branch_forward_and_score_shapes()
     test_branch_score_accepts_cpu_features_when_module_is_cuda()

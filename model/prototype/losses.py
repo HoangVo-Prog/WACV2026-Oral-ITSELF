@@ -4,6 +4,12 @@ import torch
 import torch.nn.functional as F
 
 
+_HAPG_GATE_MIN = 0.5
+_HAPG_GATE_MAX = 1.5
+_HAPG_ALPHA_MAX = 0.5
+_HAPG_RAMP_EPOCHS = 3
+
+
 def _masked_logsumexp(values, mask, dim):
     return values.masked_fill(~mask, float("-inf")).logsumexp(dim=dim)
 
@@ -52,6 +58,30 @@ def _uniform_gate(batch_size, device):
     return gate, _gate_stats(gate)
 
 
+def _gate_details(img_stats, txt_stats, alpha):
+    return {
+        "prototype_host_gate_img_mean": img_stats["mean"],
+        "prototype_host_gate_img_p10": img_stats["p10"],
+        "prototype_host_gate_img_p90": img_stats["p90"],
+        "prototype_host_gate_txt_mean": txt_stats["mean"],
+        "prototype_host_gate_txt_p10": txt_stats["p10"],
+        "prototype_host_gate_txt_p90": txt_stats["p90"],
+        "prototype_host_gate_alpha": alpha,
+    }
+
+
+def _renormalize_gate(gate, eps=1e-6):
+    mean = gate.mean().clamp_min(eps)
+    return gate / mean
+
+
+def _conservative_gate(raw_gate, alpha):
+    conservative = raw_gate.clamp(_HAPG_GATE_MIN, _HAPG_GATE_MAX)
+    conservative = _renormalize_gate(conservative)
+    gate = (1.0 - alpha) + alpha * conservative
+    return _renormalize_gate(gate)
+
+
 def _host_margins_from_similarity(similarity, pids):
     pids = pids.long().to(similarity.device)
     pos_mask = pids.unsqueeze(0).eq(pids.unsqueeze(1))
@@ -65,7 +95,7 @@ def _host_margins_from_similarity(similarity, pids):
 
 
 @torch.no_grad()
-def _host_aligned_gates(image_host_features, text_host_features, pids, eps=1e-6):
+def _host_aligned_gates(image_host_features, text_host_features, pids, epoch=None, warmup_epochs=0, eps=1e-6):
     batch_size = int(pids.shape[0]) if pids is not None else 0
     if image_host_features is not None:
         device = image_host_features.device
@@ -78,34 +108,25 @@ def _host_aligned_gates(image_host_features, text_host_features, pids, eps=1e-6)
 
     img_gate, img_stats = _uniform_gate(batch_size, device)
     txt_gate, txt_stats = _uniform_gate(batch_size, device)
+    zero_alpha = torch.tensor(0.0, device=device, dtype=torch.float32)
 
     if (
         batch_size < 2
         or image_host_features is None
         or text_host_features is None
     ):
-        return img_gate, txt_gate, {
-            "prototype_host_gate_img_mean": img_stats["mean"],
-            "prototype_host_gate_img_p10": img_stats["p10"],
-            "prototype_host_gate_img_p90": img_stats["p90"],
-            "prototype_host_gate_txt_mean": txt_stats["mean"],
-            "prototype_host_gate_txt_p10": txt_stats["p10"],
-            "prototype_host_gate_txt_p90": txt_stats["p90"],
-        }
+        return img_gate, txt_gate, _gate_details(img_stats, txt_stats, zero_alpha)
 
     image_host_features = F.normalize(image_host_features.detach().float().to(device), p=2, dim=1)
     text_host_features = F.normalize(text_host_features.detach().float().to(device), p=2, dim=1)
     pids = pids.long().to(device)
 
     if pids.unique(sorted=False).numel() < 2:
-        return img_gate, txt_gate, {
-            "prototype_host_gate_img_mean": img_stats["mean"],
-            "prototype_host_gate_img_p10": img_stats["p10"],
-            "prototype_host_gate_img_p90": img_stats["p90"],
-            "prototype_host_gate_txt_mean": txt_stats["mean"],
-            "prototype_host_gate_txt_p10": txt_stats["p10"],
-            "prototype_host_gate_txt_p90": txt_stats["p90"],
-        }
+        return img_gate, txt_gate, _gate_details(img_stats, txt_stats, zero_alpha)
+
+    progress = _schedule_progress(epoch, warmup_epochs, ramp_epochs=_HAPG_RAMP_EPOCHS)
+    alpha_value = _HAPG_ALPHA_MAX * progress
+    alpha = torch.tensor(alpha_value, device=device, dtype=torch.float32)
 
     sims = text_host_features @ image_host_features.t()
     txt_margin, txt_valid = _host_margins_from_similarity(sims, pids)
@@ -115,24 +136,17 @@ def _host_aligned_gates(image_host_features, text_host_features, pids, eps=1e-6)
         txt_std = txt_margin.float().std(unbiased=False)
         if bool(torch.isfinite(txt_std).item()) and txt_std.item() > eps:
             txt_z = (txt_margin.float() - txt_margin.float().mean()) / (txt_std + eps)
-            txt_gate = batch_size * torch.softmax(-txt_z, dim=0)
+            txt_gate = _conservative_gate(batch_size * torch.softmax(-txt_z, dim=0), alpha)
             txt_stats = _gate_stats(txt_gate)
 
     if bool(img_valid.all().item()):
         img_std = img_margin.float().std(unbiased=False)
         if bool(torch.isfinite(img_std).item()) and img_std.item() > eps:
             img_z = (img_margin.float() - img_margin.float().mean()) / (img_std + eps)
-            img_gate = batch_size * torch.softmax(-img_z, dim=0)
+            img_gate = _conservative_gate(batch_size * torch.softmax(-img_z, dim=0), alpha)
             img_stats = _gate_stats(img_gate)
 
-    return img_gate, txt_gate, {
-        "prototype_host_gate_img_mean": img_stats["mean"],
-        "prototype_host_gate_img_p10": img_stats["p10"],
-        "prototype_host_gate_img_p90": img_stats["p90"],
-        "prototype_host_gate_txt_mean": txt_stats["mean"],
-        "prototype_host_gate_txt_p10": txt_stats["p10"],
-        "prototype_host_gate_txt_p90": txt_stats["p90"],
-    }
+    return img_gate, txt_gate, _gate_details(img_stats, txt_stats, alpha)
 
 
 @torch.no_grad()
@@ -294,7 +308,7 @@ def symmetric_identity_proxy_loss(
 
     if pressure_mode == "host_aligned":
         image_gate, text_gate, gate_details = _host_aligned_gates(
-            host_image_features, host_text_features, pids
+            host_image_features, host_text_features, pids, epoch=epoch, warmup_epochs=warmup_epochs
         )
         image_gate = image_gate.to(image_losses.device)
         text_gate = text_gate.to(text_losses.device)

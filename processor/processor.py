@@ -201,6 +201,7 @@ def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_step
         "prototype_host_gate_txt_mean",
         "prototype_host_gate_txt_p10",
         "prototype_host_gate_txt_p90",
+        "prototype_host_gate_alpha",
         "dead_slot_rate",
         "effective_slots_per_id",
         "slot_redundancy",
