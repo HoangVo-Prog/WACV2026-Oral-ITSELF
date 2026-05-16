@@ -110,8 +110,17 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     image_features = torch.cat(image_features, dim=0)
     text_features = torch.cat(text_features, dim=0)
     pids = torch.cat(pids, dim=0)
-    branch.initialize_projected(image_features, text_features, pids)
+    allocation_metrics = branch.initialize_projected(image_features, text_features, pids)
     logger.info("Prototype banks initialized with {} samples".format(pids.numel()))
+    if allocation_metrics:
+        logger.info(
+            "Prototype slot allocation: mode=%s, max_per_id=%s, active_mean=%.3f, active_rate=%.3f, fallback=%s",
+            getattr(args, "prototype_slot_mode", "fixed"),
+            allocation_metrics.get("prototype_max_per_id"),
+            allocation_metrics.get("prototype_active_slots_mean", 0.0),
+            allocation_metrics.get("prototype_active_slot_rate", 0.0),
+            bool(allocation_metrics.get("prototype_allocation_fallback", 0.0)),
+        )
 
 
 def _loss_components(ret):
@@ -172,6 +181,10 @@ def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_step
     }
     if args is not None:
         metrics["train/prototype_text_update_mode"] = getattr(args, "prototype_text_update_mode", "uniform")
+        metrics["train/prototype_slot_mode"] = getattr(args, "prototype_slot_mode", "fixed")
+        prototype_max_per_id = getattr(args, "prototype_max_per_id", None)
+        if prototype_max_per_id is not None:
+            metrics["train/prototype_max_per_id"] = prototype_max_per_id
     lrs = [group["lr"] for group in optimizer.param_groups]
     metrics["train/lr_min"] = min(lrs)
     metrics["train/lr_max"] = max(lrs)
@@ -208,9 +221,19 @@ def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_step
         "prototype_text_update_weight_p10",
         "prototype_text_update_weight_p90",
         "prototype_text_update_weight_uniform_fallback",
+        "prototype_max_per_id",
+        "prototype_active_slots_mean",
+        "prototype_active_slots_p10",
+        "prototype_active_slots_p90",
+        "prototype_active_slots_min",
+        "prototype_active_slots_max",
+        "prototype_active_slot_rate",
+        "prototype_allocation_fallback",
         "dead_slot_rate",
+        "active_dead_slot_rate",
         "effective_slots_per_id",
         "slot_redundancy",
+        "physical_slot_redundancy",
         "assignment_flip_rate",
         "hard_negative_overlap",
         "proto_to_host_margin_corr",
@@ -245,6 +268,8 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     logger.info('start training')
     logger.info("Prototype pressure mode: %s", getattr(args, "prototype_pressure_mode", "fixed"))
     logger.info("Prototype text update mode: %s", getattr(args, "prototype_text_update_mode", "uniform"))
+    logger.info("Prototype slot mode: %s", getattr(args, "prototype_slot_mode", "fixed"))
+    logger.info("Prototype max per ID: %s", getattr(args, "prototype_max_per_id", None))
 
     meters = {
         "loss": AverageMeter(),
@@ -253,6 +278,8 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     tb_writer = SummaryWriter(log_dir=args.output_dir)
     tb_writer.add_text("prototype_pressure_mode", getattr(args, "prototype_pressure_mode", "fixed"), 0)
     tb_writer.add_text("prototype_text_update_mode", getattr(args, "prototype_text_update_mode", "uniform"), 0)
+    tb_writer.add_text("prototype_slot_mode", getattr(args, "prototype_slot_mode", "fixed"), 0)
+    tb_writer.add_text("prototype_max_per_id", str(getattr(args, "prototype_max_per_id", None)), 0)
 
     best_top1 = 0.0
     initial_eval = evaluator.eval(model.eval(), return_metrics=(get_rank() == 0))

@@ -140,6 +140,77 @@ def test_identity_assignment_stays_inside_identity_slots():
     assert torch.equal(assigned_pids, pids)
 
 
+def test_adaptive_masked_initialization_keeps_physical_cap_and_active_budget():
+    features = F.normalize(
+        torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.9, 0.1, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.9, 0.1],
+            ]
+        ),
+        p=2,
+        dim=1,
+    )
+    pids = torch.tensor([0, 0, 1, 1])
+    memory = PrototypeMemory(
+        num_classes=2,
+        prototypes_per_id=1,
+        prototype_max_per_id=3,
+        slot_mode="adaptive_masked",
+        dim=3,
+    )
+    metrics = memory.initialize(features, features, pids, num_iters=2, seed=4)
+
+    assert memory.image_prototypes.shape == (6, 3)
+    assert memory.proto_active_mask.view(2, 3).sum(dim=1).tolist() == [1, 1]
+    assert metrics["prototype_active_slots_mean"] == 1.0
+    assert abs(metrics["prototype_active_slot_rate"] - (1.0 / 3.0)) < 1e-6
+
+
+def test_identity_assignment_and_ema_ignore_inactive_slots():
+    memory = PrototypeMemory(
+        num_classes=2,
+        prototypes_per_id=1,
+        prototype_max_per_id=3,
+        slot_mode="adaptive_masked",
+        dim=2,
+        momentum=1.0,
+    )
+    bank = F.normalize(
+        torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [-1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 0.0],
+                [-1.0, 0.0],
+            ]
+        ),
+        p=2,
+        dim=1,
+    )
+    memory.image_prototypes.copy_(bank)
+    memory.text_prototypes.copy_(bank)
+    memory.text_to_image.copy_(bank)
+    memory.image_to_text.copy_(bank)
+    memory.proto_active_mask.copy_(torch.tensor([False, True, False, True, False, False]))
+    memory.initialized.fill_(True)
+
+    features = F.normalize(torch.tensor([[1.0, 0.0], [-1.0, 0.0]]), p=2, dim=1)
+    pids = torch.tensor([0, 1])
+    assignments = memory.assign_identity(features, pids, memory.image_prototypes)
+    assert assignments.tolist() == [1, 3]
+
+    inactive_before = memory.image_prototypes[[0, 2, 4, 5]].clone()
+    memory.ema_update(features, features, pids)
+    assert torch.allclose(memory.image_prototypes[[0, 2, 4, 5]], inactive_before, atol=1e-6)
+    assert torch.allclose(memory.image_prototypes[1], features[0], atol=1e-6)
+    assert torch.allclose(memory.image_prototypes[3], features[1], atol=1e-6)
+
+
 def test_pbt_empty_slots_fall_back_to_same_side_prototypes():
     image_features = F.normalize(torch.tensor([[1.0, 0.0]]), p=2, dim=1)
     text_features = F.normalize(torch.tensor([[0.0, 1.0]]), p=2, dim=1)
@@ -180,6 +251,32 @@ def test_per_sample_identity_proxy_matches_reduced_loss():
 
     assert details["valid_mask"].all()
     assert torch.allclose(per_sample.mean(), reduced, atol=1e-6)
+
+
+def test_identity_proxy_loss_masks_inactive_wrong_identity_prototypes():
+    features = F.normalize(torch.tensor([[1.0, 0.0], [0.0, 1.0]]), p=2, dim=1)
+    prototypes = F.normalize(
+        torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [1.0, 0.0],
+            ]
+        ),
+        p=2,
+        dim=1,
+    )
+    pids = torch.tensor([0, 1])
+    proto_pids = torch.tensor([0, 0, 1, 1])
+    active_mask = torch.tensor([True, False, True, False])
+
+    masked = identity_proxy_contrastive(
+        features, pids, prototypes, proto_pids, tau=0.1, hard_k=2, proto_active_mask=active_mask
+    )
+    unmasked = identity_proxy_contrastive(features, pids, prototypes, proto_pids, tau=0.1, hard_k=2)
+
+    assert masked < unmasked
 
 
 def test_host_aligned_pressure_uses_fixed_hard_k_and_logs_gates():
@@ -408,9 +505,12 @@ if __name__ == "__main__":
     test_scatter_group_means_match_deterministic_group_means_on_cpu()
     test_weighted_image_to_text_update_only_changes_translated_text_bank()
     test_identity_assignment_stays_inside_identity_slots()
+    test_adaptive_masked_initialization_keeps_physical_cap_and_active_budget()
+    test_identity_assignment_and_ema_ignore_inactive_slots()
     test_pbt_empty_slots_fall_back_to_same_side_prototypes()
     test_prototype_score_prefers_positive_pairs()
     test_per_sample_identity_proxy_matches_reduced_loss()
+    test_identity_proxy_loss_masks_inactive_wrong_identity_prototypes()
     test_host_aligned_pressure_uses_fixed_hard_k_and_logs_gates()
     test_host_aligned_pressure_ramps_from_uniform_gate()
     test_branch_forward_and_score_shapes()
