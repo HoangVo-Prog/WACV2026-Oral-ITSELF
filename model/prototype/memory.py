@@ -57,6 +57,70 @@ class PrototypeMemory(nn.Module):
         self.initialized.fill_(True)
 
     @torch.no_grad()
+    def refresh(self, image_features, text_features, pids, num_iters=20, seed=None, alpha=0.35, refresh_epoch=None, refresh_step=-1):
+        if not self.is_ready():
+            return {"prototype_refresh_done": 0.0}
+        if alpha < 0.0 or alpha > 1.0:
+            raise ValueError("prototype refresh alpha must be in [0, 1]")
+
+        image_features = F.normalize(image_features.float(), p=2, dim=1)
+        text_features = F.normalize(text_features.float(), p=2, dim=1)
+        pids = pids.long()
+
+        old_image = self.image_prototypes.detach().clone()
+        old_text = self.text_prototypes.detach().clone()
+        old_text_to_image = self.text_to_image.detach().clone()
+        old_image_to_text = self.image_to_text.detach().clone()
+
+        image_bank = identity_kmeans(
+            image_features,
+            pids,
+            self.num_classes,
+            self.prototypes_per_id,
+            num_iters=num_iters,
+            seed=seed,
+        )
+        text_bank = identity_kmeans(
+            text_features,
+            pids,
+            self.num_classes,
+            self.prototypes_per_id,
+            num_iters=num_iters,
+            seed=None if seed is None else int(seed) + 1,
+        )
+
+        image_bank = self._align_identity_slots(old_image, image_bank)
+        text_bank = self._align_identity_slots(old_text, text_bank)
+
+        refreshed_image = self._blend_bank(old_image, image_bank, alpha)
+        refreshed_text = self._blend_bank(old_text, text_bank, alpha)
+        self.image_prototypes.copy_(refreshed_image)
+        self.text_prototypes.copy_(refreshed_text)
+
+        text_to_image, image_to_text = self._build_pbt_banks(
+            image_features,
+            text_features,
+            pids,
+            self.image_prototypes,
+            self.text_prototypes,
+        )
+        refreshed_text_to_image = self._blend_bank(old_text_to_image, text_to_image, alpha)
+        refreshed_image_to_text = self._blend_bank(old_image_to_text, image_to_text, alpha)
+        self.text_to_image.copy_(refreshed_text_to_image)
+        self.image_to_text.copy_(refreshed_image_to_text)
+
+        return {
+            "prototype_refresh_done": 1.0,
+            "prototype_refresh_epoch": float(refresh_epoch) if refresh_epoch is not None else -1.0,
+            "prototype_refresh_alpha": float(alpha),
+            "prototype_refresh_step": float(refresh_step),
+            "prototype_refresh_image_delta": self._bank_delta(old_image, self.image_prototypes),
+            "prototype_refresh_text_delta": self._bank_delta(old_text, self.text_prototypes),
+            "prototype_refresh_text_to_image_delta": self._bank_delta(old_text_to_image, self.text_to_image),
+            "prototype_refresh_image_to_text_delta": self._bank_delta(old_image_to_text, self.image_to_text),
+        }
+
+    @torch.no_grad()
     def ema_update(self, image_features, text_features, pids):
         if not self.is_ready():
             return
@@ -74,17 +138,75 @@ class PrototypeMemory(nn.Module):
 
     @torch.no_grad()
     def _rebuild_pbt(self, image_features, text_features, pids):
-        image_features = image_features.to(self.image_prototypes.device)
-        text_features = text_features.to(self.text_prototypes.device)
-        pids = pids.to(self.proto_pids.device)
+        text_to_image, image_to_text = self._build_pbt_banks(
+            image_features,
+            text_features,
+            pids,
+            self.image_prototypes,
+            self.text_prototypes,
+        )
+        self.text_to_image.copy_(text_to_image)
+        self.image_to_text.copy_(image_to_text)
 
-        image_assign = self.assign_identity(image_features, pids, self.image_prototypes)
-        text_assign = self.assign_identity(text_features, pids, self.text_prototypes)
+    @torch.no_grad()
+    def _build_pbt_banks(self, image_features, text_features, pids, image_bank, text_bank):
+        device = self.image_prototypes.device
+        image_features = F.normalize(image_features.to(device).float(), p=2, dim=1)
+        text_features = F.normalize(text_features.to(device).float(), p=2, dim=1)
+        pids = pids.to(device)
+        image_bank = F.normalize(image_bank.to(device).float(), p=2, dim=1)
+        text_bank = F.normalize(text_bank.to(device).float(), p=2, dim=1)
 
-        self.text_to_image.copy_(self.image_prototypes)
-        self.image_to_text.copy_(self.text_prototypes)
-        self._mean_scatter(self.text_to_image, text_assign, image_features)
-        self._mean_scatter(self.image_to_text, image_assign, text_features)
+        image_assign = self.assign_identity(image_features, pids, image_bank)
+        text_assign = self.assign_identity(text_features, pids, text_bank)
+
+        text_to_image = image_bank.clone()
+        image_to_text = text_bank.clone()
+        self._mean_scatter(text_to_image, text_assign, image_features)
+        self._mean_scatter(image_to_text, image_assign, text_features)
+        return text_to_image, image_to_text
+
+    @torch.no_grad()
+    def _align_identity_slots(self, old_bank, new_bank):
+        device = self.image_prototypes.device
+        old_bank = F.normalize(old_bank.to(device).float(), p=2, dim=1)
+        new_bank = F.normalize(new_bank.to(device).float(), p=2, dim=1)
+        if self.prototypes_per_id <= 1:
+            return new_bank
+
+        old_by_id = old_bank.view(self.num_classes, self.prototypes_per_id, self.dim)
+        new_by_id = new_bank.view(self.num_classes, self.prototypes_per_id, self.dim)
+        aligned = torch.empty_like(new_by_id)
+
+        for pid in range(self.num_classes):
+            sims = old_by_id[pid] @ new_by_id[pid].t()
+            order = sims.reshape(-1).argsort(descending=True).tolist()
+            used_old = set()
+            used_new = set()
+            for flat_idx in order:
+                old_idx = flat_idx // self.prototypes_per_id
+                new_idx = flat_idx % self.prototypes_per_id
+                if old_idx in used_old or new_idx in used_new:
+                    continue
+                aligned[pid, old_idx] = new_by_id[pid, new_idx]
+                used_old.add(old_idx)
+                used_new.add(new_idx)
+                if len(used_old) == self.prototypes_per_id:
+                    break
+
+        return aligned.reshape(self.total_prototypes, self.dim)
+
+    @torch.no_grad()
+    def _blend_bank(self, old_bank, new_bank, alpha):
+        old_bank = old_bank.to(self.image_prototypes.device).float()
+        new_bank = new_bank.to(self.image_prototypes.device).float()
+        return F.normalize((1.0 - float(alpha)) * old_bank + float(alpha) * new_bank, p=2, dim=1)
+
+    @torch.no_grad()
+    def _bank_delta(self, old_bank, new_bank):
+        old_bank = F.normalize(old_bank.to(new_bank.device).float(), p=2, dim=1)
+        new_bank = F.normalize(new_bank.float(), p=2, dim=1)
+        return (1.0 - (old_bank * new_bank).sum(dim=1)).mean().detach().cpu().item()
 
     @torch.no_grad()
     def _mean_scatter(self, bank, assignments, features):

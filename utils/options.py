@@ -61,6 +61,12 @@ def get_args():
     parser.add_argument("--prototype_dim", type=int, default=512)
     parser.add_argument("--prototype_kmeans_iters", type=int, default=20)
     parser.add_argument("--prototype_warmup_epochs", type=int, default=0)
+    parser.add_argument("--prototype_refresh_start_epoch", type=int, default=-1,
+                        help="TAPR refresh start epoch; negative disables refresh.")
+    parser.add_argument("--prototype_refresh_step", type=int, default=-1,
+                        help="TAPR refresh interval; -1 refreshes once, positive values refresh periodically.")
+    parser.add_argument("--prototype_refresh_alpha", type=float, default=0.35,
+                        help="TAPR anchored blend strength for refreshed prototype banks.")
     parser.add_argument("--prototype_tau", type=float, default=0.05)
     parser.add_argument("--prototype_hard_k", type=int, default=16)
     parser.add_argument("--prototype_id_weight", type=float, default=0.2)
