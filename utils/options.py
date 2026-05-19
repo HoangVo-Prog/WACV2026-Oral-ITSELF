@@ -21,6 +21,8 @@ def get_args():
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
     parser.add_argument("--finetune", type=str, default="")
+    parser.add_argument("--finetune_clip", type=str, default="",
+                        help="load weights from a CLIP-only ITSELF checkpoint into the current model")
     parser.add_argument("--pretrain", type=str, default="") # unused
     parser.add_argument("--nohup", default=False, action='store_true',
                         help="redirect stdout/stderr to a timestamped .log file")
@@ -99,6 +101,8 @@ def get_args():
     
     ######################## scheduler ########################
     parser.add_argument("--num_epoch", type=int, default=60)
+    parser.add_argument("--lr_total_epochs", type=int, default=None,
+                        help="total epoch horizon for LR decay; defaults to --num_epoch")
     parser.add_argument("--milestones", type=int, nargs='+', default=(45, 50))
     parser.add_argument("--gamma", type=float, default=0.1)
     parser.add_argument("--warmup_factor", type=float, default=0.1)
