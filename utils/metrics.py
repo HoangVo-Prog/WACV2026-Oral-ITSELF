@@ -137,7 +137,7 @@ class Evaluator():
         gfeats = torch.cat(gfeats, 0)
         return qfeats.cpu(), gfeats.cpu(), qids.cpu(), gids.cpu()
 
-    def eval(self, model, i2t_metric=False):
+    def eval(self, model, i2t_metric=False, return_metrics=False):
         qfeats, gfeats, qids, gids = self._compute_embedding(model)
         qfeats_raw, gfeats_raw = qfeats, gfeats
         qfeats = F.normalize(qfeats, p=2, dim=1) # text features
@@ -192,15 +192,47 @@ class Evaluator():
         table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP","rSum"])
 
         top1 = 0
+        metrics = {}
+        best_metrics = {}
 
         for key in sims_dict.keys():
             sims = sims_dict[key]
             rs = get_metrics(sims, qids, gids, f'{key}-t2i',False)
             table.add_row(rs)
+            row_metrics = {
+                f"{rs[0]}/R1": float(rs[1]),
+                f"{rs[0]}/R5": float(rs[2]),
+                f"{rs[0]}/R10": float(rs[3]),
+                f"{rs[0]}/mAP": float(rs[4]),
+                f"{rs[0]}/mINP": float(rs[5]),
+                f"{rs[0]}/rSum": float(rs[6]),
+            }
+            metrics.update(row_metrics)
+            if float(rs[1]) >= float(top1):
+                best_metrics = {
+                    "task": rs[0],
+                    "R1": float(rs[1]),
+                    "R5": float(rs[2]),
+                    "R10": float(rs[3]),
+                    "mAP": float(rs[4]),
+                    "mINP": float(rs[5]),
+                    "rSum": float(rs[6]),
+                }
             if i2t_metric:
                 i2t_cmc, i2t_mAP, i2t_mINP, _ = rank(similarity=sims.t(), q_pids=gids, g_pids=qids, max_rank=10, get_mAP=True)
                 i2t_cmc, i2t_mAP, i2t_mINP = i2t_cmc.numpy(), i2t_mAP.numpy(), i2t_mINP.numpy()
-                table.add_row(['i2t', i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP])
+                i2t_name = f'{key}-i2t'
+                i2t_rsum = i2t_cmc[0] + i2t_cmc[4] + i2t_cmc[9]
+                table.add_row([i2t_name, i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP, i2t_rsum])
+                row_metrics = {
+                    f"{i2t_name}/R1": float(i2t_cmc[0]),
+                    f"{i2t_name}/R5": float(i2t_cmc[4]),
+                    f"{i2t_name}/R10": float(i2t_cmc[9]),
+                    f"{i2t_name}/mAP": float(i2t_mAP),
+                    f"{i2t_name}/mINP": float(i2t_mINP),
+                    f"{i2t_name}/rSum": float(i2t_rsum),
+                }
+                metrics.update(row_metrics)
 
             top1 = max(top1,rs[1])
 
@@ -209,8 +241,10 @@ class Evaluator():
         table.custom_format["R10"] = lambda f, v: f"{v:.2f}"
         table.custom_format["mAP"] = lambda f, v: f"{v:.2f}"
         table.custom_format["mINP"] = lambda f, v: f"{v:.2f}"
-        table.custom_format["RSum"] = lambda f, v: f"{v:.2f}"
+        table.custom_format["rSum"] = lambda f, v: f"{v:.2f}"
         self.logger.info('\n' + str(table))
         self.logger.info('\n' + "best R1 = " + str(top1))
 
+        if return_metrics:
+            return top1, metrics, best_metrics
         return top1

@@ -16,6 +16,7 @@ from model import build_model
 from utils.metrics import Evaluator
 from utils.options import get_args
 from utils.comm import get_rank, synchronize
+from utils.wandb_utils import setup_wandb, wandb_finish
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -114,6 +115,7 @@ if __name__ == '__main__':
     logger.info("Using {} GPUs".format(num_gpus))
     logger.info(str(args).replace(',', '\n'))
     save_train_configs(args.output_dir, args)
+    wandb_run = setup_wandb(args, cur_time, logger)
     if not os.path.isdir(args.output_dir+'/img'):
         os.makedirs(args.output_dir+'/img')
 
@@ -153,4 +155,8 @@ if __name__ == '__main__':
         start_epoch = checkpoint['epoch']
         logger.info(f"===================>start {start_epoch}")
 
-    do_train(start_epoch, args, model, train_loader, evaluator, optimizer, scheduler, checkpointer)
+    try:
+        do_train(start_epoch, args, model, train_loader, evaluator, optimizer, scheduler, checkpointer)
+    finally:
+        if wandb_run is not None:
+            wandb_finish()
