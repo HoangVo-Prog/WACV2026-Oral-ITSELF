@@ -10,6 +10,7 @@ from utils.meter import AverageMeter
 from utils.metrics import Evaluator
 from utils.comm import get_rank, synchronize
 from utils.rng import preserve_rng_state
+from utils.prototype_refresh import prototype_refresh_due, validate_prototype_refresh_args
 from utils.train_diagnostics import compute_train_diagnostics
 from utils.wandb_utils import wandb_log
 from torch.utils.tensorboard import SummaryWriter
@@ -88,6 +89,50 @@ def _validate_prototype_init_coverage(pids, num_classes, expected_samples):
 
 
 @torch.no_grad()
+def _collect_projected_prototype_features(model, train_loader, args, device, logger, action):
+    model_without_ddp = _unwrap_model(model)
+    branch = getattr(model_without_ddp, "prototype_branch", None)
+    if branch is None:
+        return None
+
+    logger.info("%s identity-aware PBT prototypes from train embeddings", action)
+    was_training = model_without_ddp.training
+
+    prototype_loader = _build_prototype_init_loader(train_loader, args)
+    expected_samples = len(prototype_loader.dataset)
+    logger.info("Using full train dataset for prototype %s", action.lower())
+
+    dataset = getattr(prototype_loader, "dataset", None)
+    old_txt_aug = getattr(dataset, "txt_aug", None)
+    image_features, text_features, pids = [], [], []
+
+    try:
+        model_without_ddp.eval()
+        if old_txt_aug is not None:
+            dataset.txt_aug = False
+
+        with preserve_rng_state(getattr(args, "prototype_seed", 1001)):
+            for batch in prototype_loader:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                image_feat, text_feat = model_without_ddp.extract_prototype_features(batch)
+                image_feat, text_feat = branch.project_for_memory(image_feat, text_feat)
+                image_features.append(image_feat.cpu())
+                text_features.append(text_feat.cpu())
+                pids.append(batch['pids'].cpu())
+
+            image_features = torch.cat(image_features, dim=0)
+            text_features = torch.cat(text_features, dim=0)
+            pids = torch.cat(pids, dim=0)
+            _validate_prototype_init_coverage(pids, branch.memory.num_classes, expected_samples)
+    finally:
+        if old_txt_aug is not None:
+            dataset.txt_aug = old_txt_aug
+        model_without_ddp.train(was_training)
+
+    return branch, image_features, text_features, pids
+
+
+@torch.no_grad()
 def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     model_without_ddp = _unwrap_model(model)
     branch = getattr(model_without_ddp, "prototype_branch", None)
@@ -132,6 +177,71 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
         model_without_ddp.train(was_training)
 
     logger.info("Prototype banks initialized with {} samples".format(sample_count))
+
+
+def _log_prototype_refresh(metrics, logger, tb_writer, epoch, current_steps):
+    if not metrics:
+        return
+
+    logger.info(
+        "Prototype refresh: done=%s, epoch=%s, alpha=%.3f, step=%s, "
+        "image_delta=%.6f, text_delta=%.6f, text_to_image_delta=%.6f, image_to_text_delta=%.6f",
+        bool(metrics.get("prototype_refresh_done", 0.0)),
+        int(metrics.get("prototype_refresh_epoch", epoch)),
+        float(metrics.get("prototype_refresh_alpha", 0.0)),
+        int(metrics.get("prototype_refresh_step", -1)),
+        float(metrics.get("prototype_refresh_image_delta", 0.0)),
+        float(metrics.get("prototype_refresh_text_delta", 0.0)),
+        float(metrics.get("prototype_refresh_text_to_image_delta", 0.0)),
+        float(metrics.get("prototype_refresh_image_to_text_delta", 0.0)),
+    )
+    if tb_writer is not None:
+        for key, value in metrics.items():
+            tb_writer.add_scalar(key, value, epoch)
+    if get_rank() == 0:
+        wandb_log({f"train/{key}": value for key, value in metrics.items()}, step=current_steps)
+
+
+@torch.no_grad()
+def maybe_refresh_prototypes(model, train_loader, args, device, logger, epoch, tb_writer=None, current_steps=0):
+    if not prototype_refresh_due(args, epoch):
+        return {}
+
+    model_without_ddp = _unwrap_model(model)
+    branch = getattr(model_without_ddp, "prototype_branch", None)
+    if branch is None:
+        return {}
+    if not branch.is_ready():
+        logger.warning("Skipping prototype refresh at epoch %s because memory is not initialized", epoch)
+        metrics = {
+            "prototype_refresh_done": 0.0,
+            "prototype_refresh_epoch": float(epoch),
+            "prototype_refresh_alpha": float(getattr(args, "prototype_refresh_alpha", 0.35)),
+            "prototype_refresh_step": float(getattr(args, "prototype_refresh_step", -1)),
+            "prototype_refresh_image_delta": 0.0,
+            "prototype_refresh_text_delta": 0.0,
+            "prototype_refresh_text_to_image_delta": 0.0,
+            "prototype_refresh_image_to_text_delta": 0.0,
+        }
+        _log_prototype_refresh(metrics, logger, tb_writer, epoch, current_steps)
+        return metrics
+
+    collected = _collect_projected_prototype_features(
+        model,
+        train_loader,
+        args,
+        device,
+        logger,
+        action="Refreshing",
+    )
+    if collected is None:
+        return {}
+
+    _, image_features, text_features, pids = collected
+    with preserve_rng_state(int(getattr(args, "prototype_seed", 1001)) + 2000 + int(epoch)):
+        metrics = branch.refresh_projected(image_features, text_features, pids, epoch=epoch)
+    _log_prototype_refresh(metrics, logger, tb_writer, epoch, current_steps)
+    return metrics
 
 
 def _loss_components(ret):
@@ -247,6 +357,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
 
     logger = logging.getLogger("ITSELF.train")
     logger.info('start training')
+    validate_prototype_refresh_args(args)
 
     meters = {
         "loss": AverageMeter(),
@@ -278,6 +389,16 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         if _prototype_requested(args):
             if epoch > getattr(args, "prototype_warmup_epochs", 1) and not _prototype_ready(model):
                 maybe_initialize_prototypes(model, train_loader, args, device, logger)
+            maybe_refresh_prototypes(
+                model,
+                train_loader,
+                args,
+                device,
+                logger,
+                epoch,
+                tb_writer=tb_writer,
+                current_steps=current_steps,
+            )
 
         model.train()
         model.epoch = epoch

@@ -62,6 +62,23 @@ class PrototypeBranch(nn.Module):
         )
 
     @torch.no_grad()
+    def refresh_projected(self, image_features, text_features, pids, epoch=None):
+        refresh_seed = int(getattr(self.args, "prototype_seed", 1001)) + 2000
+        if epoch is not None:
+            refresh_seed += int(epoch)
+        return self.memory.refresh(
+            F.normalize(image_features.float(), p=2, dim=1).detach(),
+            F.normalize(text_features.float(), p=2, dim=1).detach(),
+            pids.detach(),
+            num_iters=getattr(self.args, "prototype_kmeans_iters", 20),
+            kmeans_init=getattr(self.args, "prototype_kmeans_init", "deterministic"),
+            seed=refresh_seed,
+            alpha=getattr(self.args, "prototype_refresh_alpha", 0.35),
+            refresh_epoch=epoch,
+            refresh_step=getattr(self.args, "prototype_refresh_step", -1),
+        )
+
+    @torch.no_grad()
     def project_for_memory(self, image_features, text_features):
         return self._project(image_features, text_features)
 
