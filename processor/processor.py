@@ -248,6 +248,9 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     now_top1 = 0
     current_epoch = 0
     current_steps = 0 
+    early_stop_patience = max(int(getattr(args, "early_stop_patience", 0)), 0)
+    early_stop_min_delta = max(float(getattr(args, "early_stop_min_delta", 0.0)), 0.0)
+    epochs_without_improvement = 0
     train_diag_state = {"assignments": {}}
     for epoch in range(start_epoch, num_epoch + 1):
         current_epoch += 1
@@ -332,12 +335,31 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 wandb_metrics.update(_best_val_wandb_metrics(best_val_metrics))
                 wandb_log(wandb_metrics, step=current_steps)
                 torch.cuda.empty_cache()
-                if best_top1 < top1:
+                improved = top1 > best_top1 + early_stop_min_delta
+                if improved:
                     best_top1 = top1
+                    epochs_without_improvement = 0
                     arguments["epoch"] = epoch
                     checkpointer.save("best", **arguments)
+                else:
+                    epochs_without_improvement += 1
+                    if early_stop_patience > 0:
+                        logger.info(
+                            "Early stop monitor: %d/%d validation checks without R1 improvement >= %.4f",
+                            epochs_without_improvement,
+                            early_stop_patience,
+                            early_stop_min_delta,
+                        )
+                        if epochs_without_improvement >= early_stop_patience:
+                            logger.info(
+                                "Early stopping at epoch %d. Best R1: %s at epoch %s",
+                                epoch,
+                                best_top1,
+                                arguments["epoch"],
+                            )
+                            break
                 
- 
+
     if get_rank() == 0:
         logger.info(f"best R1: {best_top1} at epoch {arguments['epoch']}")
 

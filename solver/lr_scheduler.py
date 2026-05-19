@@ -61,9 +61,9 @@ class LRSchedulerWithWarmup(_LRScheduler):
                 for base_lr in self.base_lrs
             ]
 
-        epoch_ratio = (self.last_epoch - self.warmup_epochs) / (
-            self.total_epochs - self.warmup_epochs
-        )
+        decay_epochs = max(self.total_epochs - self.warmup_epochs, 1)
+        epoch_ratio = (self.last_epoch - self.warmup_epochs) / decay_epochs
+        epoch_ratio = min(max(epoch_ratio, 0.0), 1.0)
 
         if self.mode == "exp":
             factor = epoch_ratio

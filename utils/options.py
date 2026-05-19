@@ -88,6 +88,8 @@ def get_args():
     
     ######################## scheduler ########################
     parser.add_argument("--num_epoch", type=int, default=60)
+    parser.add_argument("--lr_total_epochs", type=int, default=None,
+                        help="total epoch horizon for LR decay; defaults to --num_epoch")
     parser.add_argument("--milestones", type=int, nargs='+', default=(45, 50))
     parser.add_argument("--gamma", type=float, default=0.1)
     parser.add_argument("--warmup_factor", type=float, default=0.1)
@@ -96,6 +98,10 @@ def get_args():
     parser.add_argument("--lrscheduler", type=str, default="cosine")
     parser.add_argument("--target_lr", type=float, default=0)
     parser.add_argument("--power", type=float, default=0.9)
+    parser.add_argument("--early_stop_patience", type=int, default=0,
+                        help="number of validation checks without R1 improvement before stopping; 0 disables")
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.0,
+                        help="minimum R1 gain required to reset early-stop patience")
 
     ######################## dataset ########################
     parser.add_argument("--dataset_name", default="CUHK-PEDES", help="[CUHK-PEDES, ICFG-PEDES, RSTPReid]")
