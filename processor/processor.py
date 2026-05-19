@@ -3,6 +3,9 @@ import os
 import time
 
 import torch
+from torch.utils.data import DataLoader
+from datasets.bases import ImageTextDataset
+from datasets.build import build_transforms, collate
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
 from utils.comm import get_rank, synchronize
@@ -28,6 +31,61 @@ def _prototype_requested(args):
     )
 
 
+def _build_prototype_init_loader(train_loader, args):
+    train_set = getattr(train_loader, "dataset", None)
+    source_dataset = getattr(train_set, "dataset", None)
+    if source_dataset is None:
+        raise RuntimeError("Prototype full-dataset initialization requires train_loader.dataset.dataset")
+
+    prototype_set = ImageTextDataset(
+        source_dataset,
+        args,
+        transform=build_transforms(img_size=args.img_size, aug=False, is_train=False),
+        text_length=getattr(train_set, "text_length", args.text_length),
+        truncate=getattr(train_set, "truncate", True),
+    )
+    prototype_set.txt_aug = False
+    prototype_set.img_aug = False
+
+    return DataLoader(
+        prototype_set,
+        batch_size=getattr(args, "test_batch_size", args.batch_size),
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate,
+    )
+
+
+def _validate_prototype_init_coverage(pids, num_classes, expected_samples):
+    sample_count = pids.numel()
+    if sample_count != expected_samples:
+        raise RuntimeError(
+            "Prototype full-dataset initialization saw {} samples, expected {}".format(
+                sample_count,
+                expected_samples,
+            )
+        )
+
+    unique_pids = torch.unique(pids.long().cpu(), sorted=True)
+    expected_pids = torch.arange(num_classes, dtype=unique_pids.dtype)
+    if unique_pids.numel() == num_classes and torch.equal(unique_pids, expected_pids):
+        return
+
+    valid_pids = unique_pids[(unique_pids >= 0) & (unique_pids < num_classes)]
+    seen = torch.zeros(num_classes, dtype=torch.bool)
+    seen[valid_pids] = True
+    missing = seen.logical_not().nonzero(as_tuple=False).flatten().tolist()
+    preview = missing[:20]
+    suffix = "" if len(missing) <= 20 else "..."
+    raise RuntimeError(
+        "Prototype full-dataset initialization missing {} identities: {}{}".format(
+            len(missing),
+            preview,
+            suffix,
+        )
+    )
+
+
 @torch.no_grad()
 def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     model_without_ddp = _unwrap_model(model)
@@ -38,7 +96,11 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     logger.info("Initializing identity-aware PBT prototypes from train embeddings")
     was_training = model_without_ddp.training
 
-    dataset = getattr(train_loader, "dataset", None)
+    prototype_loader = _build_prototype_init_loader(train_loader, args)
+    expected_samples = len(prototype_loader.dataset)
+    logger.info("Using full train dataset for prototype initialization")
+
+    dataset = getattr(prototype_loader, "dataset", None)
     old_txt_aug = getattr(dataset, "txt_aug", None)
     image_features, text_features, pids = [], [], []
     sample_count = 0
@@ -49,7 +111,7 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
             dataset.txt_aug = False
 
         with preserve_rng_state(getattr(args, "prototype_seed", 1001)):
-            for batch in train_loader:
+            for batch in prototype_loader:
                 batch = {k: v.to(device) for k, v in batch.items()}
                 image_feat, text_feat = model_without_ddp.extract_prototype_features(batch)
                 image_feat, text_feat = branch.project_for_memory(image_feat, text_feat)
@@ -61,6 +123,7 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
             text_features = torch.cat(text_features, dim=0)
             pids = torch.cat(pids, dim=0)
             sample_count = pids.numel()
+            _validate_prototype_init_coverage(pids, branch.memory.num_classes, expected_samples)
             branch.initialize_projected(image_features, text_features, pids)
     finally:
         if old_txt_aug is not None:
