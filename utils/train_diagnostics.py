@@ -168,6 +168,13 @@ def _slot_redundancy(memory):
     return _mean(torch.stack(redundancies))
 
 
+def _selected_hard_k(ret, key, default):
+    value = _to_float(ret.get(key))
+    if value is None:
+        value = default
+    return max(int(round(value)), 1)
+
+
 @torch.no_grad()
 def compute_train_diagnostics(model, ret, args, state):
     diag = ret.get("_diag")
@@ -189,22 +196,29 @@ def compute_train_diagnostics(model, ret, args, state):
     proto_image, proto_text = branch.project_for_memory(proto_image, proto_text)
     memory = branch.memory
     hard_k = getattr(args, "prototype_hard_k", 16)
+    hard_k_img = _selected_hard_k(ret, "prototype_k_img", hard_k)
+    hard_k_txt = _selected_hard_k(ret, "prototype_k_txt", hard_k)
 
     img_margin, img_hard_pids = _prototype_margin(
         proto_image,
         memory.text_to_image,
         memory.proto_pids,
         pids,
-        hard_k,
+        hard_k_img,
     )
     txt_margin, txt_hard_pids = _prototype_margin(
         proto_text,
         memory.image_to_text,
         memory.proto_pids,
         pids,
-        hard_k,
+        hard_k_txt,
     )
     proto_margin = 0.5 * (img_margin + txt_margin)
+    img_margin_mean = _mean(img_margin)
+    txt_margin_mean = _mean(txt_margin)
+    margin_gap = None
+    if img_margin_mean is not None and txt_margin_mean is not None:
+        margin_gap = img_margin_mean - txt_margin_mean
 
     negative_proto = torch.cat([img_margin, txt_margin]).lt(0).float()
     host_hard = host_extra["hard_neg_pids"]
@@ -214,13 +228,56 @@ def compute_train_diagnostics(model, ret, args, state):
         overlap.append(float(host_pid in hard_ids))
 
     metrics.update({
-        "proto_margin_img_mean": _mean(img_margin),
-        "proto_margin_txt_mean": _mean(txt_margin),
+        "proto_margin_img_mean": img_margin_mean,
+        "proto_margin_txt_mean": txt_margin_mean,
+        "proto_margin_gap": margin_gap,
         "negative_proto_margin_rate": _mean(negative_proto),
         "hard_negative_overlap": _mean(torch.tensor(overlap)) if overlap else None,
         "proto_to_host_margin_corr": _corrcoef(proto_margin, host_extra["host_margin"]),
         "slot_redundancy": _slot_redundancy(memory),
+        "prototype_k_img": float(hard_k_img),
+        "prototype_k_txt": float(hard_k_txt),
     })
+    scheduler_keys = [
+        "prototype_img_k_raw",
+        "prototype_img_k_target",
+        "prototype_img_k_min",
+        "prototype_img_k_max",
+        "prototype_img_n_eff_mean",
+        "prototype_img_n_eff_q75",
+        "prototype_img_unsafe_rate",
+        "prototype_img_easy_rate",
+        "prototype_img_intrusion",
+        "prototype_img_intrusion_guard",
+        "prototype_img_alignment_guard",
+        "prototype_img_corr",
+        "prototype_img_overlap",
+        "prototype_img_gap_q05",
+        "prototype_img_gap_q50",
+        "prototype_img_gap_q75",
+        "prototype_img_fallback",
+        "prototype_txt_k_raw",
+        "prototype_txt_k_target",
+        "prototype_txt_k_min",
+        "prototype_txt_k_max",
+        "prototype_txt_n_eff_mean",
+        "prototype_txt_n_eff_q75",
+        "prototype_txt_unsafe_rate",
+        "prototype_txt_easy_rate",
+        "prototype_txt_intrusion",
+        "prototype_txt_intrusion_guard",
+        "prototype_txt_alignment_guard",
+        "prototype_txt_corr",
+        "prototype_txt_overlap",
+        "prototype_txt_gap_q05",
+        "prototype_txt_gap_q50",
+        "prototype_txt_gap_q75",
+        "prototype_txt_fallback",
+    ]
+    for key in scheduler_keys:
+        value = _to_float(ret.get(key))
+        if value is not None:
+            metrics[key] = value
     metrics.update(_assignment_metrics(
         memory,
         proto_image,

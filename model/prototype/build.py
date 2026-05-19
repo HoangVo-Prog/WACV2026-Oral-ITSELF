@@ -31,6 +31,7 @@ class PrototypeBranch(nn.Module):
             momentum=getattr(args, "prototype_momentum", 0.2),
             group_mean_impl=getattr(args, "prototype_group_mean_impl", "deterministic"),
         )
+        self.hard_k_state = {}
 
     def is_ready(self):
         return self.memory.is_ready()
@@ -65,7 +66,16 @@ class PrototypeBranch(nn.Module):
     def project_for_memory(self, image_features, text_features):
         return self._project(image_features, text_features)
 
-    def forward(self, image_features, text_features, pids, use_loss_id=True):
+    def forward(
+        self,
+        image_features,
+        text_features,
+        pids,
+        use_loss_id=True,
+        epoch=None,
+        host_image_features=None,
+        host_text_features=None,
+    ):
         image_features, text_features = self._project(image_features, text_features)
         zero = image_features.sum() * 0.0
         if not self.is_ready():
@@ -77,14 +87,23 @@ class PrototypeBranch(nn.Module):
         pids = pids.long()
         ret = {}
         if use_loss_id:
-            ret["proto_id_loss"] = symmetric_identity_proxy_loss(
+            proto_loss, proto_details = symmetric_identity_proxy_loss(
                 image_features,
                 text_features,
                 pids,
                 self.memory,
                 tau=getattr(self.args, "prototype_tau", 0.05),
                 hard_k=getattr(self.args, "prototype_hard_k", 16),
+                hard_k_mode=getattr(self.args, "prototype_hard_k_mode", "fixed"),
+                epoch=epoch,
+                warmup_epochs=getattr(self.args, "prototype_warmup_epochs", 0),
+                host_image_features=host_image_features,
+                host_text_features=host_text_features,
+                scheduler_state=self.hard_k_state,
+                return_details=True,
             )
+            ret["proto_id_loss"] = proto_loss
+            ret.update(proto_details)
 
         self.memory.ema_update(image_features.detach(), text_features.detach(), pids.detach())
         return ret
