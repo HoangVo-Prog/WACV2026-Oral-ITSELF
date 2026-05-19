@@ -125,7 +125,16 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
             pids = torch.cat(pids, dim=0)
             sample_count = pids.numel()
             _validate_prototype_init_coverage(pids, branch.memory.num_classes, expected_samples)
-            branch.initialize_projected(image_features, text_features, pids)
+            allocation_metrics = branch.initialize_projected(image_features, text_features, pids)
+            if allocation_metrics:
+                logger.info(
+                    "Prototype slot allocation: mode=%s, max_per_id=%s, active_mean=%.3f, active_rate=%.3f, fallback=%s",
+                    getattr(args, "prototype_slot_mode", "fixed"),
+                    allocation_metrics.get("prototype_max_per_id"),
+                    allocation_metrics.get("prototype_active_slots_mean", 0.0),
+                    allocation_metrics.get("prototype_active_slot_rate", 0.0),
+                    bool(allocation_metrics.get("prototype_allocation_fallback", 0.0)),
+                )
     finally:
         if old_txt_aug is not None:
             dataset.txt_aug = old_txt_aug
@@ -212,9 +221,19 @@ def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_step
         "proto_margin_img_mean",
         "proto_margin_txt_mean",
         "negative_proto_margin_rate",
+        "prototype_max_per_id",
+        "prototype_active_slots_mean",
+        "prototype_active_slots_p10",
+        "prototype_active_slots_p90",
+        "prototype_active_slots_min",
+        "prototype_active_slots_max",
+        "prototype_active_slot_rate",
+        "prototype_allocation_fallback",
         "dead_slot_rate",
+        "active_dead_slot_rate",
         "effective_slots_per_id",
         "slot_redundancy",
+        "physical_slot_redundancy",
         "assignment_flip_rate",
         "hard_negative_overlap",
         "proto_to_host_margin_corr",

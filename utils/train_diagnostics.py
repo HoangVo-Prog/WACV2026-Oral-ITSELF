@@ -86,22 +86,35 @@ def _batch_host_metrics(image_features, text_features, pids):
     }
 
 
-def _prototype_margin(features, prototypes, proto_pids, pids, hard_k):
+def _prototype_margin(features, prototypes, proto_pids, pids, hard_k, proto_active_mask=None):
     features = F.normalize(features.float(), p=2, dim=1)
     prototypes = F.normalize(prototypes.to(features.device).float(), p=2, dim=1)
     proto_pids = proto_pids.to(features.device)
+    if proto_active_mask is None:
+        proto_active_mask = torch.ones_like(proto_pids, dtype=torch.bool, device=features.device)
+    else:
+        proto_active_mask = proto_active_mask.to(features.device, dtype=torch.bool)
     pids = pids.long().to(features.device)
 
     logits = features @ prototypes.t()
-    pos_mask = proto_pids.unsqueeze(0).eq(pids.unsqueeze(1))
-    neg_mask = ~pos_mask
+    active_mask = proto_active_mask.unsqueeze(0)
+    pos_mask = proto_pids.unsqueeze(0).eq(pids.unsqueeze(1)) & active_mask
+    neg_mask = proto_pids.unsqueeze(0).ne(pids.unsqueeze(1)) & active_mask
     pos = logits.masked_fill(~pos_mask, float("-inf")).max(dim=1).values
     neg_logits = logits.masked_fill(~neg_mask, float("-inf"))
     neg = neg_logits.max(dim=1).values
 
-    k = min(max(int(hard_k), 1), neg_logits.shape[1])
-    topk_idx = neg_logits.topk(k=k, dim=1).indices
-    topk_pids = proto_pids[topk_idx].detach().cpu()
+    neg_pool = neg_mask.sum(dim=1)
+    pool_size = int(neg_pool.max().item()) if neg_pool.numel() > 0 else 0
+    if pool_size <= 0:
+        topk_pids = torch.full((features.shape[0], 1), -1, dtype=proto_pids.dtype)
+        return (pos - neg).detach().cpu(), topk_pids
+
+    k = min(max(int(hard_k), 1), pool_size)
+    topk_values, topk_idx = neg_logits.topk(k=k, dim=1)
+    topk_pids = proto_pids[topk_idx].detach().clone()
+    topk_pids[~torch.isfinite(topk_values)] = -1
+    topk_pids = topk_pids.cpu()
     return (pos - neg).detach().cpu(), topk_pids
 
 
@@ -110,10 +123,13 @@ def _assignment_metrics(memory, image_features, text_features, pids, indices, st
     text_assign = memory.assign_identity(text_features, pids, memory.text_prototypes).detach().cpu()
     pids_cpu = pids.detach().cpu().long()
     k = int(memory.prototypes_per_id)
+    active_by_id = memory.proto_active_mask.detach().cpu().view(memory.num_classes, k)
     present = pids_cpu.unique(sorted=True)
 
     dead_slots = 0
     total_slots = 0
+    active_dead_slots = 0
+    active_total_slots = 0
     effective_slots = []
 
     for pid in present.tolist():
@@ -124,7 +140,13 @@ def _assignment_metrics(memory, image_features, text_features, pids, indices, st
             total = counts.sum()
             if total <= 0:
                 continue
-            probs = counts / total
+            active_local = active_by_id[pid]
+            active_counts = counts[active_local]
+            if active_counts.numel() > 0:
+                active_dead_slots += active_counts.eq(0).sum().item()
+                active_total_slots += int(active_local.sum().item())
+            effective_source = active_counts if active_counts.sum().item() > 0 else counts
+            probs = effective_source / effective_source.sum().clamp_min(1.0)
             entropy = -(probs[probs > 0] * probs[probs > 0].log()).sum()
             effective_slots.append(entropy.exp())
             dead_slots += counts.eq(0).sum().item()
@@ -147,12 +169,13 @@ def _assignment_metrics(memory, image_features, text_features, pids, indices, st
 
     return {
         "dead_slot_rate": (dead_slots / total_slots) if total_slots > 0 else None,
+        "active_dead_slot_rate": (active_dead_slots / active_total_slots) if active_total_slots > 0 else None,
         "effective_slots_per_id": _mean(torch.stack(effective_slots).cpu()) if effective_slots else None,
         "assignment_flip_rate": flip_rate,
     }
 
 
-def _slot_redundancy(memory):
+def _slot_redundancy(memory, active_only=True):
     k = int(memory.prototypes_per_id)
     if k <= 1:
         return 0.0
@@ -161,10 +184,18 @@ def _slot_redundancy(memory):
     for bank in (memory.image_prototypes, memory.text_prototypes):
         bank = F.normalize(bank.float(), p=2, dim=1)
         bank = bank.view(memory.num_classes, k, memory.dim)
-        sims = torch.bmm(bank, bank.transpose(1, 2))
-        mask = ~torch.eye(k, device=sims.device, dtype=torch.bool).unsqueeze(0)
-        mask = mask.expand(memory.num_classes, -1, -1)
-        redundancies.append(sims[mask].mean().detach().cpu())
+        active_by_id = memory.proto_active_mask.view(memory.num_classes, k)
+        for pid in range(memory.num_classes):
+            local = bank[pid]
+            if active_only:
+                local = local[active_by_id[pid]]
+            if local.shape[0] <= 1:
+                continue
+            sims = local @ local.t()
+            mask = ~torch.eye(local.shape[0], device=sims.device, dtype=torch.bool)
+            redundancies.append(sims[mask].mean().detach().cpu())
+    if not redundancies:
+        return 0.0
     return _mean(torch.stack(redundancies))
 
 
@@ -196,6 +227,7 @@ def compute_train_diagnostics(model, ret, args, state):
         memory.proto_pids,
         pids,
         hard_k,
+        proto_active_mask=memory.proto_active_mask,
     )
     txt_margin, txt_hard_pids = _prototype_margin(
         proto_text,
@@ -203,6 +235,7 @@ def compute_train_diagnostics(model, ret, args, state):
         memory.proto_pids,
         pids,
         hard_k,
+        proto_active_mask=memory.proto_active_mask,
     )
     proto_margin = 0.5 * (img_margin + txt_margin)
 
@@ -219,8 +252,10 @@ def compute_train_diagnostics(model, ret, args, state):
         "negative_proto_margin_rate": _mean(negative_proto),
         "hard_negative_overlap": _mean(torch.tensor(overlap)) if overlap else None,
         "proto_to_host_margin_corr": _corrcoef(proto_margin, host_extra["host_margin"]),
-        "slot_redundancy": _slot_redundancy(memory),
+        "slot_redundancy": _slot_redundancy(memory, active_only=True),
+        "physical_slot_redundancy": _slot_redundancy(memory, active_only=False),
     })
+    metrics.update(memory.allocation_metrics())
     metrics.update(_assignment_metrics(
         memory,
         proto_image,

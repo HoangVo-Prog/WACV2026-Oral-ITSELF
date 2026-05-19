@@ -30,6 +30,8 @@ class PrototypeBranch(nn.Module):
             dim=self.prototype_dim,
             momentum=getattr(args, "prototype_momentum", 0.2),
             group_mean_impl=getattr(args, "prototype_group_mean_impl", "deterministic"),
+            slot_mode=getattr(args, "prototype_slot_mode", "fixed"),
+            prototype_max_per_id=getattr(args, "prototype_max_per_id", None),
         )
 
     def is_ready(self):
@@ -48,11 +50,11 @@ class PrototypeBranch(nn.Module):
     @torch.no_grad()
     def initialize(self, image_features, text_features, pids):
         image_features, text_features = self._project(image_features, text_features)
-        self.initialize_projected(image_features, text_features, pids)
+        return self.initialize_projected(image_features, text_features, pids)
 
     @torch.no_grad()
     def initialize_projected(self, image_features, text_features, pids):
-        self.memory.initialize(
+        return self.memory.initialize(
             F.normalize(image_features.float(), p=2, dim=1).detach(),
             F.normalize(text_features.float(), p=2, dim=1).detach(),
             pids.detach(),

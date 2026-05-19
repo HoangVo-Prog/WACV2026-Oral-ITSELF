@@ -56,6 +56,10 @@ def get_args():
     parser.add_argument("--use_loss_id", default=False, action='store_true')
     parser.add_argument("--prototype_feature", type=str, default="auto", choices=["auto", "local", "global"])
     parser.add_argument("--prototype_per_id", type=int, default=2)
+    parser.add_argument("--prototype_slot_mode", type=str, default="fixed", choices=["fixed", "adaptive_masked"],
+                        help="Use fixed per-identity slots or a padded active-mask adaptive slot budget.")
+    parser.add_argument("--prototype_max_per_id", type=int, default=None,
+                        help="Physical per-identity slot cap for --prototype_slot_mode adaptive_masked.")
     parser.add_argument("--prototype_dim", type=int, default=512)
     parser.add_argument("--prototype_kmeans_iters", type=int, default=20)
     parser.add_argument("--prototype_warmup_epochs", type=int, default=0)
