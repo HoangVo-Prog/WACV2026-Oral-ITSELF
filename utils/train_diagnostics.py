@@ -221,6 +221,15 @@ def compute_train_diagnostics(model, ret, args, state):
         "proto_to_host_margin_corr": _corrcoef(proto_margin, host_extra["host_margin"]),
         "slot_redundancy": _slot_redundancy(memory),
     })
+    for key in (
+        "prototype_text_update_weight_mean",
+        "prototype_text_update_weight_p10",
+        "prototype_text_update_weight_p90",
+        "prototype_text_update_weight_uniform_fallback",
+    ):
+        value = _to_float(ret.get(key))
+        if value is not None:
+            metrics[key] = value
     metrics.update(_assignment_metrics(
         memory,
         proto_image,
