@@ -221,3 +221,5 @@ __marimo__/
 tests/*
 logs/*
 docs/*
+AGENTS.md
+wait_pid_then_train.sh

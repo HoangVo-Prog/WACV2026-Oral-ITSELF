@@ -91,7 +91,7 @@ if __name__ == '__main__':
 
     detach_nohup_process(args, cur_time, name)
 
-    set_seed(1+get_rank())
+    set_seed(args.seed + get_rank())
 
     num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
     args.distributed = num_gpus > 1

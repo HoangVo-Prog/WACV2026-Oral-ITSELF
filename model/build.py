@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from .grab import TexualEmbeddingLayer, VisualEmbeddingLayer
 from .prototype import PrototypeBranch
+from utils.rng import preserve_rng_state
 from torch.cuda.amp import autocast
 
 
@@ -108,7 +109,8 @@ class ITSELF(nn.Module):
 
         if self.prototype_enabled:
             prototype_feature_dim = self.grab_embed_dim if use_proto_local else self.embed_dim
-            self.prototype_branch = PrototypeBranch(args, num_classes, prototype_feature_dim)
+            with preserve_rng_state(getattr(args, "prototype_seed", 1001)):
+                self.prototype_branch = PrototypeBranch(args, num_classes, prototype_feature_dim)
         else:
             self.prototype_branch = None
                 

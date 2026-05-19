@@ -6,6 +6,7 @@ import torch
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
 from utils.comm import get_rank, synchronize
+from utils.rng import preserve_rng_state
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -40,29 +41,33 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     dataset = getattr(train_loader, "dataset", None)
     old_txt_aug = getattr(dataset, "txt_aug", None)
     image_features, text_features, pids = [], [], []
+    sample_count = 0
 
     try:
         model_without_ddp.eval()
         if old_txt_aug is not None:
             dataset.txt_aug = False
 
-        for batch in train_loader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            image_feat, text_feat = model_without_ddp.extract_prototype_features(batch)
-            image_feat, text_feat = branch.project_for_memory(image_feat, text_feat)
-            image_features.append(image_feat.cpu())
-            text_features.append(text_feat.cpu())
-            pids.append(batch['pids'].cpu())
+        with preserve_rng_state(getattr(args, "prototype_seed", 1001)):
+            for batch in train_loader:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                image_feat, text_feat = model_without_ddp.extract_prototype_features(batch)
+                image_feat, text_feat = branch.project_for_memory(image_feat, text_feat)
+                image_features.append(image_feat.cpu())
+                text_features.append(text_feat.cpu())
+                pids.append(batch['pids'].cpu())
+
+            image_features = torch.cat(image_features, dim=0)
+            text_features = torch.cat(text_features, dim=0)
+            pids = torch.cat(pids, dim=0)
+            sample_count = pids.numel()
+            branch.initialize_projected(image_features, text_features, pids)
     finally:
         if old_txt_aug is not None:
             dataset.txt_aug = old_txt_aug
         model_without_ddp.train(was_training)
 
-    image_features = torch.cat(image_features, dim=0)
-    text_features = torch.cat(text_features, dim=0)
-    pids = torch.cat(pids, dim=0)
-    branch.initialize_projected(image_features, text_features, pids)
-    logger.info("Prototype banks initialized with {} samples".format(pids.numel()))
+    logger.info("Prototype banks initialized with {} samples".format(sample_count))
 
 
 def _loss_components(ret):

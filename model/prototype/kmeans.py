@@ -2,9 +2,26 @@ import torch
 import torch.nn.functional as F
 
 
-def _initial_centroids(features, num_clusters):
-    perm = torch.randperm(features.shape[0], device=features.device)[:num_clusters]
-    return features[perm].clone()
+def _make_generator(seed):
+    generator = torch.Generator()
+    generator.manual_seed(0 if seed is None else int(seed))
+    return generator
+
+
+def _initial_centroids(features, num_clusters, init_method="deterministic", seed=None):
+    if init_method == "deterministic":
+        indices = torch.linspace(
+            0,
+            features.shape[0] - 1,
+            steps=num_clusters,
+            device=features.device,
+        ).round().long()
+        return features[indices].clone()
+    if init_method == "random":
+        generator = _make_generator(seed)
+        perm = torch.randperm(features.shape[0], generator=generator)[:num_clusters].to(features.device)
+        return features[perm].clone()
+    raise ValueError("init_method must be 'deterministic' or 'random'")
 
 
 def _cluster_means(features, assignments, centroids):
@@ -17,7 +34,8 @@ def _cluster_means(features, assignments, centroids):
 
 
 @torch.no_grad()
-def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096):
+def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096,
+                 init_method="deterministic", seed=None):
     """Spherical K-Means over L2-normalized features."""
     if features.ndim != 2:
         raise ValueError("features must be a 2D tensor")
@@ -34,7 +52,7 @@ def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096):
         centroids = features.repeat(repeats, 1)[:num_clusters].clone()
         return F.normalize(centroids, p=2, dim=1)
 
-    centroids = _initial_centroids(features, num_clusters)
+    centroids = _initial_centroids(features, num_clusters, init_method=init_method, seed=seed)
 
     for _ in range(num_iters):
         assignments = []
@@ -49,7 +67,8 @@ def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096):
 
 
 @torch.no_grad()
-def identity_kmeans(features, pids, num_classes, prototypes_per_id, num_iters=20):
+def identity_kmeans(features, pids, num_classes, prototypes_per_id, num_iters=20,
+                    init_method="deterministic", seed=None):
     """Build fixed-count prototypes for each identity."""
     features = F.normalize(features.float(), p=2, dim=1)
     pids = pids.long()
@@ -65,10 +84,13 @@ def identity_kmeans(features, pids, num_classes, prototypes_per_id, num_iters=20
             repeats = (prototypes_per_id + identity_features.shape[0] - 1) // identity_features.shape[0]
             centroids = identity_features.repeat(repeats, 1)[:prototypes_per_id]
         else:
+            identity_seed = None if seed is None else int(seed) + int(pid)
             centroids = torch_kmeans(
                 identity_features,
                 prototypes_per_id,
                 num_iters=num_iters,
+                init_method=init_method,
+                seed=identity_seed,
             )
         banks.append(F.normalize(centroids.reshape(prototypes_per_id, dim), p=2, dim=1))
 

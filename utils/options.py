@@ -13,6 +13,8 @@ def get_args():
     parser.add_argument("--name", default="ITSELF", help="experiment name to save")
     parser.add_argument("--run_time", default="",
                         help="timestamp used in run output paths; defaults to current time")
+    parser.add_argument("--seed", default=1, type=int,
+                        help="base random seed for backbone training; default matches the legacy path")
     parser.add_argument("--log_period", default=20)
     parser.add_argument("--eval_period", default=1)
     parser.add_argument("--val_dataset", default="test") # use val set when evaluate, if test use test set
@@ -54,6 +56,14 @@ def get_args():
                         default=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
                         help="Inference-time prototype score weights for interpolation ablation.")
     parser.add_argument("--prototype_momentum", type=float, default=0.2)
+    parser.add_argument("--prototype_seed", type=int, default=1001,
+                        help="isolated seed for prototype branch initialization and prototype bank initialization")
+    parser.add_argument("--prototype_kmeans_init", type=str, default="deterministic",
+                        choices=["deterministic", "random"],
+                        help="prototype k-means centroid initialization")
+    parser.add_argument("--prototype_group_mean_impl", type=str, default="deterministic",
+                        choices=["deterministic", "scatter"],
+                        help="prototype memory group mean implementation")
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))
     parser.add_argument("--stride_size", type=int, default=16)
