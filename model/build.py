@@ -356,9 +356,13 @@ class ITSELF(nn.Module):
                 proto_text_feats,
                 batch['pids'],
                 use_loss_id=getattr(self.args, "use_loss_id", False),
+                epoch=epoch,
             )
-            if "proto_id_loss" in proto_ret:
-                ret["proto_id_loss"] = proto_ret["proto_id_loss"] * getattr(self.args, "prototype_id_weight", 0.2)
+            for key, value in proto_ret.items():
+                if key == "proto_id_loss":
+                    ret["proto_id_loss"] = value * getattr(self.args, "prototype_id_weight", 0.2)
+                else:
+                    ret[key] = value
 
         return ret
 
