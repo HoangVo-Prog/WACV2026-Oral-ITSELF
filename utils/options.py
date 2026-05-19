@@ -55,6 +55,19 @@ def get_args():
     parser.add_argument("--prototype", default=False, action='store_true')
     parser.add_argument("--use_loss_id", default=False, action='store_true')
     parser.add_argument("--prototype_feature", type=str, default="auto", choices=["auto", "local", "global"])
+    parser.add_argument("--prototype_projector", type=str, default="default",
+                        choices=[
+                            "default",
+                            "identity",
+                            "residual_identity",
+                            "random_orthogonal",
+                            "pca_init",
+                            "shared",
+                            "shared_pca_init",
+                        ],
+                        help="prototype projection mode; default preserves the existing Linear+LayerNorm projectors")
+    parser.add_argument("--prototype_residual_scale", type=float, default=0.1,
+                        help="scale for --prototype_projector residual_identity")
     parser.add_argument("--prototype_per_id", type=int, default=2)
     parser.add_argument("--prototype_dim", type=int, default=512)
     parser.add_argument("--prototype_kmeans_iters", type=int, default=20)
