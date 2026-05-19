@@ -54,21 +54,14 @@ def get_args():
     ######################## prototype settings ########################
     parser.add_argument("--prototype", default=False, action='store_true')
     parser.add_argument("--use_loss_id", default=False, action='store_true')
-    parser.add_argument("--use_loss_rank", default=False, action='store_true')
     parser.add_argument("--prototype_feature", type=str, default="auto", choices=["auto", "local", "global"])
     parser.add_argument("--prototype_per_id", type=int, default=2)
     parser.add_argument("--prototype_dim", type=int, default=512)
     parser.add_argument("--prototype_kmeans_iters", type=int, default=20)
     parser.add_argument("--prototype_warmup_epochs", type=int, default=0)
     parser.add_argument("--prototype_tau", type=float, default=0.05)
-    parser.add_argument("--prototype_margin", type=float, default=0.2)
     parser.add_argument("--prototype_hard_k", type=int, default=16)
     parser.add_argument("--prototype_id_weight", type=float, default=0.2)
-    parser.add_argument("--prototype_rank_weight", type=float, default=0.5)
-    parser.add_argument("--prototype_score_weight", type=float, default=0.1)
-    parser.add_argument("--prototype_score_weights", type=float, nargs='+',
-                        default=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-                        help="Inference-time prototype score weights for interpolation ablation.")
     parser.add_argument("--prototype_momentum", type=float, default=0.2)
     parser.add_argument("--prototype_seed", type=int, default=1001,
                         help="isolated seed for prototype branch initialization and prototype bank initialization")

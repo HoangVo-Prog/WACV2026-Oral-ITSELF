@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .losses import prototype_pair_ranking_loss, symmetric_identity_proxy_loss
+from .losses import symmetric_identity_proxy_loss
 from .memory import PrototypeMemory
 
 
@@ -65,15 +65,13 @@ class PrototypeBranch(nn.Module):
     def project_for_memory(self, image_features, text_features):
         return self._project(image_features, text_features)
 
-    def forward(self, image_features, text_features, pids, use_loss_id=True, use_loss_rank=True):
+    def forward(self, image_features, text_features, pids, use_loss_id=True):
         image_features, text_features = self._project(image_features, text_features)
         zero = image_features.sum() * 0.0
         if not self.is_ready():
             ret = {}
             if use_loss_id:
                 ret["proto_id_loss"] = zero
-            if use_loss_rank:
-                ret["proto_rank_loss"] = zero
             return ret
 
         pids = pids.long()
@@ -85,17 +83,6 @@ class PrototypeBranch(nn.Module):
                 pids,
                 self.memory,
                 tau=getattr(self.args, "prototype_tau", 0.05),
-                hard_k=getattr(self.args, "prototype_hard_k", 16),
-            )
-
-        if use_loss_rank:
-            proto_scores = self.memory.training_score_matrix(text_features, image_features)
-            host_scores = F.normalize(text_features, p=2, dim=1) @ F.normalize(image_features, p=2, dim=1).t()
-            ret["proto_rank_loss"] = prototype_pair_ranking_loss(
-                proto_scores,
-                pids,
-                host_scores=host_scores,
-                margin=getattr(self.args, "prototype_margin", 0.2),
                 hard_k=getattr(self.args, "prototype_hard_k", 16),
             )
 
