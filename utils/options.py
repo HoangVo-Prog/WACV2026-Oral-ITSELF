@@ -65,6 +65,21 @@ def get_args():
     parser.add_argument("--prototype_hard_k", type=int, default=16)
     parser.add_argument("--prototype_id_weight", type=float, default=0.2)
     parser.add_argument("--prototype_momentum", type=float, default=0.2)
+    parser.add_argument("--prototype_momentum_scheduler", "--prototype_momentum_schedular",
+                        dest="prototype_momentum_scheduler",
+                        type=str, default=None,
+                        choices=["linear", "cosine", "step"],
+                        help="epoch-based scheduler for prototype memory EMA momentum")
+    parser.add_argument("--prototype_momentum_min", type=float, default=0.05,
+                        help="minimum/final prototype momentum for decay schedulers")
+    parser.add_argument("--prototype_momentum_total_epochs", type=int, default=None,
+                        help="epoch horizon for prototype momentum decay; defaults to --num_epoch")
+    parser.add_argument("--prototype_momentum_warmup_epochs", type=int, default=0,
+                        help="epochs to keep prototype momentum at --prototype_momentum before decay")
+    parser.add_argument("--prototype_momentum_milestones", type=int, nargs='+', default=None,
+                        help="epoch milestones for --prototype_momentum_scheduler step")
+    parser.add_argument("--prototype_momentum_gamma", type=float, default=0.5,
+                        help="decay factor for --prototype_momentum_scheduler step")
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))
     parser.add_argument("--stride_size", type=int, default=16)

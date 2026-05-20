@@ -13,6 +13,7 @@ from utils.iotools import save_train_configs
 from utils.logger import setup_logger
 from solver import build_optimizer, build_lr_scheduler
 from model import build_model
+from model.prototype import build_prototype_momentum_scheduler
 from utils.metrics import Evaluator
 from utils.options import get_args
 from utils.comm import get_rank, synchronize
@@ -212,6 +213,7 @@ if __name__ == '__main__':
     
     optimizer = build_optimizer(args, model)
     scheduler = build_lr_scheduler(args, optimizer)
+    prototype_momentum_scheduler = build_prototype_momentum_scheduler(args)
 
 
     is_master = get_rank() == 0
@@ -225,7 +227,17 @@ if __name__ == '__main__':
         logger.info(f"===================>start {start_epoch}")
 
     try:
-        do_train(start_epoch, args, model, train_loader, evaluator, optimizer, scheduler, checkpointer)
+        do_train(
+            start_epoch,
+            args,
+            model,
+            train_loader,
+            evaluator,
+            optimizer,
+            scheduler,
+            checkpointer,
+            prototype_momentum_scheduler=prototype_momentum_scheduler,
+        )
     finally:
         if wandb_run is not None:
             wandb_finish()

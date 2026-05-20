@@ -24,6 +24,13 @@ def _prototype_ready(model):
     return branch is not None and branch.is_ready()
 
 
+def _get_prototype_momentum(model):
+    model = _unwrap_model(model)
+    branch = getattr(model, "prototype_branch", None)
+    memory = getattr(branch, "memory", None) if branch is not None else None
+    return getattr(memory, "momentum", None)
+
+
 def _prototype_requested(args):
     return (
         getattr(args, "prototype", False)
@@ -162,7 +169,7 @@ def _best_val_wandb_metrics(best_metrics):
     return metrics
 
 
-def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_steps):
+def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_steps, prototype_momentum=None):
     metrics = {
         "train/epoch": epoch,
         "train/iteration": current_steps,
@@ -170,6 +177,8 @@ def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_step
         "train/weighted_loss": meters["loss"].avg,
         "train/lr": optimizer.param_groups[0]["lr"],
     }
+    if prototype_momentum is not None:
+        metrics["train/prototype_momentum"] = prototype_momentum
     lrs = [group["lr"] for group in optimizer.param_groups]
     metrics["train/lr_min"] = min(lrs)
     metrics["train/lr_max"] = max(lrs)
@@ -214,7 +223,7 @@ def _train_console_metrics(meters, loss_components):
 
 
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
-             scheduler, checkpointer):
+             scheduler, checkpointer, prototype_momentum_scheduler=None):
 
     log_period = args.log_period
     eval_period = args.eval_period
@@ -252,11 +261,25 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     early_stop_min_delta = max(float(getattr(args, "early_stop_min_delta", 0.0)), 0.0)
     epochs_without_improvement = 0
     train_diag_state = {"assignments": {}}
+    last_logged_prototype_momentum = None
     for epoch in range(start_epoch, num_epoch + 1):
         current_epoch += 1
         start_time = time.time()
         for meter in meters.values():
             meter.reset()
+
+        if prototype_momentum_scheduler is not None:
+            prototype_momentum = prototype_momentum_scheduler.step(model, epoch)
+            if (
+                get_rank() == 0
+                and prototype_momentum is not None
+                and (
+                    last_logged_prototype_momentum is None
+                    or abs(prototype_momentum - last_logged_prototype_momentum) > 1e-12
+                )
+            ):
+                logger.info("Prototype momentum: %.6f", prototype_momentum)
+                last_logged_prototype_momentum = prototype_momentum
 
         _set_epoch_on_loader(train_loader, epoch)
         if _prototype_requested(args):
@@ -301,10 +324,22 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 info_str += f", Base Lr: {args.lr:.2e}"
                 logger.info(info_str)
                 if get_rank() == 0:
-                    wandb_log(_train_wandb_metrics(meters, loss_components, optimizer, epoch, current_steps),
-                              step=current_steps)
+                    wandb_log(
+                        _train_wandb_metrics(
+                            meters,
+                            loss_components,
+                            optimizer,
+                            epoch,
+                            current_steps,
+                            prototype_momentum=_get_prototype_momentum(model),
+                        ),
+                        step=current_steps,
+                    )
 
         tb_writer.add_scalar('lr', scheduler.get_lr()[0], epoch)
+        prototype_momentum = _get_prototype_momentum(model)
+        if prototype_momentum is not None:
+            tb_writer.add_scalar('prototype_momentum', prototype_momentum, epoch)
         tb_writer.add_scalar('temperature', ret['temperature'], epoch)
         for k, v in meters.items():
             if v.count > 0:
