@@ -5,7 +5,7 @@ import time
 import torch
 from torch.utils.data import DataLoader
 from datasets.bases import ImageTextDataset
-from datasets.build import build_transforms, collate
+from datasets.build import build_transforms, collate, make_data_loader_generator, seed_worker
 from utils.meter import AverageMeter
 from utils.metrics import Evaluator
 from utils.comm import get_rank, synchronize
@@ -32,6 +32,17 @@ def _prototype_requested(args):
     )
 
 
+def _set_epoch_on_loader(loader, epoch):
+    sampler = getattr(loader, "sampler", None)
+    if sampler is not None and hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
+
+    batch_sampler = getattr(loader, "batch_sampler", None)
+    inner_sampler = getattr(batch_sampler, "sampler", None)
+    if inner_sampler is not None and hasattr(inner_sampler, "set_epoch"):
+        inner_sampler.set_epoch(epoch)
+
+
 def _build_prototype_init_loader(train_loader, args):
     train_set = getattr(train_loader, "dataset", None)
     source_dataset = getattr(train_set, "dataset", None)
@@ -54,6 +65,8 @@ def _build_prototype_init_loader(train_loader, args):
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=collate,
+        worker_init_fn=seed_worker,
+        generator=make_data_loader_generator(args, offset=4000),
     )
 
 
@@ -275,6 +288,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         for meter in meters.values():
             meter.reset()
 
+        _set_epoch_on_loader(train_loader, epoch)
         if _prototype_requested(args):
             if epoch > getattr(args, "prototype_warmup_epochs", 1) and not _prototype_ready(model):
                 maybe_initialize_prototypes(model, train_loader, args, device, logger)

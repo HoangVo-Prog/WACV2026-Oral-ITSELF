@@ -2,8 +2,8 @@ import torch
 import torch.nn.functional as F
 
 
-def _make_generator(seed):
-    generator = torch.Generator()
+def _make_generator(seed, device):
+    generator = torch.Generator() if device.type == "cpu" else torch.Generator(device=device.type)
     generator.manual_seed(0 if seed is None else int(seed))
     return generator
 
@@ -18,8 +18,8 @@ def _initial_centroids(features, num_clusters, init_method="deterministic", seed
         ).round().long()
         return features[indices].clone()
     if init_method == "random":
-        generator = _make_generator(seed)
-        perm = torch.randperm(features.shape[0], generator=generator)[:num_clusters].to(features.device)
+        generator = _make_generator(seed, features.device)
+        perm = torch.randperm(features.shape[0], device=features.device, generator=generator)[:num_clusters]
         return features[perm].clone()
     raise ValueError("init_method must be 'deterministic' or 'random'")
 
