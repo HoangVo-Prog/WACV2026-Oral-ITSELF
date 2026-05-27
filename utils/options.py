@@ -15,7 +15,7 @@ def get_args():
                         help="timestamp used in run output paths; defaults to current time")
     parser.add_argument("--seed", default=1, type=int,
                         help="base random seed for training, data loading, and prototype initialization")
-    parser.add_argument("--deterministic", default=true, action='store_true',
+    parser.add_argument("--deterministic", default=True, action='store_true',
                         help="enable deterministic training settings for reproducible runs")
     parser.add_argument("--log_period", default=20, type=int)
     parser.add_argument("--eval_period", default=1, type=int)
@@ -56,6 +56,8 @@ def get_args():
     ######################## prototype settings ########################
     parser.add_argument("--prototype", default=False, action='store_true')
     parser.add_argument("--use_loss_id", default=False, action='store_true')
+    parser.add_argument("--no_pbt", default=False, action='store_true',
+                        help="disable use of PBT translated prototype banks and use raw cross-modal prototypes for identity loss")
     parser.add_argument("--prototype_feature", type=str, default="auto", choices=["auto", "local", "global"])
     parser.add_argument("--prototype_projector", type=str, default="default",
                         choices=[

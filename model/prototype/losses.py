@@ -35,11 +35,18 @@ def identity_proxy_contrastive(features, pids, prototypes, proto_pids, tau=0.05,
     return -(pos_lse[valid] - denom).mean()
 
 
-def symmetric_identity_proxy_loss(image_features, text_features, pids, memory, tau=0.05, hard_k=16):
+def identity_proxy_banks(memory, use_pbt=True):
+    if use_pbt:
+        return memory.text_to_image, memory.image_to_text
+    return memory.text_prototypes, memory.image_prototypes
+
+
+def symmetric_identity_proxy_loss(image_features, text_features, pids, memory, tau=0.05, hard_k=16, use_pbt=True):
+    image_prototypes, text_prototypes = identity_proxy_banks(memory, use_pbt=use_pbt)
     image_loss = identity_proxy_contrastive(
-        image_features, pids, memory.text_to_image, memory.proto_pids, tau=tau, hard_k=hard_k
+        image_features, pids, image_prototypes, memory.proto_pids, tau=tau, hard_k=hard_k
     )
     text_loss = identity_proxy_contrastive(
-        text_features, pids, memory.image_to_text, memory.proto_pids, tau=tau, hard_k=hard_k
+        text_features, pids, text_prototypes, memory.proto_pids, tau=tau, hard_k=hard_k
     )
     return 0.5 * (image_loss + text_loss)

@@ -105,6 +105,12 @@ def _prototype_margin(features, prototypes, proto_pids, pids, hard_k):
     return (pos - neg).detach().cpu(), topk_pids
 
 
+def _identity_proxy_banks(memory, use_pbt=True):
+    if use_pbt:
+        return memory.text_to_image, memory.image_to_text
+    return memory.text_prototypes, memory.image_prototypes
+
+
 def _assignment_metrics(memory, image_features, text_features, pids, indices, state):
     image_assign = memory.assign_identity(image_features, pids, memory.image_prototypes).detach().cpu()
     text_assign = memory.assign_identity(text_features, pids, memory.text_prototypes).detach().cpu()
@@ -189,17 +195,21 @@ def compute_train_diagnostics(model, ret, args, state):
     proto_image, proto_text = branch.project_for_memory(proto_image, proto_text)
     memory = branch.memory
     hard_k = getattr(args, "prototype_hard_k", 16)
+    image_prototypes, text_prototypes = _identity_proxy_banks(
+        memory,
+        use_pbt=not getattr(args, "no_pbt", False),
+    )
 
     img_margin, img_hard_pids = _prototype_margin(
         proto_image,
-        memory.text_to_image,
+        image_prototypes,
         memory.proto_pids,
         pids,
         hard_k,
     )
     txt_margin, txt_hard_pids = _prototype_margin(
         proto_text,
-        memory.image_to_text,
+        text_prototypes,
         memory.proto_pids,
         pids,
         hard_k,

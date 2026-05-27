@@ -234,6 +234,7 @@ class PrototypeBranch(nn.Module):
                 self.memory,
                 tau=getattr(self.args, "prototype_tau", 0.05),
                 hard_k=getattr(self.args, "prototype_hard_k", 16),
+                use_pbt=not getattr(self.args, "no_pbt", False),
             )
 
         self.memory.ema_update(image_features.detach(), text_features.detach(), pids.detach())

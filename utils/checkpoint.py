@@ -70,6 +70,7 @@ class Checkpointer:
                 "feature_dim": getattr(branch, "feature_dim", None),
                 "prototype_dim": getattr(branch, "prototype_dim", None),
                 "projector_mode": getattr(branch, "projector_mode", None),
+                "no_pbt": getattr(getattr(branch, "args", None), "no_pbt", None),
                 "use_local": getattr(branch, "use_local", None),
                 "num_classes": getattr(memory, "num_classes", None) if memory is not None else None,
                 "prototypes_per_id": getattr(memory, "prototypes_per_id", None) if memory is not None else None,
