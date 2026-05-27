@@ -47,14 +47,59 @@ def _corrcoef(x, y):
     return (x @ y / denom).item()
 
 
-def _batch_host_metrics(image_features, text_features, pids):
+def _row_masked_mean(values, mask):
+    counts = mask.sum(dim=1)
+    sums = values.masked_fill(~mask, 0.0).sum(dim=1)
+    out = values.new_full((values.shape[0],), float("nan"))
+    valid = counts > 0
+    out[valid] = sums[valid] / counts[valid].float()
+    return out
+
+
+def _row_masked_max(values, mask):
+    masked = values.masked_fill(~mask, float("-inf"))
+    out = masked.max(dim=1).values
+    out = out.masked_fill(~mask.any(dim=1), float("nan"))
+    return out
+
+
+def _row_topk_finite_mean(values, mask, k):
+    k = min(max(int(k), 1), values.shape[1])
+    top_values, top_idx = values.masked_fill(~mask, float("-inf")).topk(k=k, dim=1)
+    finite = torch.isfinite(top_values)
+    counts = finite.sum(dim=1)
+    sums = top_values.masked_fill(~finite, 0.0).sum(dim=1)
+    out = values.new_full((values.shape[0],), float("nan"))
+    valid = counts > 0
+    out[valid] = sums[valid] / counts[valid].float()
+    return out, top_idx, finite
+
+
+def _batch_identity_centroids(image_features, text_features, pids):
+    unique_pids, inverse = pids.unique(sorted=True, return_inverse=True)
+    features = torch.cat([image_features, text_features], dim=0)
+    inverse = inverse.repeat(2)
+
+    centroids = image_features.new_zeros((unique_pids.numel(), image_features.shape[1]))
+    centroids.index_add_(0, inverse, features)
+    counts = torch.bincount(inverse, minlength=unique_pids.numel()).float().to(image_features.device)
+    centroids = centroids / counts.clamp_min(1.0).unsqueeze(1)
+    centroids = F.normalize(centroids, p=2, dim=1)
+    return centroids, unique_pids
+
+
+def _batch_host_metrics(image_features, text_features, pids, hard_k=16):
     image_features = F.normalize(image_features.float(), p=2, dim=1)
     text_features = F.normalize(text_features.float(), p=2, dim=1)
     pids = pids.long().to(image_features.device)
 
     sims = text_features @ image_features.t()
+    image_sims = image_features @ image_features.t()
+    text_sims = text_features @ text_features.t()
     pos_mask = pids.unsqueeze(0).eq(pids.unsqueeze(1))
     neg_mask = ~pos_mask
+    eye = torch.eye(pids.numel(), device=image_features.device, dtype=torch.bool)
+    same_id_offdiag = pos_mask & ~eye
 
     pos_logits = sims.masked_fill(~pos_mask, float("-inf"))
     pos_for_min = sims.masked_fill(~pos_mask, float("inf"))
@@ -63,22 +108,69 @@ def _batch_host_metrics(image_features, text_features, pids):
     best_pos = pos_logits.max(dim=1).values
     worst_pos = pos_for_min.min(dim=1).values
     hard_neg, hard_neg_idx = neg_logits.max(dim=1)
+    has_neg = neg_mask.any(dim=1)
+    hard_neg = hard_neg.masked_fill(~has_neg, float("nan"))
     hard_neg_pids = pids[hard_neg_idx].detach().cpu()
+    hard_neg_pids = hard_neg_pids.masked_fill(~has_neg.detach().cpu(), -1)
 
     host_margin = best_pos - hard_neg
     hard_pos_margin = worst_pos - hard_neg
     negative_intrusion = hard_neg > best_pos
+    negative_intrusion = negative_intrusion.float().masked_fill(~has_neg, float("nan"))
 
     sorted_idx = sims.argsort(dim=1, descending=True)
     sorted_pos = pos_mask.gather(1, sorted_idx)
     first_pos_rank = sorted_pos.float().argmax(dim=1).float() + 1.0
 
+    intra_i2i = _row_masked_mean(image_sims, same_id_offdiag)
+    intra_t2t = _row_masked_mean(text_sims, same_id_offdiag)
+    intra_xmod = _row_masked_mean(sims, pos_mask)
+
+    inter_i2i_nearest = _row_masked_max(image_sims, neg_mask)
+    inter_t2t_nearest = _row_masked_max(text_sims, neg_mask)
+    inter_xmod_nearest = hard_neg
+
+    topk_neg_attr, topk_neg_idx, topk_neg_valid = _row_topk_finite_mean(sims, neg_mask, hard_k)
+
+    centroids, centroid_pids = _batch_identity_centroids(image_features, text_features, pids)
+    if centroid_pids.numel() > 1:
+        pid_to_centroid = pids.unsqueeze(1).eq(centroid_pids.unsqueeze(0)).float()
+        sample_centroids = pid_to_centroid @ centroids
+        sample_centroid_sims = sample_centroids @ sample_centroids.t()
+        topk_neg_identity = sample_centroid_sims.gather(1, topk_neg_idx)
+        topk_neg_identity = topk_neg_identity.masked_fill(~topk_neg_valid, float("nan"))
+        topk_neg_identity = _row_masked_mean(topk_neg_identity, torch.isfinite(topk_neg_identity))
+
+        centroid_sims = centroids @ centroids.t()
+        centroid_eye = torch.eye(centroid_pids.numel(), device=centroids.device, dtype=torch.bool)
+        nearest_centroid = _row_masked_max(centroid_sims, ~centroid_eye)
+    else:
+        topk_neg_identity = image_features.new_full((pids.numel(),), float("nan"))
+        nearest_centroid = image_features.new_full((centroid_pids.numel(),), float("nan"))
+
     metrics = {
         "host_margin_mean": _mean(host_margin.detach().cpu()),
         "host_margin_p10": _quantile(host_margin.detach().cpu(), 0.10),
         "hard_pos_margin_mean": _mean(hard_pos_margin.detach().cpu()),
-        "negative_intrusion_rate": _mean(negative_intrusion.float().detach().cpu()),
+        "negative_intrusion_rate": _mean(negative_intrusion.detach().cpu()),
         "mean_first_positive_rank": _mean(first_pos_rank.detach().cpu()),
+        "host_intra_i2i_sim_mean": _mean(image_sims[same_id_offdiag].detach().cpu()),
+        "host_intra_t2t_sim_mean": _mean(text_sims[same_id_offdiag].detach().cpu()),
+        "host_intra_xmod_sim_mean": _mean(sims[pos_mask].detach().cpu()),
+        "host_paired_xmod_sim_mean": _mean(sims.diag().detach().cpu()),
+        "host_inter_i2i_nearest_sim_mean": _mean(inter_i2i_nearest.detach().cpu()),
+        "host_inter_t2t_nearest_sim_mean": _mean(inter_t2t_nearest.detach().cpu()),
+        "host_inter_xmod_nearest_sim_mean": _mean(inter_xmod_nearest.detach().cpu()),
+        "host_i2i_identity_margin_mean": _mean((intra_i2i - inter_i2i_nearest).detach().cpu()),
+        "host_t2t_identity_margin_mean": _mean((intra_t2t - inter_t2t_nearest).detach().cpu()),
+        "host_xmod_identity_margin_mean": _mean((intra_xmod - inter_xmod_nearest).detach().cpu()),
+        "host_topk_neg_attr_sim_mean": _mean(topk_neg_attr.detach().cpu()),
+        "host_topk_neg_identity_centroid_sim_mean": _mean(topk_neg_identity.detach().cpu()),
+        "host_topk_neg_identity_centroid_distance_mean": _mean((1.0 - topk_neg_identity).detach().cpu()),
+        "host_topk_attr_id_decoupling": _mean((topk_neg_attr - topk_neg_identity).detach().cpu()),
+        "host_same_id_alignment_gap": _mean((intra_xmod - topk_neg_attr).detach().cpu()),
+        "host_identity_centroid_nearest_sim_mean": _mean(nearest_centroid.detach().cpu()),
+        "host_identity_centroid_margin_mean": _mean((1.0 - nearest_centroid).detach().cpu()),
     }
     return metrics, {
         "host_margin": host_margin.detach().cpu(),
@@ -183,12 +275,17 @@ def compute_train_diagnostics(model, ret, args, state):
     pids = diag["pids"].detach()
     host_image = diag["host_image_feats"].detach()
     host_text = diag["host_text_feats"].detach()
-    metrics, host_extra = _batch_host_metrics(host_image, host_text, pids)
+    metrics, host_extra = _batch_host_metrics(
+        host_image,
+        host_text,
+        pids,
+        hard_k=getattr(args, "prototype_hard_k", 16),
+    )
 
     model = _unwrap_model(model)
     branch = getattr(model, "prototype_branch", None)
     if branch is None or not branch.is_ready():
-        return metrics
+        return {key: value for key, value in metrics.items() if _to_float(value) is not None}
 
     proto_image = diag["proto_image_feats"].detach()
     proto_text = diag["proto_text_feats"].detach()
