@@ -15,7 +15,7 @@ def get_args():
                         help="timestamp used in run output paths; defaults to current time")
     parser.add_argument("--seed", default=1, type=int,
                         help="base random seed for training, data loading, and prototype initialization")
-    parser.add_argument("--deterministic", default=False, action='store_true',
+    parser.add_argument("--deterministic", default=true, action='store_true',
                         help="enable deterministic training settings for reproducible runs")
     parser.add_argument("--log_period", default=20, type=int)
     parser.add_argument("--eval_period", default=1, type=int)
