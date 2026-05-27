@@ -366,6 +366,8 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                     epochs_without_improvement = 0
                     arguments["epoch"] = epoch
                     checkpointer.save("best", **arguments)
+                    if getattr(args, "save_prototype", False):
+                        checkpointer.save_prototype_branch("best_prototype_branch", **arguments)
                 else:
                     epochs_without_improvement += 1
                     if early_stop_patience > 0:

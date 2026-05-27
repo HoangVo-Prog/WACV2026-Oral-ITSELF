@@ -6,6 +6,17 @@ from collections import OrderedDict
 import torch
 
 
+def _unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def _cpu_state_dict(state_dict):
+    return {
+        key: value.detach().cpu() if torch.is_tensor(value) else value
+        for key, value in state_dict.items()
+    }
+
+
 class Checkpointer:
     def __init__(
         self,
@@ -43,6 +54,49 @@ class Checkpointer:
         save_file = os.path.join(self.save_dir, "{}.pth".format(name))
         self.logger.info("Saving checkpoint to {}".format(save_file))
         torch.save(data, save_file)
+
+    def prototype_branch_state(self):
+        model = _unwrap_model(self.model)
+        branch = getattr(model, "prototype_branch", None)
+        if branch is None:
+            self.logger.warning("Skipping prototype branch checkpoint because the model has no prototype branch.")
+            return None
+
+        memory = getattr(branch, "memory", None)
+        data = {
+            "prototype_branch": _cpu_state_dict(branch.state_dict()),
+            "prototype_ready": bool(memory.is_ready()) if memory is not None and hasattr(memory, "is_ready") else None,
+            "prototype_config": {
+                "feature_dim": getattr(branch, "feature_dim", None),
+                "prototype_dim": getattr(branch, "prototype_dim", None),
+                "projector_mode": getattr(branch, "projector_mode", None),
+                "use_local": getattr(branch, "use_local", None),
+                "num_classes": getattr(memory, "num_classes", None) if memory is not None else None,
+                "prototypes_per_id": getattr(memory, "prototypes_per_id", None) if memory is not None else None,
+                "dim": getattr(memory, "dim", None) if memory is not None else None,
+                "momentum": getattr(memory, "momentum", None) if memory is not None else None,
+            },
+        }
+        if memory is not None:
+            data["prototype_bank"] = _cpu_state_dict(memory.state_dict())
+        return data
+
+    def save_prototype_branch(self, name, **kwargs):
+        if not self.save_dir:
+            return False
+
+        if not self.save_to_disk:
+            return False
+
+        data = self.prototype_branch_state()
+        if data is None:
+            return False
+        data.update(kwargs)
+
+        save_file = os.path.join(self.save_dir, "{}.pth".format(name))
+        self.logger.info("Saving prototype branch checkpoint to {}".format(save_file))
+        torch.save(data, save_file)
+        return True
 
     def load(self, f=None):
         if not f:
