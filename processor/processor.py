@@ -70,6 +70,21 @@ def _build_prototype_init_loader(train_loader, args):
 
 
 @torch.no_grad()
+def _project_prototype_feature_bank(branch, image_features, text_features, batch_size):
+    image_projected, text_projected = [], []
+    batch_size = max(int(batch_size), 1)
+    for start in range(0, image_features.shape[0], batch_size):
+        end = start + batch_size
+        image_batch, text_batch = branch.project_for_memory(
+            image_features[start:end],
+            text_features[start:end],
+        )
+        image_projected.append(image_batch.cpu())
+        text_projected.append(text_batch.cpu())
+    return torch.cat(image_projected, dim=0), torch.cat(text_projected, dim=0)
+
+
+@torch.no_grad()
 def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     model_without_ddp = _unwrap_model(model)
     branch = getattr(model_without_ddp, "prototype_branch", None)
@@ -98,7 +113,6 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
         for batch in prototype_loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             image_feat, text_feat = model_without_ddp.extract_prototype_features(batch)
-            image_feat, text_feat = branch.project_for_memory(image_feat, text_feat)
             image_features.append(image_feat.cpu())
             text_features.append(text_feat.cpu())
             pids.append(batch['pids'].cpu())
@@ -110,6 +124,17 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     image_features = torch.cat(image_features, dim=0)
     text_features = torch.cat(text_features, dim=0)
     pids = torch.cat(pids, dim=0)
+
+    if hasattr(branch, "needs_pca_init") and branch.needs_pca_init():
+        logger.info("Initializing prototype projector from raw train embeddings")
+        branch.initialize_projector_from_features(image_features, text_features)
+
+    image_features, text_features = _project_prototype_feature_bank(
+        branch,
+        image_features,
+        text_features,
+        getattr(args, "test_batch_size", getattr(args, "batch_size", 512)),
+    )
     branch.initialize_projected(image_features, text_features, pids)
     logger.info("Prototype banks initialized with {} samples".format(pids.numel()))
 
