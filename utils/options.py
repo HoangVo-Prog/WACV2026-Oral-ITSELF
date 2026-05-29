@@ -80,8 +80,6 @@ def get_args():
     parser.add_argument("--prototype_hard_k", type=int, default=16)
     parser.add_argument("--prototype_id_weight", type=float, default=0.2)
     parser.add_argument("--prototype_momentum", type=float, default=0.2)
-    parser.add_argument("--save_prototype", default=False, action='store_true',
-                        help="save best_prototype_branch.pth alongside the best model checkpoint")
     ######################## vison trainsformer settings ########################
     parser.add_argument("--img_size", type=tuple, default=(384, 128))
     parser.add_argument("--stride_size", type=int, default=16)

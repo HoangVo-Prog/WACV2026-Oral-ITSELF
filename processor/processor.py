@@ -8,7 +8,7 @@ from utils.meter import AverageMeter
 from utils.metrics import Evaluator
 from utils.comm import get_rank, synchronize
 from utils.train_diagnostics import compute_train_diagnostics
-from utils.wandb_utils import wandb_log
+from utils.wandb_utils import wandb_log, wandb_upload_best_checkpoints
 from torch.utils.tensorboard import SummaryWriter
 from datasets.bases import ImageTextDataset
 from datasets.build import build_transforms, collate, make_data_loader_generator, seed_worker
@@ -22,6 +22,11 @@ def _prototype_ready(model):
     model = _unwrap_model(model)
     branch = getattr(model, "prototype_branch", None)
     return branch is not None and branch.is_ready()
+
+
+def _has_prototype_branch(model):
+    model = _unwrap_model(model)
+    return getattr(model, "prototype_branch", None) is not None
 
 
 def _prototype_requested(args):
@@ -383,7 +388,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                     epochs_without_improvement = 0
                     arguments["epoch"] = epoch
                     checkpointer.save("best", **arguments)
-                    if getattr(args, "save_prototype", False):
+                    if _has_prototype_branch(model):
                         checkpointer.save_prototype_branch("best_prototype_branch", **arguments)
                 else:
                     epochs_without_improvement += 1
@@ -406,6 +411,14 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
 
     if get_rank() == 0:
         logger.info(f"best R1: {best_top1} at epoch {arguments['epoch']}")
+        wandb_upload_best_checkpoints(
+            args.output_dir,
+            logger=logger,
+            metadata={
+                "best_top1": float(best_top1),
+                "best_epoch": int(arguments["epoch"]),
+            },
+        )
 
                    
 def do_inference(model, test_img_loader, test_txt_loader, args):

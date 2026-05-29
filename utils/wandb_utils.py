@@ -122,6 +122,58 @@ def wandb_log(metrics, step=None):
         _WANDB.log(clean, step=step)
 
 
+def _safe_artifact_name(name):
+    clean = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip(".-")
+    return clean or "best-checkpoints"
+
+
+def wandb_upload_best_checkpoints(output_dir, logger=None, metadata=None):
+    logger = logger or logging.getLogger("ITSELF.wandb")
+    if get_rank() != 0 or _WANDB is None:
+        return []
+
+    run = getattr(_WANDB, "run", None)
+    if run is None:
+        logger.warning("WandB best checkpoint upload skipped because no active run exists")
+        return []
+
+    output_path = Path(output_dir)
+    checkpoint_paths = sorted(path for path in output_path.glob("best*.pth") if path.is_file())
+    if not checkpoint_paths:
+        logger.warning("WandB best checkpoint upload skipped; no best*.pth files found in %s", output_path)
+        return []
+
+    run_name = getattr(run, "name", None) or getattr(run, "id", None) or "run"
+    artifact_name = _safe_artifact_name(f"{run_name}-best-checkpoints")
+    artifact_metadata = {
+        "output_dir": str(output_path),
+        "files": {path.name: path.stat().st_size for path in checkpoint_paths},
+    }
+    if metadata:
+        artifact_metadata.update(metadata)
+
+    artifact = _WANDB.Artifact(
+        name=artifact_name,
+        type="model",
+        metadata=artifact_metadata,
+    )
+    for path in checkpoint_paths:
+        artifact.add_file(str(path), name=path.name)
+
+    try:
+        run.log_artifact(artifact, aliases=["best", "latest"])
+    except Exception as exc:
+        logger.warning("WandB best checkpoint upload failed: %s", exc)
+        return []
+
+    logger.info(
+        "Uploaded best checkpoint file(s) to WandB artifact %s: %s",
+        artifact_name,
+        ", ".join(path.name for path in checkpoint_paths),
+    )
+    return checkpoint_paths
+
+
 def wandb_finish():
     if _WANDB is not None:
         _WANDB.finish()
