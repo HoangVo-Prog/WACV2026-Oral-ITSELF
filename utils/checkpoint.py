@@ -17,6 +17,32 @@ def _cpu_state_dict(state_dict):
     }
 
 
+def _is_model_prototype_memory_key(key):
+    if key.startswith("module."):
+        key = key[len("module."):]
+    return key.startswith("prototype_branch.memory.")
+
+
+def _is_branch_memory_key(key):
+    return key.startswith("memory.")
+
+
+def _without_model_prototype_memory(state_dict):
+    return OrderedDict(
+        (key, value)
+        for key, value in state_dict.items()
+        if not _is_model_prototype_memory_key(key)
+    )
+
+
+def _without_branch_memory(state_dict):
+    return OrderedDict(
+        (key, value)
+        for key, value in state_dict.items()
+        if not _is_branch_memory_key(key)
+    )
+
+
 class Checkpointer:
     def __init__(
         self,
@@ -44,7 +70,7 @@ class Checkpointer:
             return
 
         data = {}
-        data["model"] = self.model.state_dict()
+        data["model"] = _without_model_prototype_memory(self.model.state_dict())
         if self.optimizer is not None:
             data["optimizer"] = self.optimizer.state_dict()
         if self.scheduler is not None:
@@ -55,32 +81,70 @@ class Checkpointer:
         self.logger.info("Saving checkpoint to {}".format(save_file))
         torch.save(data, save_file)
 
-    def prototype_branch_state(self):
+    def _prototype_branch_and_memory(self):
         model = _unwrap_model(self.model)
         branch = getattr(model, "prototype_branch", None)
         if branch is None:
             self.logger.warning("Skipping prototype branch checkpoint because the model has no prototype branch.")
+            return None, None
+        return branch, getattr(branch, "memory", None)
+
+    def _prototype_config(self, branch, memory):
+        return {
+            "feature_dim": getattr(branch, "feature_dim", None),
+            "prototype_dim": getattr(branch, "prototype_dim", None),
+            "projector_mode": getattr(branch, "projector_mode", None),
+            "no_pbt": getattr(getattr(branch, "args", None), "no_pbt", None),
+            "use_local": getattr(branch, "use_local", None),
+            "num_classes": getattr(memory, "num_classes", None) if memory is not None else None,
+            "prototypes_per_id": getattr(memory, "prototypes_per_id", None) if memory is not None else None,
+            "dim": getattr(memory, "dim", None) if memory is not None else None,
+            "momentum": getattr(memory, "momentum", None) if memory is not None else None,
+        }
+
+    def prototype_branch_state(self):
+        branch, memory = self._prototype_branch_and_memory()
+        if branch is None:
             return None
 
-        memory = getattr(branch, "memory", None)
         data = {
-            "prototype_branch": _cpu_state_dict(branch.state_dict()),
+            "prototype_branch": _cpu_state_dict(_without_branch_memory(branch.state_dict())),
             "prototype_ready": bool(memory.is_ready()) if memory is not None and hasattr(memory, "is_ready") else None,
-            "prototype_config": {
-                "feature_dim": getattr(branch, "feature_dim", None),
-                "prototype_dim": getattr(branch, "prototype_dim", None),
-                "projector_mode": getattr(branch, "projector_mode", None),
-                "no_pbt": getattr(getattr(branch, "args", None), "no_pbt", None),
-                "use_local": getattr(branch, "use_local", None),
-                "num_classes": getattr(memory, "num_classes", None) if memory is not None else None,
-                "prototypes_per_id": getattr(memory, "prototypes_per_id", None) if memory is not None else None,
-                "dim": getattr(memory, "dim", None) if memory is not None else None,
-                "momentum": getattr(memory, "momentum", None) if memory is not None else None,
-            },
+            "prototype_config": self._prototype_config(branch, memory),
         }
-        if memory is not None:
-            data["prototype_bank"] = _cpu_state_dict(memory.state_dict())
         return data
+
+    def prototype_bank_state(self):
+        branch, memory = self._prototype_branch_and_memory()
+        if branch is None:
+            return None
+        if memory is not None:
+            return {
+                "prototype_bank": _cpu_state_dict(memory.state_dict()),
+                "prototype_ready": bool(memory.is_ready()) if hasattr(memory, "is_ready") else None,
+                "prototype_config": self._prototype_config(branch, memory),
+            }
+        self.logger.warning("Skipping prototype bank checkpoint because the prototype branch has no memory bank.")
+        return None
+
+    def _save_data(self, name, data, description):
+        if not self.save_dir:
+            return False
+
+        if not self.save_to_disk:
+            return False
+
+        save_file = os.path.join(self.save_dir, "{}.pth".format(name))
+        self.logger.info("Saving {} to {}".format(description, save_file))
+        torch.save(data, save_file)
+        return True
+
+    def save_prototype_bank(self, name, **kwargs):
+        data = self.prototype_bank_state()
+        if data is None:
+            return False
+        data.update(kwargs)
+        return self._save_data(name, data, "prototype bank checkpoint")
 
     def save_prototype_branch(self, name, **kwargs):
         if not self.save_dir:
@@ -94,10 +158,7 @@ class Checkpointer:
             return False
         data.update(kwargs)
 
-        save_file = os.path.join(self.save_dir, "{}.pth".format(name))
-        self.logger.info("Saving prototype branch checkpoint to {}".format(save_file))
-        torch.save(data, save_file)
-        return True
+        return self._save_data(name, data, "prototype branch checkpoint")
 
     def load(self, f=None):
         if not f:
