@@ -152,6 +152,46 @@ def load_clip_finetune(model, checkpoint_path, logger):
         skipped_shape,
     )
 
+
+def _count_parameters(module, trainable_only=False):
+    return sum(
+        p.numel()
+        for p in module.parameters()
+        if not trainable_only or p.requires_grad
+    )
+
+
+def _count_buffers(module):
+    return sum(buffer.numel() for buffer in module.buffers())
+
+
+def log_model_parameter_counts(model, logger):
+    total_params = _count_parameters(model)
+    logger.info('Total params: %2.fM' % (total_params / 1000000.0))
+
+    prototype_branch = getattr(model, "prototype_branch", None)
+    if prototype_branch is None:
+        logger.info("Prototype branch params: disabled")
+        return
+
+    prototype_params = _count_parameters(prototype_branch)
+    prototype_trainable_params = _count_parameters(prototype_branch, trainable_only=True)
+    prototype_buffer_elements = _count_buffers(prototype_branch)
+    prototype_share = (prototype_params / total_params * 100.0) if total_params else 0.0
+    logger.info(
+        "Prototype branch params: %d total (%.4fM), %d trainable (%.4fM), %.2f%% of total model params",
+        prototype_params,
+        prototype_params / 1000000.0,
+        prototype_trainable_params,
+        prototype_trainable_params / 1000000.0,
+        prototype_share,
+    )
+    logger.info(
+        "Prototype branch buffers: %d elements (%.4fM, not counted as params)",
+        prototype_buffer_elements,
+        prototype_buffer_elements / 1000000.0,
+    )
+
 if __name__ == '__main__':
     args = get_args()
     name = "ITSELF"
@@ -189,7 +229,7 @@ if __name__ == '__main__':
         
     train_loader, val_img_loader, val_txt_loader, num_classes = build_dataloader(args)
     model = build_model(args, num_classes)
-    logger.info('Total params: %2.fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
+    log_model_parameter_counts(model, logger)
     model.to(device)
     if args.finetune:
         logger.info("loading {} model".format(args.finetune))
