@@ -964,7 +964,9 @@ def write_grid_images(rows, base_path, args):
     cfg = grid_config(args, dummy_draw)
     created = []
 
-    for page_index, page_rows in enumerate(pages):
+    page_iter = tqdm(pages, desc="Writing grid image pages", unit="page")
+    for page_index, page_rows in enumerate(page_iter):
+        page_iter.set_postfix(rows=len(page_rows))
         row_heights = [measure_grid_row(row, args, cfg, dummy_draw) for row in page_rows]
         header_h = 70
         page_h = (
@@ -984,7 +986,14 @@ def write_grid_images(rows, base_path, args):
         draw.text((cfg["margin"], y), summary, fill="#53616f", font=cfg["body_font"])
         y = cfg["margin"] + header_h
 
-        for row, row_h in zip(page_rows, row_heights):
+        row_iter = tqdm(
+            zip(page_rows, row_heights),
+            total=len(page_rows),
+            desc=f"Drawing grid page {page_index + 1}/{len(pages)}",
+            unit="row",
+            leave=False,
+        )
+        for row, row_h in row_iter:
             draw_grid_row(draw, page, row, args, cfg, y, row_h)
             y += row_h + cfg["row_gap"]
 
