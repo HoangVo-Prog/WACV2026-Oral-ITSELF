@@ -9,6 +9,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import quote
 
 import torch
 import torch.nn.functional as F
@@ -258,18 +259,23 @@ def load_checkpoint_for_inference(model, checkpoint_path):
 
 def load_dataset_annotations(dataset_name, root_dir):
     config = DATASETS[dataset_name]
-    dataset_dir = os.path.join(root_dir, config["dataset_dir"])
-    img_dir = os.path.join(dataset_dir, config["image_dir"])
-    annotation_path = os.path.join(dataset_dir, config["annotation_file"])
+    root_path = Path(root_dir).expanduser()
+    if not root_path.is_absolute():
+        root_path = REPO_ROOT / root_path
+    root_path = root_path.resolve()
 
-    if not os.path.isdir(dataset_dir):
+    dataset_dir = root_path / config["dataset_dir"]
+    img_dir = dataset_dir / config["image_dir"]
+    annotation_path = dataset_dir / config["annotation_file"]
+
+    if not dataset_dir.is_dir():
         raise FileNotFoundError(f"Dataset directory not found: {dataset_dir}")
-    if not os.path.isdir(img_dir):
+    if not img_dir.is_dir():
         raise FileNotFoundError(f"Image directory not found: {img_dir}")
-    if not os.path.isfile(annotation_path):
+    if not annotation_path.is_file():
         raise FileNotFoundError(f"Annotation file not found: {annotation_path}")
 
-    with open(annotation_path, "r", encoding="utf-8") as file:
+    with annotation_path.open("r", encoding="utf-8") as file:
         annos = json.load(file)
 
     splits = {"train": [], "val": [], "test": []}
@@ -287,7 +293,7 @@ def load_dataset_annotations(dataset_name, root_dir):
         for anno in splits["train"]
     }
     return {
-        "img_dir": img_dir,
+        "img_dir": str(img_dir),
         "path_key": config["path_key"],
         "splits": splits,
         "num_train_ids": len(train_pids),
@@ -309,7 +315,7 @@ def annotation_image_path(dataset, anno):
     rel_path = anno.get(dataset["path_key"])
     if rel_path is None:
         raise KeyError(f"Annotation has no path key: {dataset['path_key']}")
-    return os.path.normpath(os.path.join(dataset["img_dir"], rel_path))
+    return str((Path(dataset["img_dir"]) / rel_path).resolve())
 
 
 def collect_split_rows(dataset, dataset_name, split):
@@ -598,20 +604,34 @@ def write_csv(rows, path):
             })
 
 
-def image_uri(path):
-    return Path(path).resolve().as_uri()
+def display_path(path):
+    resolved = Path(path).resolve()
+    try:
+        return resolved.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return str(resolved)
 
 
-def render_image_card(item, label):
-    src = html.escape(image_uri(item["image_path"]), quote=True)
-    path = html.escape(item["image_path"])
+def html_image_src(image_path, html_path):
+    image_path = Path(image_path).expanduser().resolve()
+    html_dir = Path(html_path).expanduser().resolve().parent
+    try:
+        rel_path = os.path.relpath(str(image_path), str(html_dir))
+    except ValueError:
+        return image_path.as_uri()
+    return quote(rel_path.replace(os.sep, "/"), safe="/")
+
+
+def render_image_card(item, label, html_path):
+    src = html.escape(html_image_src(item["image_path"], html_path), quote=True)
+    path = html.escape(display_path(item["image_path"]))
     score = html.escape(f"{item['similarity']:.4f}")
     pid = html.escape(str(item.get("pid", "")))
     extra = f"<div>pid: {pid}</div>" if pid else ""
     paired = " paired" if item.get("is_paired_positive") else ""
     return (
         f'<figure class="thumb{paired}">'
-        f'<img src="{src}" loading="lazy" alt="{label}">'
+        f'<img src="{src}" loading="lazy" alt="{html.escape(label)}">'
         f"<figcaption><strong>{html.escape(label)}</strong>{extra}<div>sim: {score}</div>"
         f'<div class="path">{path}</div></figcaption></figure>'
     )
@@ -624,9 +644,9 @@ def write_html(rows, path, max_rows, positive_limit):
         positives = row["positive_images"]
         if positive_limit > 0:
             positives = positives[:positive_limit]
-        positive_cards = "\n".join(render_image_card(item, "positive") for item in positives)
+        positive_cards = "\n".join(render_image_card(item, "positive", path) for item in positives)
         negative_cards = "\n".join(
-            render_image_card(item, f"negative #{item['rank']}")
+            render_image_card(item, f"negative #{item['rank']}", path)
             for item in row["hard_negative_images"]
         )
         blocks.append(
