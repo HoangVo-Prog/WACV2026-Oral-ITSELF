@@ -41,9 +41,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size for feature extraction.")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers.")
     parser.add_argument("--device", default="cuda", help='Device, e.g. "cuda" or "cpu".')
-    parser.add_argument("--config", default=None, help="Optional shared model/config YAML for both checkpoints.")
-    parser.add_argument("--base_config", default=None, help="Optional config YAML for the no-prototype checkpoint.")
-    parser.add_argument("--proto_config", default=None, help="Optional config YAML for the prototype checkpoint.")
     parser.add_argument("--max_queries", type=int, default=None, help="Optional query limit for debugging.")
     parser.add_argument("--n_boot", type=int, default=10000, help="Number of paired bootstrap samples.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -101,7 +98,7 @@ def threshold_label(threshold: float) -> str:
     return "0" if threshold == 0 else f"{threshold:.2f}"
 
 
-def make_margin_args(args: argparse.Namespace, config_path: Optional[str]) -> SimpleNamespace:
+def make_margin_args(args: argparse.Namespace) -> SimpleNamespace:
     return SimpleNamespace(
         dataset_root=str(resolve_path(args.dataset_root)),
         checkpoint="",
@@ -111,7 +108,7 @@ def make_margin_args(args: argparse.Namespace, config_path: Optional[str]) -> Si
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         device=args.device,
-        config=config_path,
+        config=None,
         max_queries=args.max_queries,
         bins=35,
         xmin=-0.25,
@@ -138,7 +135,6 @@ def rows_to_margin_dataframe(rows: Sequence[Mapping[str, Any]], pd: Any) -> Any:
 def compute_checkpoint_margins(
     label: str,
     checkpoint_path: Path,
-    config_path: Optional[str],
     args: argparse.Namespace,
     split_data: Any,
     device: Any,
@@ -147,7 +143,7 @@ def compute_checkpoint_margins(
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"{label} checkpoint not found: {checkpoint_path}")
 
-    model_cli_args = make_margin_args(args, config_path)
+    model_cli_args = make_margin_args(args)
     model_args = margin_diag.build_model_args(model_cli_args)
     num_classes = max(int(split_data.num_train_ids), 1)
 
@@ -658,11 +654,6 @@ def main() -> None:
     out_dir = resolve_path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    base_config = args.base_config or args.config
-    proto_config = args.proto_config or args.config
-    base_config = str(resolve_path(base_config)) if base_config else None
-    proto_config = str(resolve_path(proto_config)) if proto_config else None
-
     device = margin_diag.resolve_device(args.device)
     split_data = margin_diag.load_split_data(args.dataset_name, dataset_root, args.split)
     split_data = margin_diag.limit_queries(split_data, args.max_queries)
@@ -676,7 +667,6 @@ def main() -> None:
     base_rows, base_skipped, _base_load_stats = compute_checkpoint_margins(
         "base/no prototype",
         base_checkpoint,
-        base_config,
         args,
         split_data,
         device,
@@ -685,7 +675,6 @@ def main() -> None:
     proto_rows, proto_skipped, _proto_load_stats = compute_checkpoint_margins(
         "prototype",
         proto_checkpoint,
-        proto_config,
         args,
         split_data,
         device,
