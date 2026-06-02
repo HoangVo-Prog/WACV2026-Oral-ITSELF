@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as T
-from PIL import Image, ImageFile
+from PIL import Image, ImageDraw, ImageFile, ImageFont, ImageOps
 from tqdm import tqdm
 
 
@@ -110,6 +110,11 @@ def parse_args():
     parser.add_argument("--dataset-name", choices=sorted(DATASETS), default="RSTPReid")
     parser.add_argument("--root-dir", default="data", help="Dataset root containing RSTPReid/CUHK-PEDES/etc.")
     parser.add_argument(
+        "--input-jsonl",
+        default="",
+        help="Render outputs from an existing JSONL file and skip model/dataset mining.",
+    )
+    parser.add_argument(
         "--splits",
         nargs="+",
         default=["train", "test"],
@@ -171,6 +176,22 @@ def parse_args():
     )
     parser.add_argument("--no-html", action="store_true")
     parser.add_argument("--no-csv", action="store_true")
+    parser.add_argument("--grid-image", action="store_true", help="Write PNG contact-sheet image pages.")
+    parser.add_argument(
+        "--grid-rows-per-page",
+        type=int,
+        default=50,
+        help="Rows per PNG page. Use 0 to render all rows into one very tall image.",
+    )
+    parser.add_argument("--grid-width", type=int, default=2200, help="PNG page width in pixels.")
+    parser.add_argument("--grid-thumb-width", type=int, default=120)
+    parser.add_argument("--grid-thumb-height", type=int, default=180)
+    parser.add_argument(
+        "--grid-positive-limit",
+        type=int,
+        default=5,
+        help="Maximum positive thumbnails per PNG row. Use 0 to show all positives.",
+    )
     return parser.parse_args()
 
 
@@ -556,7 +577,18 @@ def output_paths(args, split):
         "jsonl": output_dir / f"{prefix}.jsonl",
         "csv": output_dir / f"{prefix}.csv",
         "html": output_dir / f"{prefix}.html",
+        "grid": output_dir / f"{prefix}_grid.png",
     }
+
+
+def read_jsonl(path):
+    rows = []
+    with Path(path).open("r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
 
 
 def write_jsonl(rows, path):
@@ -698,6 +730,270 @@ figcaption {{ padding: 8px; font-size: 12px; line-height: 1.35; }}
     path.write_text(document, encoding="utf-8")
 
 
+def load_grid_font(size, bold=False):
+    candidates = []
+    if os.name == "nt":
+        candidates.extend([
+            Path("C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf"),
+            Path("C:/Windows/Fonts/segoeuib.ttf" if bold else "C:/Windows/Fonts/segoeui.ttf"),
+        ])
+    candidates.extend([
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/dejavu/DejaVuSans.ttf"),
+    ])
+    for candidate in candidates:
+        if candidate.exists():
+            return ImageFont.truetype(str(candidate), size=size)
+    return ImageFont.load_default()
+
+
+def text_width(draw, text, font):
+    bbox = draw.textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0]
+
+
+def line_height(draw, font):
+    bbox = draw.textbbox((0, 0), "Ag", font=font)
+    return bbox[3] - bbox[1] + 4
+
+
+def wrap_text(draw, text, font, max_width, max_lines=0):
+    words = str(text).replace("\n", " ").split()
+    if not words:
+        return [""]
+
+    lines = []
+    current = ""
+    for word in words:
+        candidate = word if not current else f"{current} {word}"
+        if text_width(draw, candidate, font) <= max_width:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+            current = word
+        else:
+            lines.append(word)
+            current = ""
+    if current:
+        lines.append(current)
+
+    if max_lines > 0 and len(lines) > max_lines:
+        lines = lines[:max_lines]
+        while lines[-1] and text_width(draw, f"{lines[-1]}...", font) > max_width:
+            lines[-1] = lines[-1][:-1]
+        lines[-1] = f"{lines[-1]}..."
+    return lines
+
+
+def grid_config(args, draw):
+    thumb_w = int(args.grid_thumb_width)
+    thumb_h = int(args.grid_thumb_height)
+    card_pad = 8
+    footer_h = 78
+    card_w = thumb_w + card_pad * 2
+    card_h = thumb_h + footer_h + card_pad * 2
+    margin = 24
+    gap = 12
+    available_w = int(args.grid_width) - margin * 2
+    cols = max(1, (available_w + gap) // (card_w + gap))
+    return {
+        "width": int(args.grid_width),
+        "margin": margin,
+        "gap": gap,
+        "row_gap": 18,
+        "row_pad": 16,
+        "thumb_w": thumb_w,
+        "thumb_h": thumb_h,
+        "card_pad": card_pad,
+        "card_w": card_w,
+        "card_h": card_h,
+        "cols": cols,
+        "title_font": load_grid_font(26, bold=True),
+        "meta_font": load_grid_font(16, bold=True),
+        "body_font": load_grid_font(15),
+        "section_font": load_grid_font(17, bold=True),
+        "label_font": load_grid_font(14, bold=True),
+        "small_font": load_grid_font(12),
+    }
+
+
+def visible_positive_images(row, args):
+    positives = row["positive_images"]
+    if args.grid_positive_limit > 0:
+        return positives[:args.grid_positive_limit]
+    return positives
+
+
+def section_height(item_count, cfg):
+    if item_count <= 0:
+        return 0
+    grid_rows = math.ceil(item_count / cfg["cols"])
+    return 24 + grid_rows * cfg["card_h"] + max(0, grid_rows - 1) * cfg["gap"] + 8
+
+
+def measure_grid_row(row, args, cfg, draw):
+    inner_w = cfg["width"] - cfg["margin"] * 2 - cfg["row_pad"] * 2
+    meta_h = line_height(draw, cfg["meta_font"])
+    caption_lines = wrap_text(draw, row["caption"], cfg["body_font"], inner_w, max_lines=3)
+    caption_h = len(caption_lines) * line_height(draw, cfg["body_font"])
+    pos_h = section_height(len(visible_positive_images(row, args)), cfg)
+    neg_h = section_height(len(row["hard_negative_images"]), cfg)
+    return cfg["row_pad"] * 2 + meta_h + 6 + caption_h + 12 + pos_h + neg_h
+
+
+def load_grid_thumbnail(image_path, size):
+    canvas = Image.new("RGB", size, "#e5e9ef")
+    try:
+        image = read_image(image_path)
+        image = ImageOps.contain(image, size)
+        x = (size[0] - image.width) // 2
+        y = (size[1] - image.height) // 2
+        canvas.paste(image, (x, y))
+    except Exception:
+        draw = ImageDraw.Draw(canvas)
+        font = load_grid_font(13, bold=True)
+        draw.text((10, size[1] // 2 - 10), "missing image", fill="#9a1c1c", font=font)
+    return canvas
+
+
+def draw_grid_card(draw, page, item, label, x, y, cfg):
+    card_w = cfg["card_w"]
+    card_h = cfg["card_h"]
+    outline = "#2563eb" if item.get("is_paired_positive") else "#d8dee6"
+    width = 4 if item.get("is_paired_positive") else 1
+    draw.rounded_rectangle(
+        [x, y, x + card_w, y + card_h],
+        radius=8,
+        fill="#ffffff",
+        outline=outline,
+        width=width,
+    )
+
+    pad = cfg["card_pad"]
+    thumb = load_grid_thumbnail(item["image_path"], (cfg["thumb_w"], cfg["thumb_h"]))
+    page.paste(thumb, (x + pad, y + pad))
+
+    text_y = y + pad + cfg["thumb_h"] + 8
+    draw.text((x + pad, text_y), label, fill="#111827", font=cfg["label_font"])
+    text_y += line_height(draw, cfg["label_font"])
+    pid = item.get("pid")
+    if pid is not None:
+        draw.text((x + pad, text_y), f"pid: {pid}", fill="#374151", font=cfg["small_font"])
+        text_y += line_height(draw, cfg["small_font"])
+    draw.text((x + pad, text_y), f"sim: {item['similarity']:.4f}", fill="#374151", font=cfg["small_font"])
+    text_y += line_height(draw, cfg["small_font"])
+
+    filename = Path(item["image_path"]).name
+    max_text_w = card_w - pad * 2
+    for line in wrap_text(draw, filename, cfg["small_font"], max_text_w, max_lines=1):
+        draw.text((x + pad, text_y), line, fill="#6b7785", font=cfg["small_font"])
+
+
+def draw_grid_section(draw, page, title, items, x, y, cfg):
+    if not items:
+        return y
+    draw.text((x, y), title, fill="#111827", font=cfg["section_font"])
+    y += 24
+
+    for index, item in enumerate(items):
+        col = index % cfg["cols"]
+        row = index // cfg["cols"]
+        card_x = x + col * (cfg["card_w"] + cfg["gap"])
+        card_y = y + row * (cfg["card_h"] + cfg["gap"])
+        if title.startswith("Positive"):
+            label = "positive"
+        else:
+            label = f"negative #{item['rank']}"
+        draw_grid_card(draw, page, item, label, card_x, card_y, cfg)
+
+    grid_rows = math.ceil(len(items) / cfg["cols"])
+    return y + grid_rows * cfg["card_h"] + max(0, grid_rows - 1) * cfg["gap"] + 8
+
+
+def draw_grid_row(draw, page, row, args, cfg, y, row_h):
+    x = cfg["margin"]
+    w = cfg["width"] - cfg["margin"] * 2
+    draw.rounded_rectangle(
+        [x, y, x + w, y + row_h],
+        radius=8,
+        fill="#ffffff",
+        outline="#d8dee6",
+        width=1,
+    )
+
+    inner_x = x + cfg["row_pad"]
+    inner_y = y + cfg["row_pad"]
+    inner_w = w - cfg["row_pad"] * 2
+    meta = (
+        f"split={row['split']}  pid={row['pid']}  "
+        f"caption_index={row['caption_index']}  feature={row['feature']}"
+    )
+    draw.text((inner_x, inner_y), meta, fill="#53616f", font=cfg["meta_font"])
+    inner_y += line_height(draw, cfg["meta_font"]) + 6
+
+    for line in wrap_text(draw, row["caption"], cfg["body_font"], inner_w, max_lines=3):
+        draw.text((inner_x, inner_y), line, fill="#1f2933", font=cfg["body_font"])
+        inner_y += line_height(draw, cfg["body_font"])
+    inner_y += 12
+
+    positives = visible_positive_images(row, args)
+    inner_y = draw_grid_section(draw, page, "Positive images", positives, inner_x, inner_y, cfg)
+    inner_y = draw_grid_section(draw, page, "Hard negative images", row["hard_negative_images"], inner_x, inner_y, cfg)
+    return inner_y
+
+
+def grid_page_path(base_path, page_index, page_count):
+    if page_count == 1:
+        return base_path
+    return base_path.with_name(f"{base_path.stem}_page{page_index + 1:03d}{base_path.suffix}")
+
+
+def write_grid_images(rows, base_path, args):
+    if not rows:
+        return []
+
+    rows_per_page = int(args.grid_rows_per_page)
+    if rows_per_page <= 0:
+        pages = [rows]
+    else:
+        pages = [rows[i:i + rows_per_page] for i in range(0, len(rows), rows_per_page)]
+
+    dummy = Image.new("RGB", (int(args.grid_width), 100), "#ffffff")
+    dummy_draw = ImageDraw.Draw(dummy)
+    cfg = grid_config(args, dummy_draw)
+    created = []
+
+    for page_index, page_rows in enumerate(pages):
+        row_heights = [measure_grid_row(row, args, cfg, dummy_draw) for row in page_rows]
+        header_h = 70
+        page_h = (
+            cfg["margin"] * 2
+            + header_h
+            + sum(row_heights)
+            + max(0, len(page_rows) - 1) * cfg["row_gap"]
+        )
+        page = Image.new("RGB", (cfg["width"], page_h), "#f7f9fb")
+        draw = ImageDraw.Draw(page)
+        y = cfg["margin"]
+
+        title = f"Hard Negative Images - page {page_index + 1}/{len(pages)}"
+        draw.text((cfg["margin"], y), title, fill="#111827", font=cfg["title_font"])
+        y += line_height(draw, cfg["title_font"]) + 6
+        summary = f"rows on page: {len(page_rows)} / total rows: {len(rows)}"
+        draw.text((cfg["margin"], y), summary, fill="#53616f", font=cfg["body_font"])
+        y = cfg["margin"] + header_h
+
+        for row, row_h in zip(page_rows, row_heights):
+            draw_grid_row(draw, page, row, args, cfg, y, row_h)
+            y += row_h + cfg["row_gap"]
+
+        output_path = grid_page_path(base_path, page_index, len(pages))
+        page.save(output_path)
+        created.append(output_path)
+    return created
+
+
 def save_outputs(rows, args, split):
     paths = output_paths(args, split)
     write_jsonl(rows, paths["jsonl"])
@@ -711,11 +1007,26 @@ def save_outputs(rows, args, split):
         write_html(rows, paths["html"], args.html_max_rows, args.html_positive_limit)
         print(f"[{split}] wrote {paths['html']}")
 
+    if args.grid_image:
+        grid_paths = write_grid_images(rows, paths["grid"], args)
+        for grid_path in grid_paths:
+            print(f"[{split}] wrote {grid_path}")
+
 
 def main():
     args = parse_args()
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    if args.input_jsonl:
+        rows = read_jsonl(args.input_jsonl)
+        if not rows:
+            raise RuntimeError(f"No rows found in JSONL file: {args.input_jsonl}")
+        if not args.output_prefix:
+            args.output_prefix = Path(args.input_jsonl).stem
+        split = rows[0].get("split", "all")
+        save_outputs(rows, args, split)
+        return
 
     device = torch.device(args.device)
     if args.feature in ("grab", "ensemble") and device.type != "cuda":
