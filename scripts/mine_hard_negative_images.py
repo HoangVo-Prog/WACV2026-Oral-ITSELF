@@ -24,10 +24,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from model import build_model
-from model.clip_model import tokenize as clip_tokenize
+from datasets.bases import tokenize as dataset_tokenize
+from utils.simple_tokenizer import SimpleTokenizer
 
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+TEXT_TOKENIZER = SimpleTokenizer()
+
 
 DATASETS = {
     "CUHK-PEDES": {
@@ -144,12 +147,45 @@ def parse_args():
     parser.add_argument("--text-length", type=int, default=77)
     parser.add_argument("--select-ratio", type=float, default=0.4)
     parser.add_argument(
+        "--return-all",
+        "--return_all",
+        dest="return_all",
+        action="store_true",
+        default=True,
+        help="Use return_all=True in the ITSELF/CLIP forward config.",
+    )
+    parser.add_argument(
+        "--topk-type",
+        "--topk_type",
+        dest="topk_type",
+        default="custom",
+        choices=["mean", "std", "custom", "layer_index"],
+        help="Top-k attention aggregation mode used by ITSELF config.",
+    )
+    parser.add_argument(
+        "--modify-k",
+        "--modify_k",
+        dest="modify_k",
+        action="store_true",
+        default=True,
+        help="Use modify_k=True in the ITSELF config.",
+    )
+    parser.add_argument(
         "--feature",
         choices=["global", "grab", "ensemble"],
         default="global",
         help="Feature used for caption-image similarity. ensemble = alpha*global + (1-alpha)*grab.",
     )
     parser.add_argument("--ensemble-alpha", type=float, default=0.5)
+    parser.add_argument(
+        "--lambda",
+        "--itself-lambda",
+        "--inference-lambda",
+        dest="inference_lambda",
+        type=float,
+        default=None,
+        help="Global branch weight for ITSELF ensemble inference: lambda*global + (1-lambda)*grab. Defaults to --ensemble-alpha.",
+    )
     parser.add_argument(
         "--captions-per-id",
         type=int,
@@ -230,6 +266,16 @@ def parse_args():
         help="Rows per baseline-vs-best comparison PNG page. Use 0 for one tall image.",
     )
     parser.add_argument(
+        "--compare-only",
+        action="store_true",
+        help="In two-checkpoint mode, only write comparison JSONL/CSV for --compare-split and skip per-checkpoint outputs/grid.",
+    )
+    parser.add_argument(
+        "--no-compare-grid",
+        action="store_true",
+        help="Skip the baseline-vs-best comparison PNG grid while still writing comparison JSONL/CSV.",
+    )
+    parser.add_argument(
         "--no-compare-plot",
         action="store_true",
         help="Disable automatic baseline-vs-best comparison PNG/CSV/JSONL outputs.",
@@ -258,44 +304,84 @@ def build_model_args(args):
         prototype_id_weight=0.2,
         prototype_momentum=0.2,
         no_pbt=False,
-        only_global=args.feature == "global",
+        only_global=False,
         select_ratio=args.select_ratio,
-        return_all=False,
-        topk_type="mean",
+        return_all=bool(args.return_all),
+        topk_type=args.topk_type,
         layer_index=-1,
         average_attn_weights=True,
-        modify_k=False,
+        modify_k=bool(args.modify_k),
     )
+
+
+def torch_load_checkpoint(checkpoint_path):
+    try:
+        return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(checkpoint_path, map_location="cpu")
 
 
 def checkpoint_state_dict(checkpoint):
     if isinstance(checkpoint, dict):
-        for key in ("model", "state_dict"):
+        for key in ("state_dict", "model", "model_state_dict", "net", "network", "module"):
             if key in checkpoint and isinstance(checkpoint[key], dict):
                 return checkpoint[key]
     return checkpoint
 
 
-def strip_module_prefix(key):
-    return key[7:] if key.startswith("module.") else key
+def strip_repeated_prefixes(key, prefixes):
+    stripped = key
+    changed = True
+    while changed:
+        changed = False
+        for prefix in prefixes:
+            if stripped.startswith(prefix):
+                stripped = stripped[len(prefix):]
+                changed = True
+    return stripped
+
+
+def candidate_state_keys(key):
+    raw = str(key)
+    candidates = []
+
+    def add(candidate):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    add(raw)
+    no_module = strip_repeated_prefixes(raw, ("module.",))
+    add(no_module)
+    no_wrapper = strip_repeated_prefixes(no_module, ("model.", "net.", "network."))
+    add(no_wrapper)
+    normalized = strip_repeated_prefixes(raw, ("module.", "model.", "net.", "network."))
+    add(normalized)
+    for candidate in (no_wrapper, normalized):
+        if candidate.startswith("base_model."):
+            add(candidate[len("base_model."):])
+        else:
+            add(f"base_model.{candidate}")
+    if no_module.startswith("model."):
+        add(no_module[len("model."):])
+    return candidates
 
 
 def load_checkpoint_for_inference(model, checkpoint_path):
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch_load_checkpoint(checkpoint_path)
     loaded_state = checkpoint_state_dict(checkpoint)
     model_state = model.state_dict()
     update_state = {}
     skipped_missing = 0
     skipped_shape = 0
+    skipped_non_tensor = 0
 
     for raw_key, value in loaded_state.items():
-        key = strip_module_prefix(raw_key)
-        candidate_keys = [key]
-        if not key.startswith("base_model."):
-            candidate_keys.append(f"base_model.{key}")
+        if not torch.is_tensor(value):
+            skipped_non_tensor += 1
+            continue
 
         target_key = None
-        for candidate in candidate_keys:
+        for candidate in candidate_state_keys(raw_key):
             if candidate in model_state:
                 target_key = candidate
                 break
@@ -317,6 +403,7 @@ def load_checkpoint_for_inference(model, checkpoint_path):
         "loaded": len(update_state),
         "skipped_missing": skipped_missing,
         "skipped_shape": skipped_shape,
+        "skipped_non_tensor": skipped_non_tensor,
     }
 
 
@@ -481,8 +568,17 @@ def encode_image_bank(model, image_rows, transform, args, device):
 
 
 @torch.no_grad()
+def tokenize_captions(captions, args):
+    tokens = [
+        dataset_tokenize(caption, tokenizer=TEXT_TOKENIZER, text_length=args.text_length, truncate=True)
+        for caption in captions
+    ]
+    return torch.stack(tokens, dim=0)
+
+
+@torch.no_grad()
 def encode_text_features(model, captions, args, device):
-    tokens = clip_tokenize(captions, context_length=args.text_length, truncate=True).to(device)
+    tokens = tokenize_captions(captions, args).to(device)
     features = {}
     if args.feature in ("global", "ensemble"):
         feats = model.encode_text(tokens).float()
@@ -493,6 +589,12 @@ def encode_text_features(model, captions, args, device):
     return features
 
 
+def inference_lambda(args):
+    if getattr(args, "inference_lambda", None) is not None:
+        return float(args.inference_lambda)
+    return float(args.ensemble_alpha)
+
+
 def similarity_matrix(text_features, image_bank, args):
     if args.feature == "global":
         return text_features["global_feats"] @ image_bank["global_feats"].t()
@@ -500,7 +602,7 @@ def similarity_matrix(text_features, image_bank, args):
         return text_features["grab_feats"] @ image_bank["grab_feats"].t()
     global_sims = text_features["global_feats"] @ image_bank["global_feats"].t()
     grab_sims = text_features["grab_feats"] @ image_bank["grab_feats"].t()
-    alpha = float(args.ensemble_alpha)
+    alpha = inference_lambda(args)
     return alpha * global_sims + (1.0 - alpha) * grab_sims
 
 
@@ -662,7 +764,8 @@ def mine_split(dataset, dataset_name, split, model, transform, args, device, run
                 "dataset": dataset_name,
                 "split": split,
                 "feature": args.feature,
-                "ensemble_alpha": float(args.ensemble_alpha) if args.feature == "ensemble" else None,
+                "ensemble_alpha": inference_lambda(args) if args.feature == "ensemble" else None,
+                "inference_lambda": inference_lambda(args) if args.feature == "ensemble" else None,
                 "pid": pid,
                 "caption_index": int(caption_row["caption_index"]),
                 "caption_rank_within_pid": int(caption_row["caption_rank_within_pid"]),
@@ -1524,10 +1627,12 @@ def save_comparison_outputs(comparison_rows, baseline_rows, best_rows, args, spl
     write_comparison_csv(comparison_rows, paths["csv"], ranks)
     print(f"[{split}] wrote {paths['csv']}")
 
-    if comparison_rows:
+    if comparison_rows and not (args.compare_only or args.no_compare_grid):
         grid_paths = write_comparison_grid_images(comparison_rows, paths["grid"], args, ranks, baseline_summary, best_summary)
         for grid_path in grid_paths:
             print(f"[{split}] wrote {grid_path}")
+    elif comparison_rows:
+        print(f"[{split}] skipped comparison grid PNG")
     else:
         print(f"[{split}] no queries where {args.best_name} improves {args.baseline_name} at R@1")
 
@@ -1559,7 +1664,8 @@ def load_model_for_run(args, num_classes, checkpoint_path, run_name, device):
         stats = load_checkpoint_for_inference(model, checkpoint_path)
         print(
             f"{label}Loaded checkpoint tensors: {stats['loaded']} "
-            f"(skipped missing={stats['skipped_missing']}, shape={stats['skipped_shape']})"
+            f"(skipped missing={stats['skipped_missing']}, shape={stats['skipped_shape']}, "
+            f"non_tensor={stats['skipped_non_tensor']})"
         )
     else:
         print(f"{label}No checkpoint supplied; using pretrained backbone {args.pretrain_choice}.")
@@ -1591,8 +1697,14 @@ def main():
         raise RuntimeError("Use both --baseline-checkpoint and --best-checkpoint for comparison mode.")
     if pair_mode and args.checkpoint:
         raise RuntimeError("Use either --checkpoint, or --baseline-checkpoint with --best-checkpoint, not both.")
+    if args.compare_only and not pair_mode:
+        raise RuntimeError("--compare-only requires --baseline-checkpoint and --best-checkpoint.")
+    if args.compare_only and args.no_compare_plot:
+        raise RuntimeError("--compare-only cannot be combined with --no-compare-plot.")
 
     compare_ranks = clean_compare_ranks(args)
+    if args.inference_lambda is not None and not (0.0 <= float(args.inference_lambda) <= 1.0):
+        raise RuntimeError("--lambda/--itself-lambda must be in [0, 1].")
 
     device = torch.device(args.device)
     if args.feature in ("grab", "ensemble") and device.type != "cuda":
@@ -1604,8 +1716,9 @@ def main():
     transform = build_eval_transform(tuple(args.img_size))
 
     if pair_mode:
-        compare_enabled = not args.no_compare_plot and args.compare_split in args.splits
-        if not args.no_compare_plot and args.compare_split not in args.splits:
+        splits_to_run = [args.compare_split] if args.compare_only else args.splits
+        compare_enabled = not args.no_compare_plot and args.compare_split in splits_to_run
+        if not args.no_compare_plot and args.compare_split not in splits_to_run:
             print(f"[{args.compare_split}] skipped comparison because split is not in --splits")
 
         run_specs = [
@@ -1616,7 +1729,7 @@ def main():
         for run_name, checkpoint_path in run_specs:
             model = load_model_for_run(args, num_classes, checkpoint_path, run_name, device)
             try:
-                for split in args.splits:
+                for split in splits_to_run:
                     top_k = max(compare_ranks) if compare_enabled and split == args.compare_split else 0
                     recall_ks = compare_ranks if compare_enabled and split == args.compare_split else []
                     rows = mine_split(
@@ -1632,7 +1745,8 @@ def main():
                         recall_ks=recall_ks,
                     )
                     rows_by_run[(run_name, split)] = rows
-                    save_outputs(rows, args, split, run_name=safe_filename_token(run_name))
+                    if not args.compare_only:
+                        save_outputs(rows, args, split, run_name=safe_filename_token(run_name))
             finally:
                 del model
                 if device.type == "cuda":
