@@ -126,6 +126,18 @@ def parse_args():
         default="",
         help="Optional ITSELF checkpoint. If omitted, the OpenAI CLIP backbone from --pretrain-choice is used.",
     )
+    parser.add_argument(
+        "--baseline-checkpoint",
+        default="",
+        help="Optional baseline checkpoint for two-checkpoint comparison mode.",
+    )
+    parser.add_argument(
+        "--best-checkpoint",
+        default="",
+        help="Optional best checkpoint for two-checkpoint comparison mode.",
+    )
+    parser.add_argument("--baseline-name", default="baseline", help="Display/output name for the baseline checkpoint.")
+    parser.add_argument("--best-name", default="best", help="Display/output name for the best checkpoint.")
     parser.add_argument("--pretrain-choice", default="ViT-B/16")
     parser.add_argument("--img-size", nargs=2, type=int, default=[384, 128], metavar=("HEIGHT", "WIDTH"))
     parser.add_argument("--stride-size", type=int, default=16)
@@ -191,6 +203,36 @@ def parse_args():
         type=int,
         default=5,
         help="Maximum positive thumbnails per PNG row. Use 0 to show all positives.",
+    )
+    parser.add_argument(
+        "--compare-ranks",
+        nargs="+",
+        type=int,
+        default=[1, 5, 10],
+        help="R@K thresholds used in baseline-vs-best comparison plots.",
+    )
+    parser.add_argument(
+        "--compare-top-m",
+        type=int,
+        default=50,
+        help="Number of test captions to plot where best improves baseline at R@1.",
+    )
+    parser.add_argument(
+        "--compare-split",
+        default="test",
+        choices=["train", "val", "test"],
+        help="Split used for the baseline-vs-best comparison plot.",
+    )
+    parser.add_argument(
+        "--compare-rows-per-page",
+        type=int,
+        default=20,
+        help="Rows per baseline-vs-best comparison PNG page. Use 0 for one tall image.",
+    )
+    parser.add_argument(
+        "--no-compare-plot",
+        action="store_true",
+        help="Disable automatic baseline-vs-best comparison PNG/CSV/JSONL outputs.",
     )
     return parser.parse_args()
 
@@ -462,6 +504,69 @@ def similarity_matrix(text_features, image_bank, args):
     return alpha * global_sims + (1.0 - alpha) * grab_sims
 
 
+def clean_compare_ranks(args):
+    ranks = []
+    for rank in getattr(args, "compare_ranks", [1, 5, 10]):
+        rank = int(rank)
+        if rank > 0:
+            ranks.append(rank)
+    ranks = sorted(set(ranks))
+    return ranks or [1]
+
+
+def retrieval_details(scores, image_bank, query_pid, paired_index, top_k, recall_ks):
+    image_pids = image_bank["image_pids"]
+    sorted_indices = torch.argsort(scores, descending=True)
+    query_pid = int(query_pid)
+    paired_index = int(paired_index)
+    top_k = max(0, int(top_k))
+    top_items = []
+    first_positive_rank = None
+
+    for rank, index in enumerate(sorted_indices.tolist(), start=1):
+        score = float(scores[index].item())
+        pid = int(image_pids[index].item())
+        is_positive = pid == query_pid
+        if rank <= top_k:
+            top_items.append({
+                "rank": rank,
+                "pid": pid,
+                "image_index": int(image_bank["image_indices"][index].item()),
+                "image_path": image_bank["image_paths"][index],
+                "similarity": score,
+                "is_positive": is_positive,
+                "is_paired_positive": int(index) == paired_index,
+            })
+        if is_positive and first_positive_rank is None:
+            first_positive_rank = rank
+        if first_positive_rank is not None and rank >= top_k:
+            break
+
+    recall_hits = {
+        f"R{int(k)}": bool(first_positive_rank is not None and first_positive_rank <= int(k))
+        for k in recall_ks
+    }
+    rank1 = top_items[0] if top_items else None
+    return {
+        "first_positive_rank": first_positive_rank,
+        "recall_hits": recall_hits,
+        "rank1_pid": rank1["pid"] if rank1 else None,
+        "rank1_image_path": rank1["image_path"] if rank1 else None,
+        "rank1_similarity": rank1["similarity"] if rank1 else None,
+        "rank1_is_positive": bool(rank1 and rank1["is_positive"]),
+        "top_retrieved_images": top_items,
+    }
+
+
+def recall_summary(rows, ranks):
+    summary = {"num_queries": len(rows)}
+    for rank in ranks:
+        key = f"R{int(rank)}"
+        hits = [bool(row.get("recall_hits", {}).get(key)) for row in rows]
+        summary[key] = float(sum(hits) * 100.0 / len(hits)) if hits else 0.0
+    return summary
+
+
 def ranked_positive_images(scores, image_bank, positive_indices, paired_index):
     positives = []
     for image_index in positive_indices:
@@ -511,7 +616,8 @@ def select_hard_negative_images(scores, image_bank, query_pid, hard_k, unique_ne
     return hard_negatives
 
 
-def mine_split(dataset, dataset_name, split, model, transform, args, device):
+def mine_split(dataset, dataset_name, split, model, transform, args, device, run_name="", top_retrieval_k=0, recall_ks=None):
+    recall_ks = recall_ks or []
     caption_rows, image_rows, pid_to_image_indices = collect_split_rows(dataset, dataset_name, split)
     selected_caption_rows = select_caption_rows(
         caption_rows,
@@ -520,8 +626,9 @@ def mine_split(dataset, dataset_name, split, model, transform, args, device):
         seed=args.seed,
     )
 
+    log_name = f"{run_name}:" if run_name else ""
     print(
-        f"[{split}] images={len(image_rows)} captions={len(caption_rows)} "
+        f"[{log_name}{split}] images={len(image_rows)} captions={len(caption_rows)} "
         f"selected_captions={len(selected_caption_rows)} identities={len(pid_to_image_indices)}"
     )
     image_bank = encode_image_bank(model, image_rows, transform, args, device)
@@ -551,7 +658,7 @@ def mine_split(dataset, dataset_name, split, model, transform, args, device):
                 hard_k=args.hard_k,
                 unique_negative_pid=unique_negative_pid,
             )
-            rows.append({
+            row_data = {
                 "dataset": dataset_name,
                 "split": split,
                 "feature": args.feature,
@@ -565,14 +672,28 @@ def mine_split(dataset, dataset_name, split, model, transform, args, device):
                 "paired_positive_image_path": caption_row["paired_positive_image_path"],
                 "positive_images": positives,
                 "hard_negative_images": hard_negatives,
-            })
+            }
+            if run_name:
+                row_data["checkpoint_name"] = run_name
+            if top_retrieval_k > 0 or recall_ks:
+                row_data.update(retrieval_details(
+                    scores,
+                    image_bank,
+                    query_pid=pid,
+                    paired_index=caption_row["paired_image_index"],
+                    top_k=top_retrieval_k,
+                    recall_ks=recall_ks,
+                ))
+            rows.append(row_data)
     return rows
 
 
-def output_paths(args, split):
+def output_paths(args, split, run_name=""):
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     prefix = args.output_prefix or f"{args.dataset_name}_{split}_{args.feature}"
+    if run_name:
+        prefix = f"{prefix}_{run_name}"
     return {
         "jsonl": output_dir / f"{prefix}.jsonl",
         "csv": output_dir / f"{prefix}.csv",
@@ -601,12 +722,18 @@ def write_csv(rows, path):
     fieldnames = [
         "dataset",
         "split",
+        "checkpoint_name",
         "feature",
         "pid",
         "caption_index",
         "caption_rank_within_pid",
         "caption",
         "paired_positive_image_path",
+        "first_positive_rank",
+        "rank1_pid",
+        "rank1_image_path",
+        "rank1_similarity",
+        "rank1_is_positive",
         "positive_image_paths",
         "positive_scores",
         "hard_negative_pids",
@@ -622,12 +749,18 @@ def write_csv(rows, path):
             writer.writerow({
                 "dataset": row["dataset"],
                 "split": row["split"],
+                "checkpoint_name": row.get("checkpoint_name", ""),
                 "feature": row["feature"],
                 "pid": row["pid"],
                 "caption_index": row["caption_index"],
                 "caption_rank_within_pid": row["caption_rank_within_pid"],
                 "caption": row["caption"],
                 "paired_positive_image_path": row["paired_positive_image_path"],
+                "first_positive_rank": row.get("first_positive_rank", ""),
+                "rank1_pid": row.get("rank1_pid", ""),
+                "rank1_image_path": row.get("rank1_image_path", ""),
+                "rank1_similarity": f"{row['rank1_similarity']:.6f}" if row.get("rank1_similarity") is not None else "",
+                "rank1_is_positive": row.get("rank1_is_positive", ""),
                 "positive_image_paths": ";".join(item["image_path"] for item in positives),
                 "positive_scores": ";".join(f"{item['similarity']:.6f}" for item in positives),
                 "hard_negative_pids": ";".join(str(item["pid"]) for item in negatives),
@@ -1003,8 +1136,358 @@ def write_grid_images(rows, base_path, args):
     return created
 
 
-def save_outputs(rows, args, split):
-    paths = output_paths(args, split)
+def safe_filename_token(value):
+    token = str(value).strip()
+    safe = [char if char.isalnum() or char in ("-", "_", ".") else "_" for char in token]
+    safe = "".join(safe).strip("_")
+    return safe or "run"
+
+
+def comparison_output_paths(args, split):
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prefix = args.output_prefix or f"{args.dataset_name}_{split}_{args.feature}"
+    baseline_name = safe_filename_token(args.baseline_name)
+    best_name = safe_filename_token(args.best_name)
+    prefix = f"{prefix}_{baseline_name}_vs_{best_name}_compare"
+    return {
+        "jsonl": output_dir / f"{prefix}.jsonl",
+        "csv": output_dir / f"{prefix}.csv",
+        "grid": output_dir / f"{prefix}_grid.png",
+    }
+
+
+def comparison_row_key(row):
+    return (row.get("split"), int(row["caption_index"]))
+
+
+def rank_value(row):
+    rank = row.get("first_positive_rank")
+    if rank is None:
+        return 10 ** 9
+    return int(rank)
+
+
+def compact_comparison_run(row):
+    return {
+        "checkpoint_name": row.get("checkpoint_name", ""),
+        "first_positive_rank": row.get("first_positive_rank"),
+        "recall_hits": row.get("recall_hits", {}),
+        "rank1_pid": row.get("rank1_pid"),
+        "rank1_image_path": row.get("rank1_image_path"),
+        "rank1_similarity": row.get("rank1_similarity"),
+        "rank1_is_positive": row.get("rank1_is_positive"),
+        "top_retrieved_images": row.get("top_retrieved_images", []),
+    }
+
+
+def build_comparison_rows(baseline_rows, best_rows, ranks, top_m):
+    baseline_by_key = {comparison_row_key(row): row for row in baseline_rows}
+    comparison_rows = []
+    for best_row in best_rows:
+        baseline_row = baseline_by_key.get(comparison_row_key(best_row))
+        if baseline_row is None:
+            continue
+
+        baseline_rank = rank_value(baseline_row)
+        best_rank = rank_value(best_row)
+        baseline_r1 = baseline_rank <= 1
+        best_r1 = best_rank <= 1
+        if not best_r1 or baseline_r1:
+            continue
+
+        baseline_rank1 = baseline_row.get("rank1_similarity")
+        best_rank1 = best_row.get("rank1_similarity")
+        score_delta = None
+        if baseline_rank1 is not None and best_rank1 is not None:
+            score_delta = float(best_rank1) - float(baseline_rank1)
+
+        comparison_rows.append({
+            "dataset": best_row["dataset"],
+            "split": best_row["split"],
+            "feature": best_row["feature"],
+            "ensemble_alpha": best_row.get("ensemble_alpha"),
+            "pid": best_row["pid"],
+            "caption_index": best_row["caption_index"],
+            "caption_rank_within_pid": best_row["caption_rank_within_pid"],
+            "caption": best_row["caption"],
+            "paired_positive_image_path": best_row["paired_positive_image_path"],
+            "rank_improvement": int(baseline_rank - best_rank),
+            "rank1_score_delta": score_delta,
+            "ranks": [int(rank) for rank in ranks],
+            "baseline": compact_comparison_run(baseline_row),
+            "best": compact_comparison_run(best_row),
+        })
+
+    comparison_rows.sort(
+        key=lambda row: (
+            row["rank_improvement"],
+            row["rank1_score_delta"] if row["rank1_score_delta"] is not None else float("-inf"),
+            -int(row["caption_index"]),
+        ),
+        reverse=True,
+    )
+    if top_m > 0:
+        comparison_rows = comparison_rows[:int(top_m)]
+    return comparison_rows
+
+
+def joined_top_values(run, key, fmt=None):
+    values = []
+    for item in run.get("top_retrieved_images", []):
+        value = item.get(key)
+        if value is None:
+            values.append("")
+        elif fmt is not None:
+            values.append(fmt(value))
+        else:
+            values.append(str(value))
+    return ";".join(values)
+
+
+def write_comparison_csv(rows, path, ranks):
+    fieldnames = [
+        "dataset",
+        "split",
+        "feature",
+        "pid",
+        "caption_index",
+        "caption_rank_within_pid",
+        "caption",
+        "paired_positive_image_path",
+        "rank_improvement",
+        "rank1_score_delta",
+        "baseline_first_positive_rank",
+        "best_first_positive_rank",
+        "baseline_rank1_pid",
+        "best_rank1_pid",
+        "baseline_rank1_image_path",
+        "best_rank1_image_path",
+    ]
+    for rank in ranks:
+        fieldnames.extend([f"baseline_R{rank}", f"best_R{rank}"])
+    fieldnames.extend([
+        "baseline_top_pids",
+        "best_top_pids",
+        "baseline_top_image_paths",
+        "best_top_image_paths",
+        "baseline_top_scores",
+        "best_top_scores",
+    ])
+
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            baseline = row["baseline"]
+            best = row["best"]
+            output = {
+                "dataset": row["dataset"],
+                "split": row["split"],
+                "feature": row["feature"],
+                "pid": row["pid"],
+                "caption_index": row["caption_index"],
+                "caption_rank_within_pid": row["caption_rank_within_pid"],
+                "caption": row["caption"],
+                "paired_positive_image_path": row["paired_positive_image_path"],
+                "rank_improvement": row["rank_improvement"],
+                "rank1_score_delta": f"{row['rank1_score_delta']:.6f}" if row["rank1_score_delta"] is not None else "",
+                "baseline_first_positive_rank": baseline.get("first_positive_rank"),
+                "best_first_positive_rank": best.get("first_positive_rank"),
+                "baseline_rank1_pid": baseline.get("rank1_pid"),
+                "best_rank1_pid": best.get("rank1_pid"),
+                "baseline_rank1_image_path": baseline.get("rank1_image_path"),
+                "best_rank1_image_path": best.get("rank1_image_path"),
+                "baseline_top_pids": joined_top_values(baseline, "pid"),
+                "best_top_pids": joined_top_values(best, "pid"),
+                "baseline_top_image_paths": joined_top_values(baseline, "image_path"),
+                "best_top_image_paths": joined_top_values(best, "image_path"),
+                "baseline_top_scores": joined_top_values(baseline, "similarity", lambda value: f"{value:.6f}"),
+                "best_top_scores": joined_top_values(best, "similarity", lambda value: f"{value:.6f}"),
+            }
+            for rank in ranks:
+                key = f"R{rank}"
+                output[f"baseline_R{rank}"] = baseline.get("recall_hits", {}).get(key, False)
+                output[f"best_R{rank}"] = best.get("recall_hits", {}).get(key, False)
+            writer.writerow(output)
+
+
+def compare_panel_cols(panel_w, cfg):
+    return max(1, int((panel_w + cfg["gap"]) // (cfg["card_w"] + cfg["gap"])))
+
+
+def compare_panel_height(item_count, panel_w, cfg):
+    if item_count <= 0:
+        return 24
+    cols = compare_panel_cols(panel_w, cfg)
+    grid_rows = math.ceil(item_count / cols)
+    return 28 + grid_rows * cfg["card_h"] + max(0, grid_rows - 1) * cfg["gap"]
+
+
+def measure_comparison_row(row, args, cfg, draw):
+    inner_w = cfg["width"] - cfg["margin"] * 2 - cfg["row_pad"] * 2
+    panel_w = (inner_w - cfg["side_gap"]) // 2
+    meta_h = line_height(draw, cfg["meta_font"])
+    caption_lines = wrap_text(draw, row["caption"], cfg["body_font"], inner_w, max_lines=3)
+    caption_h = len(caption_lines) * line_height(draw, cfg["body_font"])
+    panel_h = max(
+        compare_panel_height(len(row["baseline"].get("top_retrieved_images", [])), panel_w, cfg),
+        compare_panel_height(len(row["best"].get("top_retrieved_images", [])), panel_w, cfg),
+    )
+    return cfg["row_pad"] * 2 + meta_h + 6 + caption_h + 14 + panel_h
+
+
+def draw_compare_card(draw, page, item, x, y, cfg):
+    card_w = cfg["card_w"]
+    card_h = cfg["card_h"]
+    if item.get("is_positive"):
+        outline = "#16a34a"
+        width = 4
+    elif int(item.get("rank", 0)) == 1:
+        outline = "#dc2626"
+        width = 3
+    else:
+        outline = "#d8dee6"
+        width = 1
+    draw.rounded_rectangle([x, y, x + card_w, y + card_h], radius=8, fill="#ffffff", outline=outline, width=width)
+
+    pad = cfg["card_pad"]
+    thumb = load_grid_thumbnail(item["image_path"], (cfg["thumb_w"], cfg["thumb_h"]))
+    page.paste(thumb, (x + pad, y + pad))
+
+    text_y = y + pad + cfg["thumb_h"] + 8
+    label = f"rank #{item['rank']}"
+    draw.text((x + pad, text_y), label, fill="#111827", font=cfg["label_font"])
+    text_y += line_height(draw, cfg["label_font"])
+    draw.text((x + pad, text_y), f"pid: {item['pid']}", fill="#374151", font=cfg["small_font"])
+    text_y += line_height(draw, cfg["small_font"])
+    draw.text((x + pad, text_y), f"sim: {item['similarity']:.4f}", fill="#374151", font=cfg["small_font"])
+    text_y += line_height(draw, cfg["small_font"])
+    filename = Path(item["image_path"]).name
+    for line in wrap_text(draw, filename, cfg["small_font"], card_w - pad * 2, max_lines=1):
+        draw.text((x + pad, text_y), line, fill="#6b7785", font=cfg["small_font"])
+
+
+def draw_compare_panel(draw, page, title, run, ranks, x, y, panel_w, cfg):
+    first_rank = run.get("first_positive_rank")
+    hit_bits = []
+    for rank in ranks:
+        key = f"R{rank}"
+        hit_bits.append(f"{key}:{'hit' if run.get('recall_hits', {}).get(key) else 'miss'}")
+    header = f"{title}  first_pos_rank={first_rank}  " + "  ".join(hit_bits)
+    draw.text((x, y), header, fill="#111827", font=cfg["section_font"])
+    y += 28
+
+    items = run.get("top_retrieved_images", [])
+    cols = compare_panel_cols(panel_w, cfg)
+    for index, item in enumerate(items):
+        col = index % cols
+        row = index // cols
+        card_x = x + col * (cfg["card_w"] + cfg["gap"])
+        card_y = y + row * (cfg["card_h"] + cfg["gap"])
+        draw_compare_card(draw, page, item, card_x, card_y, cfg)
+
+
+def draw_comparison_row(draw, page, row, args, cfg, y, row_h, ranks):
+    x = cfg["margin"]
+    w = cfg["width"] - cfg["margin"] * 2
+    draw.rounded_rectangle([x, y, x + w, y + row_h], radius=8, fill="#ffffff", outline="#d8dee6", width=1)
+
+    inner_x = x + cfg["row_pad"]
+    inner_y = y + cfg["row_pad"]
+    inner_w = w - cfg["row_pad"] * 2
+    meta = (
+        f"split={row['split']}  pid={row['pid']}  caption_index={row['caption_index']}  "
+        f"rank_improvement={row['rank_improvement']}"
+    )
+    draw.text((inner_x, inner_y), meta, fill="#53616f", font=cfg["meta_font"])
+    inner_y += line_height(draw, cfg["meta_font"]) + 6
+    for line in wrap_text(draw, row["caption"], cfg["body_font"], inner_w, max_lines=3):
+        draw.text((inner_x, inner_y), line, fill="#1f2933", font=cfg["body_font"])
+        inner_y += line_height(draw, cfg["body_font"])
+    inner_y += 14
+
+    panel_w = (inner_w - cfg["side_gap"]) // 2
+    left_x = inner_x
+    right_x = inner_x + panel_w + cfg["side_gap"]
+    draw.line([(right_x - cfg["side_gap"] // 2, inner_y), (right_x - cfg["side_gap"] // 2, y + row_h - cfg["row_pad"])], fill="#d8dee6", width=1)
+    draw_compare_panel(draw, page, args.baseline_name, row["baseline"], ranks, left_x, inner_y, panel_w, cfg)
+    draw_compare_panel(draw, page, args.best_name, row["best"], ranks, right_x, inner_y, panel_w, cfg)
+
+
+def write_comparison_grid_images(rows, base_path, args, ranks, baseline_summary, best_summary):
+    if not rows:
+        return []
+
+    rows_per_page = int(args.compare_rows_per_page)
+    if rows_per_page <= 0:
+        pages = [rows]
+    else:
+        pages = [rows[i:i + rows_per_page] for i in range(0, len(rows), rows_per_page)]
+
+    dummy = Image.new("RGB", (int(args.grid_width), 100), "#ffffff")
+    dummy_draw = ImageDraw.Draw(dummy)
+    cfg = grid_config(args, dummy_draw)
+    cfg["side_gap"] = 28
+    created = []
+
+    page_iter = tqdm(pages, desc="Writing comparison grid pages", unit="page")
+    for page_index, page_rows in enumerate(page_iter):
+        row_heights = [measure_comparison_row(row, args, cfg, dummy_draw) for row in page_rows]
+        header_h = 90
+        page_h = cfg["margin"] * 2 + header_h + sum(row_heights) + max(0, len(page_rows) - 1) * cfg["row_gap"]
+        page = Image.new("RGB", (cfg["width"], page_h), "#f7f9fb")
+        draw = ImageDraw.Draw(page)
+        y = cfg["margin"]
+
+        title = f"Baseline vs Best R@K - page {page_index + 1}/{len(pages)}"
+        draw.text((cfg["margin"], y), title, fill="#111827", font=cfg["title_font"])
+        y += line_height(draw, cfg["title_font"]) + 6
+        rank_text = "  ".join(
+            f"R{rank}: {args.baseline_name}={baseline_summary[f'R{rank}']:.2f}% {args.best_name}={best_summary[f'R{rank}']:.2f}%"
+            for rank in ranks
+        )
+        summary = f"selected rows: {len(rows)}  total queries: {baseline_summary['num_queries']}  {rank_text}"
+        draw.text((cfg["margin"], y), summary, fill="#53616f", font=cfg["body_font"])
+        y = cfg["margin"] + header_h
+
+        row_iter = tqdm(
+            zip(page_rows, row_heights),
+            total=len(page_rows),
+            desc=f"Drawing comparison page {page_index + 1}/{len(pages)}",
+            unit="row",
+            leave=False,
+        )
+        for row, row_h in row_iter:
+            draw_comparison_row(draw, page, row, args, cfg, y, row_h, ranks)
+            y += row_h + cfg["row_gap"]
+
+        output_path = grid_page_path(base_path, page_index, len(pages))
+        page.save(output_path)
+        created.append(output_path)
+    return created
+
+
+def save_comparison_outputs(comparison_rows, baseline_rows, best_rows, args, split, ranks):
+    paths = comparison_output_paths(args, split)
+    baseline_summary = recall_summary(baseline_rows, ranks)
+    best_summary = recall_summary(best_rows, ranks)
+
+    write_jsonl(comparison_rows, paths["jsonl"])
+    print(f"[{split}] wrote {paths['jsonl']}")
+    write_comparison_csv(comparison_rows, paths["csv"], ranks)
+    print(f"[{split}] wrote {paths['csv']}")
+
+    if comparison_rows:
+        grid_paths = write_comparison_grid_images(comparison_rows, paths["grid"], args, ranks, baseline_summary, best_summary)
+        for grid_path in grid_paths:
+            print(f"[{split}] wrote {grid_path}")
+    else:
+        print(f"[{split}] no queries where {args.best_name} improves {args.baseline_name} at R@1")
+
+
+def save_outputs(rows, args, split, run_name=""):
+    paths = output_paths(args, split, run_name=run_name)
     write_jsonl(rows, paths["jsonl"])
     print(f"[{split}] wrote {paths['jsonl']}")
 
@@ -1022,6 +1505,26 @@ def save_outputs(rows, args, split):
             print(f"[{split}] wrote {grid_path}")
 
 
+def load_model_for_run(args, num_classes, checkpoint_path, run_name, device):
+    model_args = build_model_args(args)
+    model = build_model(model_args, num_classes=num_classes)
+    label = f"[{run_name}] " if run_name else ""
+    if checkpoint_path:
+        stats = load_checkpoint_for_inference(model, checkpoint_path)
+        print(
+            f"{label}Loaded checkpoint tensors: {stats['loaded']} "
+            f"(skipped missing={stats['skipped_missing']}, shape={stats['skipped_shape']})"
+        )
+    else:
+        print(f"{label}No checkpoint supplied; using pretrained backbone {args.pretrain_choice}.")
+
+    model.to(device)
+    if device.type == "cpu":
+        model.float()
+    model.eval()
+    return model
+
+
 def main():
     args = parse_args()
     random.seed(args.seed)
@@ -1037,6 +1540,14 @@ def main():
         save_outputs(rows, args, split)
         return
 
+    pair_mode = bool(args.baseline_checkpoint) or bool(args.best_checkpoint)
+    if pair_mode and not (args.baseline_checkpoint and args.best_checkpoint):
+        raise RuntimeError("Use both --baseline-checkpoint and --best-checkpoint for comparison mode.")
+    if pair_mode and args.checkpoint:
+        raise RuntimeError("Use either --checkpoint, or --baseline-checkpoint with --best-checkpoint, not both.")
+
+    compare_ranks = clean_compare_ranks(args)
+
     device = torch.device(args.device)
     if args.feature in ("grab", "ensemble") and device.type != "cuda":
         raise RuntimeError("GRAB features use half tensors in this codebase. Use --device cuda or --feature global.")
@@ -1044,23 +1555,51 @@ def main():
     dataset = load_dataset_annotations(args.dataset_name, args.root_dir)
     num_classes = dataset["num_train_ids"]
 
-    model_args = build_model_args(args)
-    model = build_model(model_args, num_classes=num_classes)
-    if args.checkpoint:
-        stats = load_checkpoint_for_inference(model, args.checkpoint)
-        print(
-            f"Loaded checkpoint tensors: {stats['loaded']} "
-            f"(skipped missing={stats['skipped_missing']}, shape={stats['skipped_shape']})"
-        )
-    else:
-        print(f"No checkpoint supplied; using pretrained backbone {args.pretrain_choice}.")
-
-    model.to(device)
-    if device.type == "cpu":
-        model.float()
-    model.eval()
-
     transform = build_eval_transform(tuple(args.img_size))
+
+    if pair_mode:
+        compare_enabled = not args.no_compare_plot and args.compare_split in args.splits
+        if not args.no_compare_plot and args.compare_split not in args.splits:
+            print(f"[{args.compare_split}] skipped comparison because split is not in --splits")
+
+        run_specs = [
+            (args.baseline_name, args.baseline_checkpoint),
+            (args.best_name, args.best_checkpoint),
+        ]
+        rows_by_run = {}
+        for run_name, checkpoint_path in run_specs:
+            model = load_model_for_run(args, num_classes, checkpoint_path, run_name, device)
+            try:
+                for split in args.splits:
+                    top_k = max(compare_ranks) if compare_enabled and split == args.compare_split else 0
+                    recall_ks = compare_ranks if compare_enabled and split == args.compare_split else []
+                    rows = mine_split(
+                        dataset,
+                        args.dataset_name,
+                        split,
+                        model,
+                        transform,
+                        args,
+                        device,
+                        run_name=run_name,
+                        top_retrieval_k=top_k,
+                        recall_ks=recall_ks,
+                    )
+                    rows_by_run[(run_name, split)] = rows
+                    save_outputs(rows, args, split, run_name=safe_filename_token(run_name))
+            finally:
+                del model
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+        if compare_enabled:
+            baseline_rows = rows_by_run[(args.baseline_name, args.compare_split)]
+            best_rows = rows_by_run[(args.best_name, args.compare_split)]
+            comparison_rows = build_comparison_rows(baseline_rows, best_rows, compare_ranks, args.compare_top_m)
+            save_comparison_outputs(comparison_rows, baseline_rows, best_rows, args, args.compare_split, compare_ranks)
+        return
+
+    model = load_model_for_run(args, num_classes, args.checkpoint, "", device)
     for split in args.splits:
         rows = mine_split(dataset, args.dataset_name, split, model, transform, args, device)
         save_outputs(rows, args, split)
