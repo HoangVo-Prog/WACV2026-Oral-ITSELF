@@ -1232,6 +1232,41 @@ def build_comparison_rows(baseline_rows, best_rows, ranks, top_m):
     return comparison_rows
 
 
+def comparison_transition_summary(baseline_rows, best_rows):
+    baseline_by_key = {comparison_row_key(row): row for row in baseline_rows}
+    best_by_key = {comparison_row_key(row): row for row in best_rows}
+    matched_keys = sorted(set(baseline_by_key).intersection(best_by_key))
+    summary = {
+        "baseline_queries": len(baseline_rows),
+        "best_queries": len(best_rows),
+        "matched_queries": len(matched_keys),
+        "baseline_only_keys": len(set(baseline_by_key) - set(best_by_key)),
+        "best_only_keys": len(set(best_by_key) - set(baseline_by_key)),
+        "both_hit_r1": 0,
+        "baseline_only_hit_r1": 0,
+        "best_only_hit_r1": 0,
+        "both_miss_r1": 0,
+    }
+    for key in matched_keys:
+        baseline_hit = rank_value(baseline_by_key[key]) <= 1
+        best_hit = rank_value(best_by_key[key]) <= 1
+        if baseline_hit and best_hit:
+            summary["both_hit_r1"] += 1
+        elif baseline_hit:
+            summary["baseline_only_hit_r1"] += 1
+        elif best_hit:
+            summary["best_only_hit_r1"] += 1
+        else:
+            summary["both_miss_r1"] += 1
+
+    matched = summary["matched_queries"]
+    baseline_hits = summary["both_hit_r1"] + summary["baseline_only_hit_r1"]
+    best_hits = summary["both_hit_r1"] + summary["best_only_hit_r1"]
+    summary["baseline_r1_percent"] = float(baseline_hits * 100.0 / matched) if matched else 0.0
+    summary["best_r1_percent"] = float(best_hits * 100.0 / matched) if matched else 0.0
+    return summary
+
+
 def joined_top_values(run, key, fmt=None):
     values = []
     for item in run.get("top_retrieved_images", []):
@@ -1472,6 +1507,17 @@ def save_comparison_outputs(comparison_rows, baseline_rows, best_rows, args, spl
     paths = comparison_output_paths(args, split)
     baseline_summary = recall_summary(baseline_rows, ranks)
     best_summary = recall_summary(best_rows, ranks)
+    transition = comparison_transition_summary(baseline_rows, best_rows)
+
+    print(
+        f"[{split}] comparison R@1 transitions: "
+        f"matched={transition['matched_queries']} "
+        f"{args.baseline_name}_R1={transition['baseline_r1_percent']:.2f}% "
+        f"{args.best_name}_R1={transition['best_r1_percent']:.2f}% "
+        f"best_only={transition['best_only_hit_r1']} "
+        f"baseline_only={transition['baseline_only_hit_r1']} "
+        f"both_hit={transition['both_hit_r1']} both_miss={transition['both_miss_r1']}"
+    )
 
     write_jsonl(comparison_rows, paths["jsonl"])
     print(f"[{split}] wrote {paths['jsonl']}")
