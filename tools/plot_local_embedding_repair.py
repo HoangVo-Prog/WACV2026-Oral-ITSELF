@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Visualize local embedding repair around ambiguous text queries.
 
 This utility compares the final retrieval embeddings used by the standard
@@ -143,6 +143,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host_name", default="Host", help="Left-panel title.")
     parser.add_argument("--iapr_name", default="Host + IAPR", help="Right-panel title.")
     parser.add_argument("--dpi", type=int, default=300, help="PNG output DPI.")
+    parser.add_argument(
+        "--only_global",
+        type=str2bool,
+        default=True,
+        help="Build the global/CLIP-only retrieval model. Keep true for the paper figure.",
+    )
     return parser.parse_args()
 
 
@@ -173,7 +179,15 @@ def compatibility_model_args(args: argparse.Namespace) -> SimpleNamespace:
         text_length=args.text_length,
         pretrain_choice=args.pretrain_choice,
     )
-    return build_model_args(compat)
+    model_args = build_model_args(compat)
+    model_args.only_global = bool(args.only_global)
+    model_args.prototype = False
+    model_args.use_loss_id = False
+    model_args.return_all = False
+    model_args.topk_type = "mean"
+    model_args.modify_k = False
+    model_args.prototype_feature = "auto"
+    return model_args
 
 
 @torch.no_grad()

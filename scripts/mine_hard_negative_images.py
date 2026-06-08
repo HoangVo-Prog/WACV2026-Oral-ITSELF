@@ -304,7 +304,7 @@ def build_model_args(args):
         prototype_id_weight=0.2,
         prototype_momentum=0.2,
         no_pbt=False,
-        only_global=False,
+        only_global=args.feature == "global",
         select_ratio=args.select_ratio,
         return_all=bool(args.return_all),
         topk_type=args.topk_type,

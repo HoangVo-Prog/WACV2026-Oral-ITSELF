@@ -6,6 +6,9 @@ README usage
 ============
 Visualize identity-owned prototype slots by showing nearest images and captions
 for each selected identity and prototype slot.
+This script is intentionally global/CLIP-only: it builds the model with
+only_global=True, prototype=False, and never calls encode_image_grab /
+encode_text_grab or prototype projectors.
 
 Example:
 python visualize_prototype_modes.py \
@@ -94,6 +97,15 @@ PROTOTYPE_KEY_HINTS = {
 PID_KEY_HINTS = ["proto_pids", "prototype_pids", "pids", "pid", "ids", "identity_ids"]
 CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
 CLIP_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+CLIP_STATE_KEY_PREFIXES = (
+    "visual.",
+    "transformer.",
+    "token_embedding.",
+    "ln_final.",
+    "positional_embedding",
+    "text_projection",
+    "logit_scale",
+)
 
 @dataclass
 class Sample:
@@ -186,7 +198,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--text_length", type=int, default=77)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--num_workers", type=int, default=0)
-    p.add_argument("--prototype_feature", default="auto", choices=["auto", "local", "global"])
+    p.add_argument("--only_global", action="store_true", default=True, help="Force CLIP/global inference. This is always enabled for this figure.")
+    p.add_argument("--prototype_feature", default="global", choices=["auto", "local", "global"], help="Kept for checkpoint metadata compatibility; embeddings are always global when --only_global is true.")
     p.add_argument("--prototype_projector", default="default")
     p.add_argument("--prototype_dim", type=int, default=None)
     p.add_argument("--prototype_per_id", type=int, default=None)
@@ -551,12 +564,12 @@ def model_args(args: argparse.Namespace, bank: PrototypeBank, train_samples: Seq
     proto_k = args.prototype_per_id or scalar_int(cfg.get("prototypes_per_id")) or scalar_int(cfg.get("prototype_per_id")) or infer_k(bank.proto_pids)
     return SimpleNamespace(
         loss_names="tal+cid", pretrain_choice=args.pretrain_choice, img_size=tuple(args.model_img_size), stride_size=args.stride_size,
-        temperature=0.02, prototype=True, use_loss_id=False, no_pbt=bool(cfg.get("no_pbt", False)),
-        prototype_feature=args.prototype_feature, prototype_dim=int(proto_dim), prototype_per_id=int(proto_k),
+        temperature=0.02, prototype=False, use_loss_id=False, no_pbt=False,
+        prototype_feature="global", prototype_dim=int(proto_dim), prototype_per_id=int(proto_k),
         prototype_projector=str(cfg.get("projector_mode", args.prototype_projector)), prototype_residual_scale=float(cfg.get("prototype_residual_scale", 0.1)),
         prototype_kmeans_iters=20, prototype_warmup_epochs=0, prototype_tau=0.05, prototype_hard_k=16,
-        prototype_id_weight=0.2, prototype_momentum=float(cfg.get("momentum", 0.2)), only_global=(args.prototype_feature == "global"),
-        select_ratio=args.select_ratio, return_all=True, topk_type="custom", layer_index=-1, average_attn_weights=True, modify_k=True,
+        prototype_id_weight=0.2, prototype_momentum=float(cfg.get("momentum", 0.2)), only_global=True,
+        select_ratio=args.select_ratio, return_all=False, topk_type="mean", layer_index=-1, average_attn_weights=True, modify_k=False,
         track_train_diagnostics=False, training=False, txt_aug=False, img_aug=False, num_workers=args.num_workers,
         batch_size=args.batch_size, test_batch_size=args.batch_size, dataset_name=args.dataset_name if args.dataset_name != "auto" else "custom", root_dir=str(resolve_path(args.dataset_root))
     )
@@ -594,14 +607,23 @@ def candidate_keys(key: str) -> List[str]:
         add(no_mod[len("model."):])
     return out
 
+def is_clip_global_key(raw_key: str) -> bool:
+    for candidate in candidate_keys(raw_key):
+        key = strip_prefixes(candidate, ("base_model.",))
+        if key == "logit_scale" or key.startswith(CLIP_STATE_KEY_PREFIXES):
+            return True
+    return False
+
 def load_model_checkpoint(model: torch.nn.Module, path: Path, logger: Logger) -> Dict[str, int]:
     state = checkpoint_state_dict(torch_load(path))
     model_state = model.state_dict()
     update: MutableMapping[str, torch.Tensor] = {}
-    miss = shape = non_tensor = 0
+    miss = shape = non_tensor = non_global = 0
     for raw_key, value in state.items():
         if not torch.is_tensor(value):
             non_tensor += 1; continue
+        if not is_clip_global_key(str(raw_key)):
+            non_global += 1; continue
         target = next((c for c in candidate_keys(str(raw_key)) if c in model_state), None)
         if target is None:
             miss += 1; continue
@@ -612,15 +634,20 @@ def load_model_checkpoint(model: torch.nn.Module, path: Path, logger: Logger) ->
         raise RuntimeError(f"No compatible model tensors found in {path}")
     model_state.update(update)
     model.load_state_dict(model_state, strict=True)
-    stats = {"loaded": len(update), "skipped_missing": miss, "skipped_shape": shape, "skipped_non_tensor": non_tensor}
-    logger.log(f"Loaded model checkpoint tensors: {stats}")
+    stats = {"loaded": len(update), "skipped_missing": miss, "skipped_shape": shape, "skipped_non_tensor": non_tensor, "skipped_non_global": non_global}
+    logger.log(
+        "Loaded checkpoint tensors: "
+        f"{stats['loaded']} (missing={stats['skipped_missing']}, "
+        f"shape={stats['skipped_shape']}, non_tensor={stats['skipped_non_tensor']}, "
+        f"ignored_non_global={stats['skipped_non_global']})"
+    )
     return stats
 
 def build_model(args: argparse.Namespace, bank: PrototypeBank, train_samples: Sequence[Sample], device: torch.device, logger: Logger) -> torch.nn.Module:
     from model import build_model as repo_build_model
     nclasses = max(len({s.pid for s in train_samples}), len(set(bank.proto_pids.tolist())), 1)
     ns = model_args(args, bank, train_samples)
-    logger.log(f"Building model num_classes={nclasses}, prototype_dim={ns.prototype_dim}, prototype_per_id={ns.prototype_per_id}, feature={ns.prototype_feature}")
+    logger.log(f"Building global/CLIP model num_classes={nclasses}, only_global={ns.only_global}, prototype_enabled={ns.prototype}")
     model = repo_build_model(ns, num_classes=nclasses)
     load_model_checkpoint(model, resolve_path(args.model_ckpt), logger)
     model.to(device)
@@ -690,12 +717,7 @@ def text_items_for(samples: Sequence[Sample], indices: Sequence[int]) -> List[Te
     return out
 
 def feature_kind(model: torch.nn.Module, bank: PrototypeBank) -> str:
-    dim = bank.dim
-    if dim == int(getattr(model, "embed_dim", 512)):
-        return "global"
-    if dim == int(getattr(model, "grab_embed_dim", 4096)):
-        return "grab"
-    return "prototype_projected" if getattr(model, "prototype_branch", None) is not None else "global"
+    return "global"
 
 def cache_name(args: argparse.Namespace, split: str, bank: PrototypeBank, samples: Sequence[Sample], kind: str) -> str:
     pid_digest = hashlib.sha1(",".join(str(int(s.pid)) for s in samples).encode()).hexdigest()[:12]
@@ -707,7 +729,7 @@ def encode_images(model: torch.nn.Module, loader: DataLoader, device: torch.devi
     feats, idxs = [], []
     for sample_idx, _pid, images in tqdm(loader, desc="Encoding images"):
         images = images.to(device, non_blocking=True)
-        out = model.encode_image_grab(images).float() if kind in ("grab", "prototype_projected") and hasattr(model, "encode_image_grab") else model.encode_image(images).float()
+        out = model.encode_image(images).float()
         feats.append(out.cpu()); idxs.extend(int(x) for x in sample_idx.tolist())
     return torch.cat(feats, dim=0), idxs
 
@@ -716,27 +738,13 @@ def encode_texts(model: torch.nn.Module, loader: DataLoader, device: torch.devic
     feats, idxs = [], []
     for text_idx, _pid, tokens in tqdm(loader, desc="Encoding captions"):
         tokens = tokens.to(device, non_blocking=True)
-        out = model.encode_text_grab(tokens).float() if kind in ("grab", "prototype_projected") and hasattr(model, "encode_text_grab") else model.encode_text(tokens).float()
+        out = model.encode_text(tokens).float()
         feats.append(out.cpu()); idxs.extend(int(x) for x in text_idx.tolist())
     return (torch.cat(feats, dim=0), idxs) if feats else (torch.empty(0, 1), [])
 
 @torch.inference_mode()
 def project_if_needed(model: torch.nn.Module, img: torch.Tensor, txt: torch.Tensor, kind: str, batch: int) -> Tuple[torch.Tensor, torch.Tensor, bool]:
-    branch = getattr(model, "prototype_branch", None)
-    if kind != "prototype_projected" or branch is None:
-        return img, txt, False
-    device = next(model.parameters()).device
-    out_i, out_t = [], []
-    n = max(img.shape[0], txt.shape[0])
-    for start in range(0, n, batch):
-        ib = img[start:min(start + batch, img.shape[0])]
-        tb = txt[start:min(start + batch, txt.shape[0])]
-        if ib.numel() == 0: ib = img[:1]
-        if tb.numel() == 0: tb = txt[:1]
-        ip, tp = branch.project_for_memory(ib.to(device), tb.to(device))
-        if start < img.shape[0]: out_i.append(ip[:ib.shape[0]].cpu())
-        if start < txt.shape[0]: out_t.append(tp[:tb.shape[0]].cpu())
-    return torch.cat(out_i, dim=0), torch.cat(out_t, dim=0), True
+    return img, txt, False
 
 def build_embeddings(model: torch.nn.Module, samples: Sequence[Sample], split: str, bank: PrototypeBank, args: argparse.Namespace, outdir: Path, device: torch.device, logger: Logger) -> EmbeddingBundle:
     kind = feature_kind(model, bank)
@@ -961,6 +969,8 @@ def main() -> None:
         logger.log("Prototype Mode Discovery visualization")
         if not PIL_AVAILABLE:
             raise RuntimeError("Pillow is required for image loading/rendering. Install it in this environment with `pip install pillow`.")
+        if not args.only_global:
+            raise RuntimeError("This Figure 1 tool is intentionally global/CLIP-only. Do not use --no-only_global for prototype mode discovery.")
         save_json(vars(args), outdir / "used_config.json")
         samples_by_split = load_annotations(args, logger)
         bank = load_prototypes(resolve_path(args.prototype_ckpt), logger)
@@ -977,7 +987,11 @@ def main() -> None:
         bundle = build_embeddings(model, samples, used_split, bank, args, outdir, device, logger)
         logger.log(f"Embedding feature_kind={bundle.feature_kind}, used_projector={bundle.used_projector}, dim={bundle.image_embeddings.shape[1]}")
         if bundle.image_embeddings.shape[1] != bank.dim:
-            raise RuntimeError(f"Embedding dim {bundle.image_embeddings.shape[1]} does not match prototype dim {bank.dim}. Try --prototype_feature local/global or ensure projector weights are in --model_ckpt.")
+            raise RuntimeError(
+                f"Global/CLIP embedding dim {bundle.image_embeddings.shape[1]} does not match prototype dim {bank.dim}. "
+                "This script does not use ITSELF/local/grab inference. Use a global prototype bank/checkpoint, "
+                "or rebuild/export the prototype bank in CLIP/global feature space."
+            )
         selection_args = SimpleNamespace(**vars(args))
         if args.ids and pid_shift:
             selection_args.ids = [int(pid) + pid_shift for pid in args.ids]
