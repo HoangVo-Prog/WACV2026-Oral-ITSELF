@@ -20,7 +20,8 @@ python tools/plot_local_embedding_repair.py \
   --only_ambiguous true \
   --ambiguous_eps 0.01 \
   --only_improved true \
-  --min_margin_gain 0.0
+  --min_margin_gain 0.0 \
+  --only_positive_iapr_margin true
 """
 
 from __future__ import annotations
@@ -72,6 +73,13 @@ SUMMARY_COLUMNS = [
     "iapr_neg_score",
     "iapr_margin",
     "margin_gain",
+    "host_d_pos_2d",
+    "host_d_neg_2d",
+    "host_m2d",
+    "iapr_d_pos_2d",
+    "iapr_d_neg_2d",
+    "iapr_m2d",
+    "vrs",
     "selected_positive_indices",
     "selected_hard_negative_indices",
     "output_png",
@@ -109,11 +117,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", help='Device, e.g. "cuda" or "cpu".')
     parser.add_argument("--top_pos", type=int, default=5, help="Number of positive gallery images to show.")
     parser.add_argument("--top_neg", type=int, default=10, help="Number of hard negatives per checkpoint to union.")
+    parser.add_argument("--m2d_neg_k", type=int, default=3, help="Number of nearest plotted hard negatives used in d_neg for M2D/VRS.")
     parser.add_argument("--max_queries", type=int, default=-1, help="Maximum plotted queries; <=0 plots all after filtering.")
     parser.add_argument("--only_ambiguous", type=str2bool, default=False, help="Only plot queries with host_margin < ambiguous_eps.")
     parser.add_argument("--ambiguous_eps", type=float, default=0.01, help="Ambiguous-query threshold on host margin.")
     parser.add_argument("--only_improved", type=str2bool, default=False, help="Only plot queries with margin_gain > min_margin_gain.")
     parser.add_argument("--min_margin_gain", type=float, default=0.0, help="Minimum margin gain for --only_improved.")
+    parser.add_argument(
+        "--only_positive_iapr_margin",
+        type=str2bool,
+        default=False,
+        help="Only plot queries with iapr_margin > min_iapr_margin.",
+    )
+    parser.add_argument(
+        "--min_iapr_margin",
+        type=float,
+        default=0.0,
+        help="Minimum IAPR margin for --only_positive_iapr_margin.",
+    )
     parser.add_argument(
         "--sort_by",
         default="margin_gain",
@@ -134,6 +155,24 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Keep dataset order instead of sorting before plotting.",
     )
+    parser.add_argument(
+        "--post_sort_by",
+        default="vrs",
+        choices=[
+            "none",
+            "vrs",
+            "host_m2d",
+            "iapr_m2d",
+            "host_d_pos_2d",
+            "host_d_neg_2d",
+            "iapr_d_pos_2d",
+            "iapr_d_neg_2d",
+            "margin_gain",
+            "query_index",
+        ],
+        help="Reorder the already selected top-k candidates before plotting; top-k selection still uses --sort_by.",
+    )
+    parser.add_argument("--post_sort_desc", type=str2bool, default=True, help="Sort descending for --post_sort_by.")
     parser.add_argument("--save_pdf", type=str2bool, default=True, help="Write per-query PDF figures.")
     parser.add_argument("--save_png", type=str2bool, default=True, help="Write per-query PNG figures.")
     parser.add_argument("--cache_embeddings", type=str2bool, default=True, help="Save extracted embeddings under output_dir/cache.")
@@ -163,6 +202,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--top_pos must be non-negative.")
     if args.top_neg < 0:
         raise ValueError("--top_neg must be non-negative.")
+    if args.m2d_neg_k <= 0:
+        raise ValueError("--m2d_neg_k must be positive.")
     if args.text_length <= 0:
         raise ValueError("--text_length must be positive.")
     if args.dpi <= 0:
@@ -388,6 +429,90 @@ def unique_preserve_order(indices: Iterable[int]) -> List[int]:
         result.append(index)
     return result
 
+def project_query_neighborhood(
+    host_text: torch.Tensor,
+    host_images: torch.Tensor,
+    iapr_text: torch.Tensor,
+    iapr_images: torch.Tensor,
+) -> Tuple[np.ndarray, np.ndarray]:
+    local_features = torch.cat([
+        host_text.detach().cpu().view(1, -1),
+        host_images.detach().cpu(),
+        iapr_text.detach().cpu().view(1, -1),
+        iapr_images.detach().cpu(),
+    ], dim=0).numpy()
+    projected = fit_project_2d(local_features)
+    panel_n = 1 + int(host_images.shape[0])
+    return projected[:panel_n], projected[panel_n:]
+
+
+def panel_m2d_metrics(
+    coords: np.ndarray,
+    selected_indices: Sequence[int],
+    selected_positive: Sequence[int],
+    selected_negative: Sequence[int],
+    neg_k: int,
+) -> Tuple[float, float, float]:
+    if coords.shape[0] <= 1:
+        nan = float("nan")
+        return nan, nan, nan
+
+    text_xy = coords[0]
+    image_xy = coords[1:]
+    index_to_offset = {int(index): offset for offset, index in enumerate(selected_indices)}
+
+    pos_xy = np.asarray(
+        [image_xy[index_to_offset[int(index)]] for index in selected_positive if int(index) in index_to_offset],
+        dtype=np.float64,
+    )
+    neg_xy = np.asarray(
+        [image_xy[index_to_offset[int(index)]] for index in selected_negative if int(index) in index_to_offset],
+        dtype=np.float64,
+    )
+
+    if pos_xy.size == 0:
+        d_pos = float("nan")
+    else:
+        d_pos = float(np.linalg.norm(pos_xy - text_xy[None, :], axis=1).mean())
+
+    if neg_xy.size == 0:
+        d_neg = float("nan")
+    else:
+        neg_distances = np.sort(np.linalg.norm(neg_xy - text_xy[None, :], axis=1))
+        d_neg = float(neg_distances[: min(int(neg_k), len(neg_distances))].mean())
+
+    if math.isfinite(d_pos) and math.isfinite(d_neg):
+        m2d = d_neg - d_pos
+    else:
+        m2d = float("nan")
+    return d_pos, d_neg, m2d
+
+
+def compute_vrs_metrics(
+    host_coords: np.ndarray,
+    iapr_coords: np.ndarray,
+    selected_indices: Sequence[int],
+    selected_positive: Sequence[int],
+    selected_negative: Sequence[int],
+    neg_k: int,
+) -> Dict[str, float]:
+    host_d_pos, host_d_neg, host_m2d = panel_m2d_metrics(
+        host_coords, selected_indices, selected_positive, selected_negative, neg_k
+    )
+    iapr_d_pos, iapr_d_neg, iapr_m2d = panel_m2d_metrics(
+        iapr_coords, selected_indices, selected_positive, selected_negative, neg_k
+    )
+    vrs = iapr_m2d - host_m2d if math.isfinite(iapr_m2d) and math.isfinite(host_m2d) else float("nan")
+    return {
+        "host_d_pos_2d": host_d_pos,
+        "host_d_neg_2d": host_d_neg,
+        "host_m2d": host_m2d,
+        "iapr_d_pos_2d": iapr_d_pos,
+        "iapr_d_neg_2d": iapr_d_neg,
+        "iapr_m2d": iapr_m2d,
+        "vrs": vrs,
+    }
+
 
 def fit_project_2d(features: np.ndarray) -> np.ndarray:
     features = np.asarray(features, dtype=np.float64)
@@ -461,10 +586,8 @@ def plot_query_neighborhood(
     selected_indices: Sequence[int],
     selected_positive: Sequence[int],
     selected_negative: Sequence[int],
-    host_text: torch.Tensor,
-    host_images: torch.Tensor,
-    iapr_text: torch.Tensor,
-    iapr_images: torch.Tensor,
+    host_coords: np.ndarray,
+    iapr_coords: np.ndarray,
     host_margin: float,
     iapr_margin: float,
     host_name: str,
@@ -478,16 +601,6 @@ def plot_query_neighborhood(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    local_features = torch.cat([
-        host_text.view(1, -1),
-        host_images,
-        iapr_text.view(1, -1),
-        iapr_images,
-    ], dim=0).numpy()
-    projected = fit_project_2d(local_features)
-    panel_n = 1 + len(selected_indices)
-    host_coords = projected[:panel_n]
-    iapr_coords = projected[panel_n:]
     all_coords = np.vstack([host_coords, iapr_coords])
 
     fig, axes = plt.subplots(1, 2, figsize=(6.4, 3.0), constrained_layout=True)
@@ -543,10 +656,14 @@ def print_top_margin_gains(rows: Sequence[Mapping[str, Any]], limit: int = 10) -
         )
 
 
-def selected_query_passes_filters(args: argparse.Namespace, host_margin: float, margin_gain: float) -> bool:
+def selected_query_passes_filters(
+    args: argparse.Namespace, host_margin: float, iapr_margin: float, margin_gain: float
+) -> bool:
     if args.only_ambiguous and not (host_margin < float(args.ambiguous_eps)):
         return False
     if args.only_improved and not (margin_gain > float(args.min_margin_gain)):
+        return False
+    if args.only_positive_iapr_margin and not (iapr_margin > float(args.min_iapr_margin)):
         return False
     return True
 
@@ -554,13 +671,27 @@ def selected_query_passes_filters(args: argparse.Namespace, host_margin: float, 
 def sorted_candidates(candidates: Sequence[Mapping[str, Any]], args: argparse.Namespace) -> List[Mapping[str, Any]]:
     if args.no_sort:
         return list(candidates)
-    sort_key = args.sort_by
+    return sort_rows_by_metric(candidates, args.sort_by, bool(args.sort_desc))
 
+
+def post_sorted_candidates(candidates: Sequence[Mapping[str, Any]], args: argparse.Namespace) -> List[Mapping[str, Any]]:
+    if args.post_sort_by == "none":
+        return list(candidates)
+    return sort_rows_by_metric(candidates, args.post_sort_by, bool(args.post_sort_desc))
+
+
+def sort_rows_by_metric(rows: Sequence[Mapping[str, Any]], metric: str, descending: bool) -> List[Mapping[str, Any]]:
     def value(row: Mapping[str, Any]) -> Tuple[float, int]:
-        primary = float(row[sort_key])
-        return primary, -int(row["query_index"])
+        raw_value = float(row[metric])
+        if not math.isfinite(raw_value):
+            primary = math.inf
+        elif descending:
+            primary = -raw_value
+        else:
+            primary = raw_value
+        return primary, int(row["query_index"])
 
-    return sorted(candidates, key=value, reverse=bool(args.sort_desc))
+    return sorted(rows, key=value)
 
 
 def main() -> None:
@@ -653,7 +784,7 @@ def main() -> None:
         host_pos_score, host_neg_score, host_margin = score_extrema(sim_host[query_index], pos_mask, neg_mask)
         iapr_pos_score, iapr_neg_score, iapr_margin = score_extrema(sim_iapr[query_index], pos_mask, neg_mask)
         margin_gain = iapr_margin - host_margin
-        if not selected_query_passes_filters(args, host_margin, margin_gain):
+        if not selected_query_passes_filters(args, host_margin, iapr_margin, margin_gain):
             continue
 
         combined_pos_scores = torch.maximum(sim_host[query_index], sim_iapr[query_index])
@@ -686,9 +817,36 @@ def main() -> None:
     ordered_candidates = sorted_candidates(candidates, args)
     if args.max_queries > 0:
         ordered_candidates = ordered_candidates[:int(args.max_queries)]
+
+    for candidate in tqdm(ordered_candidates, desc="Computing 2D repair metrics"):
+        query_index = int(candidate["query_index"])
+        selected_positive = list(candidate["selected_positive"])
+        selected_negative = list(candidate["selected_negative"])
+        selected_gallery = list(candidate["selected_gallery"])
+        host_coords, iapr_coords = project_query_neighborhood(
+            host_text[query_index],
+            host_image[selected_gallery],
+            iapr_text[query_index],
+            iapr_image[selected_gallery],
+        )
+        candidate.update(
+            compute_vrs_metrics(
+                host_coords,
+                iapr_coords,
+                selected_gallery,
+                selected_positive,
+                selected_negative,
+                args.m2d_neg_k,
+            )
+        )
+        candidate["host_coords"] = host_coords
+        candidate["iapr_coords"] = iapr_coords
+
+    ordered_candidates = post_sorted_candidates(ordered_candidates, args)
     print(
         f"[Selection] candidates={len(candidates)} plotted={len(ordered_candidates)} "
-        f"sort={'dataset_order' if args.no_sort else args.sort_by} desc={args.sort_desc}"
+        f"preselect_sort={'dataset_order' if args.no_sort else args.sort_by} desc={args.sort_desc} "
+        f"post_sort={args.post_sort_by} desc={args.post_sort_desc}"
     )
 
     rows: List[Dict[str, Any]] = []
@@ -705,6 +863,15 @@ def main() -> None:
         selected_positive = list(candidate["selected_positive"])
         selected_negative = list(candidate["selected_negative"])
         selected_gallery = list(candidate["selected_gallery"])
+        host_d_pos_2d = float(candidate["host_d_pos_2d"])
+        host_d_neg_2d = float(candidate["host_d_neg_2d"])
+        host_m2d = float(candidate["host_m2d"])
+        iapr_d_pos_2d = float(candidate["iapr_d_pos_2d"])
+        iapr_d_neg_2d = float(candidate["iapr_d_neg_2d"])
+        iapr_m2d = float(candidate["iapr_m2d"])
+        vrs = float(candidate["vrs"])
+        host_coords = candidate["host_coords"]
+        iapr_coords = candidate["iapr_coords"]
 
         base_name = row_filename(query_index, query_pid, host_margin, iapr_margin)
         output_base = figures_dir / base_name

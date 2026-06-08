@@ -187,6 +187,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overlay-alpha", type=float, default=0.48)
     parser.add_argument("--dpi", type=int, default=180)
     parser.add_argument("--metadata-jsonl", default="metadata.jsonl")
+    parser.add_argument("--grid", action="store_true", help="Also write paged grid images containing all comparisons.")
+    parser.add_argument("--grid-rows-per-page", type=int, default=4, help="Number of comparison rows per grid page.")
+    parser.add_argument("--grid-dir-name", default="grid_pages", help="Subdirectory name for paged grid images.")
     return parser.parse_args()
 
 
@@ -533,19 +536,22 @@ def overlay_heatmap(image, heatmap_uint8, alpha, img_size):
     overlay = (1.0 - alpha_map) * image_np + alpha_map * color
     return np.clip(overlay, 0, 255).astype(np.uint8)
 
-def save_comparison_figure(example, baseline_heatmap, best_heatmap, args, comparison_dir):
+
+def make_comparison_panels(example, baseline_heatmap, best_heatmap, args, image=None):
     height, width = tuple(args.img_size)
-    image = read_image(example.image_path)
+    image = image if image is not None else read_image(example.image_path)
     original = np.array(image.resize((width, height), Image.BILINEAR))
     baseline_overlay = overlay_heatmap(image, baseline_heatmap, args.overlay_alpha, (height, width))
     best_overlay = overlay_heatmap(image, best_heatmap, args.overlay_alpha, (height, width))
-
-    fig, axes = plt.subplots(1, 3, figsize=(8.4, 6.2))
-    panels = [
+    return [
         ("image", original),
         (args.baseline_name, baseline_overlay),
         (args.best_name, best_overlay),
     ]
+
+
+def save_comparison_figure(example, panels, args, comparison_dir):
+    fig, axes = plt.subplots(1, 3, figsize=(8.4, 6.2))
     for ax, (title, panel) in zip(axes, panels):
         ax.imshow(panel)
         ax.set_title(title, fontsize=10)
@@ -561,6 +567,52 @@ def save_comparison_figure(example, baseline_heatmap, best_heatmap, args, compar
 
     filename = f"q{example.query_index:06d}_pid{example.pid}_img{example.image_index:05d}_c{example.caption_id_within_image:02d}_{safe_filename(Path(example.image_path).stem)}.png"
     output_path = comparison_dir / filename
+    fig.savefig(output_path, dpi=args.dpi, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+def grid_page_path(grid_dir, page_index):
+    return grid_dir / f"grid_page_{page_index:04d}.png"
+
+
+def save_comparison_grid_page(entries, page_index, page_count, args, grid_dir):
+    rows = len(entries)
+    fig_width = 11.8
+    fig_height = max(3.15 * rows, 3.8)
+    fig, axes = plt.subplots(
+        rows,
+        4,
+        figsize=(fig_width, fig_height),
+        squeeze=False,
+        gridspec_kw={"width_ratios": [1.55, 1.0, 1.0, 1.0]},
+    )
+
+    headers = ["caption", "image", args.baseline_name, args.best_name]
+    for col, header in enumerate(headers):
+        axes[0, col].set_title(header, fontsize=10, pad=8)
+
+    for row_index, (example, panels) in enumerate(entries):
+        text_ax = axes[row_index, 0]
+        text_ax.axis("off")
+        caption = textwrap.fill(example.caption, width=36)
+        text_ax.text(
+            0.0,
+            0.5,
+            f"q={example.query_index}  pid={example.pid}\n{Path(example.image_path).name}\n{caption}",
+            ha="left",
+            va="center",
+            fontsize=7.5,
+            transform=text_ax.transAxes,
+        )
+        for col_index, (_title, panel) in enumerate(panels, start=1):
+            ax = axes[row_index, col_index]
+            ax.imshow(panel)
+            ax.axis("off")
+
+    fig.suptitle(f"Grad-CAM comparison page {page_index}/{page_count}", fontsize=11, y=0.995)
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.975])
+    output_path = grid_page_path(grid_dir, page_index)
     fig.savefig(output_path, dpi=args.dpi, bbox_inches="tight")
     plt.close(fig)
     return output_path
@@ -640,8 +692,20 @@ def main():
     best_cam = VisualGradCam(best_model, img_size=tuple(args.img_size))
 
     plt.ioff()
+    grid_dir = output_dir / args.grid_dir_name
+    grid_rows = int(args.grid_rows_per_page)
+    grid_page_count = 0
+    grid_entries = []
+    if args.grid:
+        if grid_rows <= 0:
+            raise ValueError("--grid-rows-per-page must be > 0.")
+        grid_dir.mkdir(parents=True, exist_ok=True)
+        grid_page_count = (len(examples) + grid_rows - 1) // grid_rows
+
+    written_grid_pages = []
     with metadata_path.open("w", encoding="utf-8") as metadata_file:
         try:
+            page_index = 1
             for example, baseline_heatmap in tqdm(
                 zip(examples, baseline_heatmaps),
                 total=len(examples),
@@ -652,8 +716,23 @@ def main():
                 image_tensor = transform(image).to(device)
                 text_tokens = tokenize_caption(example.caption, args.text_length).to(device)
                 best_heatmap = heatmap_to_uint8(best_cam(image_tensor, text_tokens))
-                figure_path = save_comparison_figure(example, baseline_heatmap, best_heatmap, args, comparison_dir)
+                panels = make_comparison_panels(example, baseline_heatmap, best_heatmap, args, image=image)
+                figure_path = save_comparison_figure(example, panels, args, comparison_dir)
                 write_metadata_row(metadata_file, example, figure_path)
+
+                if args.grid:
+                    grid_entries.append((example, panels))
+                    if len(grid_entries) == grid_rows:
+                        written_grid_pages.append(
+                            save_comparison_grid_page(grid_entries, page_index, grid_page_count, args, grid_dir)
+                        )
+                        page_index += 1
+                        grid_entries = []
+
+            if args.grid and grid_entries:
+                written_grid_pages.append(
+                    save_comparison_grid_page(grid_entries, page_index, grid_page_count, args, grid_dir)
+                )
         finally:
             best_cam.close()
             del best_model
@@ -662,6 +741,8 @@ def main():
                 torch.cuda.empty_cache()
 
     print(f"[Done] wrote {len(examples)} comparison figures to {comparison_dir}")
+    if args.grid:
+        print(f"[Done] wrote {len(written_grid_pages)} grid pages to {grid_dir}")
     print(f"[Done] wrote metadata to {metadata_path}")
 
 
