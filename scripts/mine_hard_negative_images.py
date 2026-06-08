@@ -374,23 +374,40 @@ def load_checkpoint_for_inference(model, checkpoint_path):
     skipped_missing = 0
     skipped_shape = 0
     skipped_non_tensor = 0
+    missing_keys = []
+    shape_mismatch_keys = []
+    non_tensor_keys = []
 
     for raw_key, value in loaded_state.items():
+        raw_key = str(raw_key)
         if not torch.is_tensor(value):
             skipped_non_tensor += 1
+            non_tensor_keys.append(raw_key)
             continue
 
         target_key = None
-        for candidate in candidate_state_keys(raw_key):
+        candidates = candidate_state_keys(raw_key)
+        for candidate in candidates:
             if candidate in model_state:
                 target_key = candidate
                 break
 
         if target_key is None:
             skipped_missing += 1
+            missing_keys.append({
+                "checkpoint_key": raw_key,
+                "tried_model_keys": candidates,
+                "checkpoint_shape": list(value.shape),
+            })
             continue
         if model_state[target_key].shape != value.shape:
             skipped_shape += 1
+            shape_mismatch_keys.append({
+                "checkpoint_key": raw_key,
+                "model_key": target_key,
+                "checkpoint_shape": list(value.shape),
+                "model_shape": list(model_state[target_key].shape),
+            })
             continue
         update_state[target_key] = value.detach().clone()
 
@@ -404,6 +421,9 @@ def load_checkpoint_for_inference(model, checkpoint_path):
         "skipped_missing": skipped_missing,
         "skipped_shape": skipped_shape,
         "skipped_non_tensor": skipped_non_tensor,
+        "missing_keys": missing_keys,
+        "shape_mismatch_keys": shape_mismatch_keys,
+        "non_tensor_keys": non_tensor_keys,
     }
 
 
@@ -1656,6 +1676,44 @@ def save_outputs(rows, args, split, run_name=""):
             print(f"[{split}] wrote {grid_path}")
 
 
+def print_checkpoint_missing_details(label, stats, max_keys=20):
+    missing_keys = list(stats.get("missing_keys", []))
+    if missing_keys:
+        print(f"{label}Missing checkpoint keys:")
+        for item in missing_keys[:max_keys]:
+            print(f"  - {item.get('checkpoint_key')} shape={item.get('checkpoint_shape')}")
+        if len(missing_keys) > max_keys:
+            print(f"  ... {len(missing_keys) - max_keys} more")
+
+    shape_mismatch = list(stats.get("shape_mismatch_keys", []))
+    if shape_mismatch:
+        print(f"{label}Shape-mismatch checkpoint keys:")
+        for item in shape_mismatch[:max_keys]:
+            print(
+                f"  - {item.get('checkpoint_key')} checkpoint_shape={item.get('checkpoint_shape')} "
+                f"model_key={item.get('model_key')} model_shape={item.get('model_shape')}"
+            )
+
+
+def save_checkpoint_load_report(args, run_name, checkpoint_path, stats):
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    token = safe_filename_token(run_name or "checkpoint")
+    report_path = output_dir / f"{token}_checkpoint_load_report.json"
+    report = {
+        "checkpoint": str(checkpoint_path),
+        "loaded": int(stats.get("loaded", 0)),
+        "skipped_missing": int(stats.get("skipped_missing", 0)),
+        "skipped_shape": int(stats.get("skipped_shape", 0)),
+        "skipped_non_tensor": int(stats.get("skipped_non_tensor", 0)),
+        "missing_keys": stats.get("missing_keys", []),
+        "shape_mismatch_keys": stats.get("shape_mismatch_keys", []),
+        "non_tensor_keys": stats.get("non_tensor_keys", []),
+    }
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report_path
+
+
 def load_model_for_run(args, num_classes, checkpoint_path, run_name, device):
     model_args = build_model_args(args)
     model = build_model(model_args, num_classes=num_classes)
@@ -1667,6 +1725,9 @@ def load_model_for_run(args, num_classes, checkpoint_path, run_name, device):
             f"(skipped missing={stats['skipped_missing']}, shape={stats['skipped_shape']}, "
             f"non_tensor={stats['skipped_non_tensor']})"
         )
+        print_checkpoint_missing_details(label, stats)
+        report_path = save_checkpoint_load_report(args, run_name, checkpoint_path, stats)
+        print(f"{label}Checkpoint load report: {report_path}")
     else:
         print(f"{label}No checkpoint supplied; using pretrained backbone {args.pretrain_choice}.")
 
