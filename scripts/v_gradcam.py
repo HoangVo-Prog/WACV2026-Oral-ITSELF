@@ -182,10 +182,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-size", nargs=2, type=int, default=[384, 128], metavar=("HEIGHT", "WIDTH"))
     parser.add_argument("--stride-size", type=int, default=16)
     parser.add_argument("--text-length", type=int, default=77)
-    parser.add_argument("--select-ratio", type=float, default=0.4)
-    parser.add_argument("--return-all", "--return_all", dest="return_all", action="store_true", default=True)
-    parser.add_argument("--topk-type", "--topk_type", dest="topk_type", default="custom", choices=["mean", "std", "custom", "layer_index"])
-    parser.add_argument("--modify-k", "--modify_k", dest="modify_k", action="store_true", default=True)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--max-captions", type=int, default=0, help="Optional cap for debugging. Use 0 for all captions.")
     parser.add_argument("--start-index", type=int, default=0, help="Start query index after flattening captions.")
@@ -307,13 +303,13 @@ def build_model_args(args):
         prototype_id_weight=0.2,
         prototype_momentum=0.2,
         no_pbt=False,
-        only_global=False,
-        select_ratio=args.select_ratio,
-        return_all=bool(args.return_all),
-        topk_type=args.topk_type,
+        only_global=True,
+        select_ratio=0.4,
+        return_all=False,
+        topk_type="mean",
         layer_index=-1,
         average_attn_weights=True,
-        modify_k=bool(args.modify_k),
+        modify_k=False,
     )
 
 
