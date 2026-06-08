@@ -11,13 +11,19 @@ Example:
 python visualize_prototype_modes.py \
   --model_ckpt /path/to/model.pth \
   --prototype_ckpt /path/to/best_prototype_bank.pth \
-  --dataset_root /path/to/dataset_root \
-  --train_anno /path/to/train.json \
-  --val_anno /path/to/val.json \
-  --test_anno /path/to/test.json \
+  --dataset_root /path/to/data_or_dataset_root \
   --split test \
   --output_dir /path/to/output/prototype_vis \
   --num_ids 8 --topk_images 3 --topk_texts 3
+
+The annotation paths are optional. If they are not provided, --dataset_root is
+inspected using the repository dataset layouts:
+  RSTPReid/data_captions.json
+  CUHK-PEDES/reid_raw.json
+  ICFG-PEDES/ICFG-PEDES.json
+You may pass either the dataset directory itself or its parent data directory.
+If that parent directory contains multiple known datasets, pass --dataset_name
+or let the script infer it from checkpoint/output paths when possible.
 
 If --split test is requested but the prototype bank is train-aligned, the script
 prints a warning, switches true Prototype Mode Discovery to the aligned split,
@@ -70,6 +76,16 @@ PID_KEYS = ["id", "pid", "person_id", "identity", "identity_id", "label"]
 IMAGE_KEYS = ["img_path", "file_path", "image_path", "path", "filename", "image", "img"]
 CAPTION_KEYS = ["captions", "caption", "text", "texts", "description", "descriptions"]
 DEFAULT_ANNOTATIONS = ["data_captions.json", "reid_raw.json", "ICFG-PEDES.json", "annotations.json", "annotation.json"]
+DATASET_LAYOUTS = [
+    {"name": "RSTPReid", "dirname": "RSTPReid", "annotation": "data_captions.json", "image_dir": "imgs"},
+    {"name": "CUHK-PEDES", "dirname": "CUHK-PEDES", "annotation": "reid_raw.json", "image_dir": "imgs"},
+    {"name": "ICFG-PEDES", "dirname": "ICFG-PEDES", "annotation": "ICFG-PEDES.json", "image_dir": "imgs"},
+]
+SPLIT_ANNOTATION_CANDIDATES = {
+    "train": ["train.json", "train_anno.json", "train_annotation.json", "train_captions.json"],
+    "val": ["val.json", "valid.json", "validation.json", "val_anno.json", "val_annotation.json", "val_captions.json"],
+    "test": ["test.json", "test_anno.json", "test_annotation.json", "test_captions.json"],
+}
 # Adapt these hints if your prototype checkpoint uses different key names.
 PROTOTYPE_KEY_HINTS = {
     "visual": ["image_prototypes", "visual_prototypes", "img_prototypes", "text_to_image", "visual_bank", "image_bank", "prototypes"],
@@ -86,6 +102,14 @@ class Sample:
     captions: List[str]
     split: str
     raw_index: int
+
+@dataclass
+class AnnotationSource:
+    split: Optional[str]
+    path: Path
+    dataset_dir: Path
+    image_dir: Optional[Path]
+    dataset_name: str
 
 @dataclass
 class TextItem:
@@ -141,6 +165,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model_ckpt", required=True)
     p.add_argument("--prototype_ckpt", required=True)
     p.add_argument("--dataset_root", required=True)
+    p.add_argument("--dataset_name", default="auto", choices=["auto", "RSTPReid", "CUHK-PEDES", "ICFG-PEDES"])
     p.add_argument("--train_anno", default="")
     p.add_argument("--val_anno", default="")
     p.add_argument("--test_anno", default="")
@@ -233,17 +258,20 @@ def captions_from_row(row: Mapping[str, Any]) -> List[str]:
         return [str(v) for v in val if v is not None]
     return [str(val)]
 
-def resolve_image(raw: str, dataset_root: Path, anno_dir: Path) -> Path:
+def resolve_image(raw: str, dataset_root: Path, anno_dir: Path, image_dir: Optional[Path] = None) -> Path:
     p = Path(str(raw)).expanduser()
     if p.is_absolute():
         return p.resolve()
-    candidates = [dataset_root / p, dataset_root / "imgs" / p, dataset_root / "images" / p, anno_dir / p, anno_dir / "imgs" / p]
+    candidates: List[Path] = []
+    if image_dir is not None:
+        candidates.extend([image_dir / p, image_dir / p.name])
+    candidates.extend([dataset_root / p, dataset_root / "imgs" / p, dataset_root / "images" / p, anno_dir / p, anno_dir / "imgs" / p, anno_dir / "images" / p])
     for c in candidates:
         if c.exists():
             return c.resolve()
     return candidates[0].resolve()
 
-def load_annotation(path: Path, dataset_root: Path, split: str, logger: Logger) -> List[Sample]:
+def load_annotation(path: Path, dataset_root: Path, split: str, logger: Logger, image_dir: Optional[Path] = None) -> List[Sample]:
     raw = json.load(path.open("r", encoding="utf-8"))
     rows = records_from_json(raw, split)
     out, skipped = [], 0
@@ -263,20 +291,92 @@ def load_annotation(path: Path, dataset_root: Path, split: str, logger: Logger) 
         if pid is None:
             skipped += 1
             continue
-        out.append(Sample(str(resolve_image(str(row[img_key]), dataset_root, path.parent)), pid, captions_from_row(row), split, len(out)))
-    logger.log(f"[{split}] loaded {len(out)} samples from {path} (skipped={skipped})")
+        out.append(Sample(str(resolve_image(str(row[img_key]), dataset_root, path.parent, image_dir)), pid, captions_from_row(row), split, len(out)))
+    logger.log(f"[{split}] loaded {len(out)} samples from {path} (dataset_dir={dataset_root}, image_dir={image_dir or 'auto'}, skipped={skipped})")
     return out
 
-def find_default_annotation(root: Path) -> Optional[Path]:
-    roots = [root]
+def layout_candidates(root: Path, dataset_name: str) -> List[AnnotationSource]:
+    wanted = None if dataset_name == "auto" else dataset_name
+    candidates: List[AnnotationSource] = []
+    for layout in DATASET_LAYOUTS:
+        if wanted is not None and layout["name"] != wanted:
+            continue
+        dirs = [root]
+        if root.name != layout["dirname"]:
+            dirs.append(root / layout["dirname"])
+        for dataset_dir in dirs:
+            anno = dataset_dir / layout["annotation"]
+            image_dir = dataset_dir / layout["image_dir"]
+            if anno.is_file():
+                candidates.append(AnnotationSource(None, anno.resolve(), dataset_dir.resolve(), image_dir.resolve() if image_dir.is_dir() else None, layout["name"]))
+    return candidates
+
+def generic_annotation_candidates(root: Path) -> List[AnnotationSource]:
+    bases = [root]
     if root.is_dir():
-        roots += [p for p in root.iterdir() if p.is_dir()]
-    for base in roots:
+        bases.extend(p for p in root.iterdir() if p.is_dir())
+    out: List[AnnotationSource] = []
+    for base in bases:
         for name in DEFAULT_ANNOTATIONS:
             p = base / name
             if p.is_file():
-                return p
-    return None
+                img_dir = base / "imgs"
+                out.append(AnnotationSource(None, p.resolve(), base.resolve(), img_dir.resolve() if img_dir.is_dir() else None, "custom"))
+    return out
+
+def split_file_candidates(root: Path) -> List[AnnotationSource]:
+    bases = [root]
+    for sub in ("annotations", "annos"):
+        if (root / sub).is_dir():
+            bases.append(root / sub)
+    sources: List[AnnotationSource] = []
+    for split, names in SPLIT_ANNOTATION_CANDIDATES.items():
+        for base in bases:
+            for name in names:
+                p = base / name
+                if p.is_file():
+                    img_dir = root / "imgs"
+                    sources.append(AnnotationSource(split, p.resolve(), root.resolve(), img_dir.resolve() if img_dir.is_dir() else None, "custom-split-files"))
+                    break
+            if any(s.split == split for s in sources):
+                break
+    return sources
+
+def detect_annotation_sources(root: Path, dataset_name: str, logger: Logger) -> List[AnnotationSource]:
+    if not root.exists():
+        raise FileNotFoundError(root)
+    sources = layout_candidates(root, dataset_name)
+    if not sources and dataset_name == "auto":
+        sources = generic_annotation_candidates(root)
+    if not sources:
+        sources = split_file_candidates(root)
+    if not sources:
+        known = ", ".join(f"{x['dirname']}/{x['annotation']}" for x in DATASET_LAYOUTS)
+        raise FileNotFoundError(f"No annotation JSON found under {root}. Expected one of: {known}, or train/test/val JSON files.")
+
+    single_file_sources = [s for s in sources if s.split is None]
+    if single_file_sources:
+        if len(single_file_sources) > 1:
+            described = "; ".join(f"{s.dataset_name}: {s.path}" for s in single_file_sources)
+            if dataset_name == "auto":
+                raise RuntimeError(f"Multiple dataset annotations detected under {root}: {described}. Pass --dataset_name RSTPReid, CUHK-PEDES, or ICFG-PEDES.")
+        src = single_file_sources[0]
+        logger.log(f"Auto-detected dataset annotation: dataset={src.dataset_name}, annotation={src.path}, image_dir={src.image_dir or 'auto'}")
+        return [src]
+
+    logger.log("Auto-detected split annotation files: " + ", ".join(f"{s.split}={s.path}" for s in sources))
+    return sources
+
+def norm_name(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(text).lower())
+
+def infer_dataset_name_from_context(args: argparse.Namespace) -> Optional[str]:
+    haystack = norm_name(" ".join([args.dataset_root, args.model_ckpt, args.prototype_ckpt, args.output_dir]))
+    matches = []
+    for layout in DATASET_LAYOUTS:
+        if norm_name(layout["name"]) in haystack or norm_name(layout["dirname"]) in haystack:
+            matches.append(layout["name"])
+    return matches[0] if len(set(matches)) == 1 else None
 
 def load_annotations(args: argparse.Namespace, logger: Logger) -> Dict[str, List[Sample]]:
     root = resolve_path(args.dataset_root)
@@ -291,12 +391,21 @@ def load_annotations(args: argparse.Namespace, logger: Logger) -> Dict[str, List
             out[split] = load_annotation(path, root, split, logger)
             used_any = True
     if not used_any:
-        path = find_default_annotation(root)
-        if path is None:
-            raise FileNotFoundError("No annotation was provided and no default JSON was found.")
-        logger.log(f"Using detected annotation file: {path}")
-        for split in out:
-            out[split] = load_annotation(path, root, split, logger)
+        dataset_name = args.dataset_name
+        if dataset_name == "auto":
+            inferred = infer_dataset_name_from_context(args)
+            if inferred:
+                dataset_name = inferred
+                logger.log(f"Inferred dataset_name={dataset_name} from CLI paths.")
+        sources = detect_annotation_sources(root, dataset_name, logger)
+        if len(sources) == 1 and sources[0].split is None:
+            src = sources[0]
+            for split in out:
+                out[split] = load_annotation(src.path, src.dataset_dir, split, logger, src.image_dir)
+        else:
+            for src in sources:
+                if src.split in out:
+                    out[src.split] = load_annotation(src.path, src.dataset_dir, src.split, logger, src.image_dir)
     return out
 
 def group_by_pid(samples: Sequence[Sample]) -> Dict[int, List[int]]:
@@ -449,7 +558,7 @@ def model_args(args: argparse.Namespace, bank: PrototypeBank, train_samples: Seq
         prototype_id_weight=0.2, prototype_momentum=float(cfg.get("momentum", 0.2)), only_global=(args.prototype_feature == "global"),
         select_ratio=args.select_ratio, return_all=True, topk_type="custom", layer_index=-1, average_attn_weights=True, modify_k=True,
         track_train_diagnostics=False, training=False, txt_aug=False, img_aug=False, num_workers=args.num_workers,
-        batch_size=args.batch_size, test_batch_size=args.batch_size, dataset_name="custom", root_dir=str(resolve_path(args.dataset_root))
+        batch_size=args.batch_size, test_batch_size=args.batch_size, dataset_name=args.dataset_name if args.dataset_name != "auto" else "custom", root_dir=str(resolve_path(args.dataset_root))
     )
 
 def checkpoint_state_dict(ckpt: Any) -> Mapping[str, torch.Tensor]:

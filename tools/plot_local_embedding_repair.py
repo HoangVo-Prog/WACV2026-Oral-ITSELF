@@ -112,6 +112,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ambiguous_eps", type=float, default=0.01, help="Ambiguous-query threshold on host margin.")
     parser.add_argument("--only_improved", type=str2bool, default=False, help="Only plot queries with margin_gain > min_margin_gain.")
     parser.add_argument("--min_margin_gain", type=float, default=0.0, help="Minimum margin gain for --only_improved.")
+    parser.add_argument(
+        "--sort_by",
+        default="margin_gain",
+        choices=[
+            "margin_gain",
+            "host_margin",
+            "iapr_margin",
+            "host_neg_score",
+            "iapr_neg_score",
+            "query_index",
+        ],
+        help="Criterion used before applying --max_queries. Default selects largest margin repair first.",
+    )
+    parser.add_argument("--sort_desc", type=str2bool, default=True, help="Sort descending before applying --max_queries.")
+    parser.add_argument(
+        "--no_sort",
+        type=str2bool,
+        default=False,
+        help="Keep dataset order instead of sorting before plotting.",
+    )
     parser.add_argument("--save_pdf", type=str2bool, default=True, help="Write per-query PDF figures.")
     parser.add_argument("--save_png", type=str2bool, default=True, help="Write per-query PNG figures.")
     parser.add_argument("--cache_embeddings", type=str2bool, default=True, help="Save extracted embeddings under output_dir/cache.")
@@ -418,6 +438,18 @@ def selected_query_passes_filters(args: argparse.Namespace, host_margin: float, 
     return True
 
 
+def sorted_candidates(candidates: Sequence[Mapping[str, Any]], args: argparse.Namespace) -> List[Mapping[str, Any]]:
+    if args.no_sort:
+        return list(candidates)
+    sort_key = args.sort_by
+
+    def value(row: Mapping[str, Any]) -> Tuple[float, int]:
+        primary = float(row[sort_key])
+        return primary, -int(row["query_index"])
+
+    return sorted(candidates, key=value, reverse=bool(args.sort_desc))
+
+
 def main() -> None:
     args = parse_args()
     validate_args(args)
@@ -497,9 +529,9 @@ def main() -> None:
     sim_host = host_text @ host_image.t()
     sim_iapr = iapr_text @ iapr_image.t()
 
-    rows: List[Dict[str, Any]] = []
+    candidates: List[Dict[str, Any]] = []
     skipped = 0
-    for query_index in tqdm(range(sim_host.shape[0]), desc="Plotting local neighborhoods"):
+    for query_index in tqdm(range(sim_host.shape[0]), desc="Scoring query candidates"):
         query_pid = int(query_pids[query_index].item())
         pos_mask = gallery_pids.eq(query_pid)
         neg_mask = ~pos_mask
@@ -522,6 +554,46 @@ def main() -> None:
         if not selected_gallery:
             skipped += 1
             continue
+
+        candidates.append(
+            {
+                "query_index": int(query_index),
+                "query_pid": query_pid,
+                "host_pos_score": host_pos_score,
+                "host_neg_score": host_neg_score,
+                "host_margin": host_margin,
+                "iapr_pos_score": iapr_pos_score,
+                "iapr_neg_score": iapr_neg_score,
+                "iapr_margin": iapr_margin,
+                "margin_gain": margin_gain,
+                "selected_positive": selected_positive,
+                "selected_negative": selected_negative,
+                "selected_gallery": selected_gallery,
+            }
+        )
+
+    ordered_candidates = sorted_candidates(candidates, args)
+    if args.max_queries > 0:
+        ordered_candidates = ordered_candidates[:int(args.max_queries)]
+    print(
+        f"[Selection] candidates={len(candidates)} plotted={len(ordered_candidates)} "
+        f"sort={'dataset_order' if args.no_sort else args.sort_by} desc={args.sort_desc}"
+    )
+
+    rows: List[Dict[str, Any]] = []
+    for candidate in tqdm(ordered_candidates, desc="Plotting selected neighborhoods"):
+        query_index = int(candidate["query_index"])
+        query_pid = int(candidate["query_pid"])
+        host_pos_score = float(candidate["host_pos_score"])
+        host_neg_score = float(candidate["host_neg_score"])
+        host_margin = float(candidate["host_margin"])
+        iapr_pos_score = float(candidate["iapr_pos_score"])
+        iapr_neg_score = float(candidate["iapr_neg_score"])
+        iapr_margin = float(candidate["iapr_margin"])
+        margin_gain = float(candidate["margin_gain"])
+        selected_positive = list(candidate["selected_positive"])
+        selected_negative = list(candidate["selected_negative"])
+        selected_gallery = list(candidate["selected_gallery"])
 
         base_name = row_filename(query_index, query_pid, host_margin, iapr_margin)
         output_base = figures_dir / base_name
@@ -563,9 +635,6 @@ def main() -> None:
                 "output_pdf": pdf_path,
             }
         )
-
-        if args.max_queries > 0 and len(rows) >= int(args.max_queries):
-            break
 
     summary_path = output_dir / "summary.csv"
     sorted_path = output_dir / "summary_sorted_by_margin_gain.csv"

@@ -440,7 +440,9 @@ class VisualGradCam:
         self.model = model
         self.img_size = img_size
         self.visual = model.base_model.visual
-        self.target = self.visual.transformer.resblocks[-1]
+        # Patch tokens at the final block output no longer affect the CLS image feature.
+        # Hook the pre-attention normalization instead, where CLS still attends to patches.
+        self.target = self.visual.transformer.resblocks[-1].ln_1
         self.activations = None
         self.handle = self.target.register_forward_hook(self._forward_hook)
 
@@ -476,8 +478,13 @@ class VisualGradCam:
         patch_activations = activations[1:]
         patch_gradients = gradients[1:]
         weights = patch_gradients.mean(dim=0)
-        cam = torch.relu((patch_activations * weights).sum(dim=1))
+        signed_cam = (patch_activations * weights).sum(dim=1)
+        cam = torch.relu(signed_cam)
 
+        if (not torch.isfinite(cam).all()) or float(cam.max().detach().cpu()) <= 1e-12:
+            cam = signed_cam.abs()
+        if (not torch.isfinite(cam).all()) or float(cam.max().detach().cpu()) <= 1e-12:
+            cam = patch_gradients.norm(p=2, dim=1)
         num_y = int(getattr(self.visual, "num_y", self.img_size[0] // 16))
         num_x = int(getattr(self.visual, "num_x", self.img_size[1] // 16))
         if cam.numel() != num_y * num_x:
@@ -512,10 +519,11 @@ def heatmap_to_uint8(heatmap):
 def overlay_heatmap(image, heatmap_uint8, alpha, img_size):
     height, width = img_size
     image_np = np.array(image.resize((width, height), Image.BILINEAR)).astype(np.float32)
-    color = plt.get_cmap("jet")(heatmap_uint8.astype(np.float32) / 255.0)[..., :3] * 255.0
-    overlay = (1.0 - alpha) * image_np + alpha * color
+    heatmap = heatmap_uint8.astype(np.float32) / 255.0
+    color = plt.get_cmap("jet")(heatmap)[..., :3] * 255.0
+    alpha_map = (alpha * heatmap)[..., None]
+    overlay = (1.0 - alpha_map) * image_np + alpha_map * color
     return np.clip(overlay, 0, 255).astype(np.uint8)
-
 
 def save_comparison_figure(example, baseline_heatmap, best_heatmap, args, comparison_dir):
     height, width = tuple(args.img_size)
