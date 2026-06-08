@@ -43,19 +43,28 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-import matplotlib
-matplotlib.use("Agg")
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+except ModuleNotFoundError:
+    matplotlib = None
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageDraw, ImageFile, ImageFont, ImageOps
+try:
+    from PIL import Image, ImageDraw, ImageFile, ImageFont, ImageOps
+    PIL_AVAILABLE = True
+except ModuleNotFoundError:
+    Image = ImageDraw = ImageFile = ImageFont = ImageOps = None
+    PIL_AVAILABLE = False
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+if ImageFile is not None:
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 PID_KEYS = ["id", "pid", "person_id", "identity", "identity_id", "label"]
 IMAGE_KEYS = ["img_path", "file_path", "image_path", "path", "filename", "image", "img"]
@@ -580,7 +589,8 @@ def feature_kind(model: torch.nn.Module, bank: PrototypeBank) -> str:
     return "prototype_projected" if getattr(model, "prototype_branch", None) is not None else "global"
 
 def cache_name(args: argparse.Namespace, split: str, bank: PrototypeBank, samples: Sequence[Sample], kind: str) -> str:
-    payload = {"model": str(resolve_path(args.model_ckpt)), "mtime": os.path.getmtime(resolve_path(args.model_ckpt)), "proto": str(resolve_path(args.prototype_ckpt)), "split": split, "kind": kind, "dim": bank.dim, "n": len(samples), "img": list(args.model_img_size), "text": args.text_length}
+    pid_digest = hashlib.sha1(",".join(str(int(s.pid)) for s in samples).encode()).hexdigest()[:12]
+    payload = {"model": str(resolve_path(args.model_ckpt)), "mtime": os.path.getmtime(resolve_path(args.model_ckpt)), "proto": str(resolve_path(args.prototype_ckpt)), "split": split, "kind": kind, "dim": bank.dim, "n": len(samples), "pid_digest": pid_digest, "img": list(args.model_img_size), "text": args.text_length}
     return f"{split}_{kind}_{hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:12]}.pt"
 
 @torch.inference_mode()
@@ -646,17 +656,41 @@ def build_embeddings(model: torch.nn.Module, samples: Sequence[Sample], split: s
 
 def split_alignment(samples_by_split: Mapping[str, Sequence[Sample]], bank: PrototypeBank, requested: str, force: bool, logger: Logger) -> Dict[str, Any]:
     proto_pids = set(int(x) for x in bank.proto_pids.tolist())
-    report = {"requested_split": requested, "prototype_pid_count": len(proto_pids), "split_pid_counts": {}, "overlap_counts": {}, "used_split": requested, "switched": False, "warning": ""}
+    report = {"requested_split": requested, "prototype_pid_count": len(proto_pids), "split_pid_counts": {}, "overlap_counts": {}, "pid_shifts": {}, "used_split": requested, "used_pid_shift": 0, "switched": False, "warning": ""}
     for split, samples in samples_by_split.items():
-        pids = {s.pid for s in samples}
-        report["split_pid_counts"][split] = len(pids)
-        report["overlap_counts"][split] = len(pids & proto_pids)
-    if force or report["overlap_counts"].get(requested, 0) > 0:
-        logger.log(f"Prototype/split alignment: using requested split={requested}, overlap={report['overlap_counts'].get(requested, 0)}")
+        shift, overlap = best_pid_shift(samples, proto_pids)
+        report["split_pid_counts"][split] = len({s.pid for s in samples})
+        report["overlap_counts"][split] = int(overlap)
+        report["pid_shifts"][split] = int(shift)
+        logger.log(f"Prototype/split alignment candidate: split={split} raw_pids={report['split_pid_counts'][split]} best_overlap={overlap} pid_shift={shift}")
+    if force:
+        report["used_pid_shift"] = int(report["pid_shifts"].get(requested, 0))
+        logger.log(f"Prototype/split alignment: --force_split uses requested split={requested}, pid_shift={report['used_pid_shift']}, overlap={report['overlap_counts'].get(requested, 0)}")
         return report
+
+    requested_overlap = int(report["overlap_counts"].get(requested, 0))
+    train_overlap = int(report["overlap_counts"].get("train", 0))
+    if requested == "test" and train_overlap > 0 and train_overlap >= requested_overlap:
+        report.update({
+            "used_split": "train",
+            "used_pid_shift": int(report["pid_shifts"].get("train", 0)),
+            "switched": requested != "train",
+            "warning": (
+                "Prototype bank appears train-aligned. True Prototype Mode Discovery will use split 'train' "
+                f"(train_overlap={train_overlap}, requested_test_overlap={requested_overlap}). Use --force_split only if this checkpoint was built for test IDs."
+            ),
+        })
+        logger.log("WARNING: " + report["warning"])
+        return report
+
+    if requested_overlap > 0:
+        report["used_pid_shift"] = int(report["pid_shifts"].get(requested, 0))
+        logger.log(f"Prototype/split alignment: using requested split={requested}, pid_shift={report['used_pid_shift']}, overlap={requested_overlap}")
+        return report
+
     best = max(("train", "val", "test"), key=lambda s: int(report["overlap_counts"].get(s, 0)))
     if report["overlap_counts"].get(best, 0) > 0:
-        report.update({"used_split": best, "switched": True, "warning": f"Requested split {requested!r} has no prototype PID overlap. Using aligned split {best!r} for true Prototype Mode Discovery."})
+        report.update({"used_split": best, "used_pid_shift": int(report["pid_shifts"].get(best, 0)), "switched": True, "warning": f"Requested split {requested!r} has no prototype PID overlap. Using aligned split {best!r} for true Prototype Mode Discovery."})
         logger.log("WARNING: " + report["warning"])
     else:
         report["warning"] = "No split has PID overlap with the prototype bank."
@@ -693,6 +727,9 @@ def topk_proto(proto: torch.Tensor, emb: torch.Tensor, positions: Sequence[int],
     sims = emb[pos] @ F.normalize(proto.float(), p=2, dim=0)
     vals, loc = torch.topk(sims, k=min(k, sims.numel()), largest=True)
     return [(int(pos[int(i)].item()), float(v.item())) for v, i in zip(vals, loc)]
+
+def retrieve_topk_for_prototype(proto: torch.Tensor, emb: torch.Tensor, positions: Sequence[int], k: int) -> List[Tuple[int, float]]:
+    return topk_proto(proto, emb, positions, k)
 
 STOPWORDS = {"the", "and", "with", "wearing", "person", "man", "woman", "shirt", "pants", "body", "image", "photo", "this", "that", "has", "have", "standing", "walking"}
 def auto_tag(captions: Sequence[str]) -> str:
@@ -784,6 +821,9 @@ def overview(paths: Sequence[Path], out: Path, max_rows: int) -> None:
         canvas.paste(im, ((w - im.width)//2, y)); y += im.height
     canvas.save(out)
 
+def render_overview_figure(paths: Sequence[Path], out: Path, max_rows: int) -> None:
+    overview(paths, out, max_rows)
+
 def render_test_sheet(pid: int, samples: Sequence[Sample], out: Path, image_size: int, max_images: int) -> None:
     idxs = group_by_pid(samples).get(pid, [])[:max_images]
     if not idxs: return
@@ -810,6 +850,8 @@ def main() -> None:
     logger = Logger(outdir)
     try:
         logger.log("Prototype Mode Discovery visualization")
+        if not PIL_AVAILABLE:
+            raise RuntimeError("Pillow is required for image loading/rendering. Install it in this environment with `pip install pillow`.")
         save_json(vars(args), outdir / "used_config.json")
         samples_by_split = load_annotations(args, logger)
         bank = load_prototypes(resolve_path(args.prototype_ckpt), logger)
@@ -819,12 +861,23 @@ def main() -> None:
         if not samples_by_split.get(used_split): raise RuntimeError(f"No samples for split {used_split}")
         device = device_from_arg(args.device); logger.log(f"Using device: {device}")
         model = build_model(args, bank, samples_by_split.get("train", []), device, logger)
-        samples = samples_by_split[used_split]
+        pid_shift = int(align.get("used_pid_shift", 0))
+        samples = apply_pid_shift(samples_by_split[used_split], pid_shift)
+        if pid_shift:
+            logger.log(f"Applied pid_shift={pid_shift} to split={used_split} so annotation IDs align with prototype IDs.")
         bundle = build_embeddings(model, samples, used_split, bank, args, outdir, device, logger)
         logger.log(f"Embedding feature_kind={bundle.feature_kind}, used_projector={bundle.used_projector}, dim={bundle.image_embeddings.shape[1]}")
         if bundle.image_embeddings.shape[1] != bank.dim:
             raise RuntimeError(f"Embedding dim {bundle.image_embeddings.shape[1]} does not match prototype dim {bank.dim}. Try --prototype_feature local/global or ensure projector weights are in --model_ckpt.")
-        ids = choose_ids(samples, bank, args, logger)
+        selection_args = SimpleNamespace(**vars(args))
+        if args.ids and pid_shift:
+            selection_args.ids = [int(pid) + pid_shift for pid in args.ids]
+            logger.log(f"Interpreting requested --ids in prototype PID space after shift: {selection_args.ids}")
+        ids = choose_ids(samples, bank, selection_args, logger)
+        if not ids and args.ids:
+            logger.log("WARNING: requested --ids do not map to the prototype-aligned split; falling back to automatic ID selection for the true prototype figure.")
+            fallback_args = SimpleNamespace(**vars(selection_args)); fallback_args.ids = None
+            ids = choose_ids(samples, bank, fallback_args, logger)
         if not ids: raise RuntimeError("No identity IDs could be selected for true Prototype Mode Discovery.")
         summary, id_paths = [], []
         for pid in ids:
