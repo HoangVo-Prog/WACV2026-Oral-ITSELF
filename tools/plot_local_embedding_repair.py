@@ -33,7 +33,7 @@ import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -48,13 +48,15 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.plot_ambiguity_rate_compare import (  # noqa: E402
     build_model_args,
     build_repo_model,
+    candidate_state_keys,
+    checkpoint_state_dict,
     extract_image_features,
     extract_text_features,
-    load_checkpoint_for_inference,
     load_split_data,
     parse_img_size,
     resolve_device,
     resolve_path,
+    torch_load_checkpoint,
     validate_split_data,
 )
 
@@ -190,6 +192,103 @@ def compatibility_model_args(args: argparse.Namespace) -> SimpleNamespace:
     return model_args
 
 
+def load_checkpoint_for_inference_report(model: torch.nn.Module, checkpoint_path: Path) -> Dict[str, Any]:
+    checkpoint = torch_load_checkpoint(checkpoint_path)
+    loaded_state = checkpoint_state_dict(checkpoint)
+    model_state = model.state_dict()
+    update_state: MutableMapping[str, torch.Tensor] = {}
+    missing_keys: List[Dict[str, Any]] = []
+    shape_mismatch_keys: List[Dict[str, Any]] = []
+    non_tensor_keys: List[str] = []
+
+    for raw_key, value in loaded_state.items():
+        raw_key = str(raw_key)
+        if not torch.is_tensor(value):
+            non_tensor_keys.append(raw_key)
+            continue
+
+        candidates = candidate_state_keys(raw_key)
+        target_key = None
+        for candidate in candidates:
+            if candidate in model_state:
+                target_key = candidate
+                break
+
+        if target_key is None:
+            missing_keys.append({
+                "checkpoint_key": raw_key,
+                "tried_model_keys": candidates,
+                "checkpoint_shape": list(value.shape),
+            })
+            continue
+
+        if model_state[target_key].shape != value.shape:
+            shape_mismatch_keys.append({
+                "checkpoint_key": raw_key,
+                "model_key": target_key,
+                "checkpoint_shape": list(value.shape),
+                "model_shape": list(model_state[target_key].shape),
+            })
+            continue
+
+        update_state[target_key] = value.detach().clone()
+
+    if not update_state:
+        raise RuntimeError(f"No compatible tensors found in checkpoint: {checkpoint_path}")
+
+    model_state.update(update_state)
+    model.load_state_dict(model_state, strict=True)
+    return {
+        "loaded": len(update_state),
+        "skipped_missing": len(missing_keys),
+        "skipped_shape": len(shape_mismatch_keys),
+        "skipped_non_tensor": len(non_tensor_keys),
+        "missing_keys": missing_keys,
+        "shape_mismatch_keys": shape_mismatch_keys,
+        "non_tensor_keys": non_tensor_keys,
+    }
+
+
+def save_checkpoint_report(output_dir: Path, label: str, checkpoint_path: Path, stats: Mapping[str, Any]) -> Path:
+    report = {
+        "checkpoint": str(checkpoint_path),
+        "loaded": int(stats.get("loaded", 0)),
+        "skipped_missing": int(stats.get("skipped_missing", 0)),
+        "skipped_shape": int(stats.get("skipped_shape", 0)),
+        "skipped_non_tensor": int(stats.get("skipped_non_tensor", 0)),
+        "missing_keys": stats.get("missing_keys", []),
+        "shape_mismatch_keys": stats.get("shape_mismatch_keys", []),
+        "non_tensor_keys": stats.get("non_tensor_keys", []),
+    }
+    path = output_dir / f"{label}_checkpoint_load_report.json"
+    path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return path
+
+
+def print_checkpoint_load_summary(label: str, stats: Mapping[str, Any], max_keys: int = 20) -> None:
+    print(
+        f"[{label}] loaded={stats.get('loaded', 0)} "
+        f"missing={stats.get('skipped_missing', 0)} "
+        f"shape={stats.get('skipped_shape', 0)} "
+        f"non_tensor={stats.get('skipped_non_tensor', 0)}"
+    )
+    missing_keys = list(stats.get("missing_keys", []))
+    if missing_keys:
+        print(f"[{label}] missing checkpoint keys:")
+        for item in missing_keys[:max_keys]:
+            print(f"  - {item.get('checkpoint_key')} shape={item.get('checkpoint_shape')}")
+        if len(missing_keys) > max_keys:
+            print(f"  ... {len(missing_keys) - max_keys} more")
+    shape_mismatch = list(stats.get("shape_mismatch_keys", []))
+    if shape_mismatch:
+        print(f"[{label}] shape-mismatch checkpoint keys:")
+        for item in shape_mismatch[:max_keys]:
+            print(
+                f"  - {item.get('checkpoint_key')} checkpoint_shape={item.get('checkpoint_shape')} "
+                f"model_key={item.get('model_key')} model_shape={item.get('model_shape')}"
+            )
+
+
 @torch.no_grad()
 def extract_embeddings_for_checkpoint(
     checkpoint_path: Path,
@@ -204,7 +303,7 @@ def extract_embeddings_for_checkpoint(
         run_args = SimpleNamespace(**vars(model_args))
         num_classes = max(int(split_data.num_train_ids), 1)
         model = build_repo_model(run_args, num_classes=num_classes)
-        load_stats = load_checkpoint_for_inference(model, checkpoint_path)
+        load_stats = load_checkpoint_for_inference_report(model, checkpoint_path)
         model.to(device)
         if device.type == "cpu":
             model.float()
@@ -502,10 +601,9 @@ def main() -> None:
         args.batch_size,
         args.num_workers,
     )
-    print(
-        f"[Host] loaded={host_stats.get('loaded', 0)} "
-        f"missing={host_stats.get('skipped_missing', 0)} shape={host_stats.get('skipped_shape', 0)}"
-    )
+    print_checkpoint_load_summary("Host", host_stats)
+    host_report_path = save_checkpoint_report(output_dir, "host", host_ckpt, host_stats)
+    print(f"[Host] checkpoint load report: {host_report_path}")
 
     print(f"[Host+IAPR] Extracting retrieval embeddings from {iapr_ckpt}")
     iapr_text, iapr_image, query_pids_iapr, gallery_pids_iapr, iapr_stats = extract_embeddings_for_checkpoint(
@@ -516,10 +614,9 @@ def main() -> None:
         args.batch_size,
         args.num_workers,
     )
-    print(
-        f"[Host+IAPR] loaded={iapr_stats.get('loaded', 0)} "
-        f"missing={iapr_stats.get('skipped_missing', 0)} shape={iapr_stats.get('skipped_shape', 0)}"
-    )
+    print_checkpoint_load_summary("Host+IAPR", iapr_stats)
+    iapr_report_path = save_checkpoint_report(output_dir, "iapr", iapr_ckpt, iapr_stats)
+    print(f"[Host+IAPR] checkpoint load report: {iapr_report_path}")
 
     if not torch.equal(query_pids, query_pids_iapr):
         raise RuntimeError("Host and Host+IAPR query pid arrays differ.")

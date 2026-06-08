@@ -7,7 +7,6 @@ import sys
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -26,7 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from datasets.bases import tokenize as dataset_tokenize
 from datasets.build import build_transforms
-from model import build_model
+from model.clip_model import build_CLIP_from_openai_pretrained
 from utils.simple_tokenizer import SimpleTokenizer
 
 
@@ -282,35 +281,13 @@ def load_query_examples(args):
     return examples, len(train_pids)
 
 
-def build_model_args(args):
-    return SimpleNamespace(
-        loss_names="tal+cid",
-        pretrain_choice=args.pretrain_choice,
-        img_size=tuple(args.img_size),
-        stride_size=args.stride_size,
-        temperature=0.02,
-        prototype=False,
-        use_loss_id=False,
-        prototype_feature="auto",
-        prototype_dim=512,
-        prototype_per_id=2,
-        prototype_projector="default",
-        prototype_residual_scale=0.1,
-        prototype_kmeans_iters=20,
-        prototype_warmup_epochs=0,
-        prototype_tau=0.05,
-        prototype_hard_k=16,
-        prototype_id_weight=0.2,
-        prototype_momentum=0.2,
-        no_pbt=False,
-        only_global=True,
-        select_ratio=0.4,
-        return_all=False,
-        topk_type="mean",
-        layer_index=-1,
-        average_attn_weights=True,
-        modify_k=False,
+def build_global_clip_model(args):
+    model, _ = build_CLIP_from_openai_pretrained(
+        args.pretrain_choice,
+        tuple(args.img_size),
+        args.stride_size,
     )
+    return model
 
 
 def torch_load_checkpoint(checkpoint_path):
@@ -343,6 +320,27 @@ def strip_repeated_prefixes(key, prefixes):
     return stripped
 
 
+CLIP_BACKBONE_EXACT_KEYS = {"positional_embedding", "text_projection"}
+CLIP_BACKBONE_PREFIXES = (
+    "visual.",
+    "transformer.",
+    "token_embedding.",
+    "ln_final.",
+)
+
+
+def normalized_clip_key(key):
+    normalized = strip_repeated_prefixes(str(key), ("module.", "model.", "net.", "network."))
+    if normalized.startswith("base_model."):
+        normalized = normalized[len("base_model."):]
+    return normalized
+
+
+def is_clip_backbone_checkpoint_key(key):
+    normalized = normalized_clip_key(key)
+    return normalized in CLIP_BACKBONE_EXACT_KEYS or normalized.startswith(CLIP_BACKBONE_PREFIXES)
+
+
 def candidate_state_keys(key):
     raw = str(key)
     candidates = []
@@ -365,8 +363,8 @@ def candidate_state_keys(key):
             add(f"base_model.{candidate}")
     if no_module.startswith("model."):
         add(no_module[len("model."):])
+    add(normalized_clip_key(raw))
     return candidates
-
 
 def load_checkpoint_for_inference(model, checkpoint_path):
     checkpoint = torch_load_checkpoint(checkpoint_path)
@@ -376,10 +374,15 @@ def load_checkpoint_for_inference(model, checkpoint_path):
     skipped_missing = 0
     skipped_shape = 0
     skipped_non_tensor = 0
+    ignored_non_clip = 0
 
     for raw_key, value in loaded_state.items():
         if not torch.is_tensor(value):
             skipped_non_tensor += 1
+            continue
+
+        if not is_clip_backbone_checkpoint_key(str(raw_key)):
+            ignored_non_clip += 1
             continue
 
         target_key = None
@@ -406,18 +409,20 @@ def load_checkpoint_for_inference(model, checkpoint_path):
         "skipped_missing": skipped_missing,
         "skipped_shape": skipped_shape,
         "skipped_non_tensor": skipped_non_tensor,
+        "ignored_non_clip": ignored_non_clip,
     }
 
 
-def load_model_for_checkpoint(args, checkpoint_path, num_classes, device, label):
+def load_model_for_checkpoint(args, checkpoint_path, device, label):
     checkpoint = resolve_path(checkpoint_path)
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint}")
-    model = build_model(build_model_args(args), num_classes=max(int(num_classes), 1))
+    model = build_global_clip_model(args)
     stats = load_checkpoint_for_inference(model, checkpoint)
     print(
-        f"[{label}] Loaded checkpoint tensors: {stats['loaded']} "
-        f"(missing={stats['skipped_missing']}, shape={stats['skipped_shape']}, non_tensor={stats['skipped_non_tensor']})"
+        f"[{label}] Loaded global CLIP tensors: {stats['loaded']} "
+        f"(ignored_non_clip={stats['ignored_non_clip']}, missing={stats['skipped_missing']}, "
+        f"shape={stats['skipped_shape']}, non_tensor={stats['skipped_non_tensor']})"
     )
     model.to(device)
     model.float()
@@ -439,7 +444,7 @@ class VisualGradCam:
     def __init__(self, model, img_size):
         self.model = model
         self.img_size = img_size
-        self.visual = model.base_model.visual
+        self.visual = model.visual
         # Patch tokens at the final block output no longer affect the CLS image feature.
         # Hook the pre-attention normalization instead, where CLS still attends to patches.
         self.target = self.visual.transformer.resblocks[-1].ln_1
@@ -462,10 +467,13 @@ class VisualGradCam:
         text_batch = text_tokens.unsqueeze(0)
 
         with torch.no_grad():
-            text_feat = self.model.encode_text(text_batch).float()
+            text_tokens_long = text_batch.long()
+            text_all, _ = self.model.encode_text(text_tokens_long)
+            text_feat = text_all[torch.arange(text_all.shape[0], device=text_all.device), text_tokens_long.argmax(dim=-1)].float()
             text_feat = F.normalize(text_feat, p=2, dim=1).detach()
 
-        image_feat = self.model.encode_image(image_batch).float()
+        image_all, _ = self.model.encode_image(image_batch)
+        image_feat = image_all[:, 0, :].float()
         image_feat = F.normalize(image_feat, p=2, dim=1)
         score = (image_feat * text_feat).sum()
         score.backward()
@@ -614,7 +622,7 @@ def main():
         f"num_train_ids={num_classes}"
     )
 
-    baseline_model = load_model_for_checkpoint(args, args.baseline_checkpoint, num_classes, device, args.baseline_name)
+    baseline_model = load_model_for_checkpoint(args, args.baseline_checkpoint, device, args.baseline_name)
     baseline_heatmaps = compute_heatmaps_for_checkpoint(
         baseline_model,
         examples,
@@ -627,7 +635,7 @@ def main():
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    best_model = load_model_for_checkpoint(args, args.best_checkpoint, num_classes, device, args.best_name)
+    best_model = load_model_for_checkpoint(args, args.best_checkpoint, device, args.best_name)
     transform = build_transforms(img_size=tuple(args.img_size), is_train=False)
     best_cam = VisualGradCam(best_model, img_size=tuple(args.img_size))
 
