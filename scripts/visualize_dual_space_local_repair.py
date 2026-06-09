@@ -630,14 +630,14 @@ def config_model_args(cli: argparse.Namespace, bank: PrototypeBankData) -> Simpl
     cfg["prototype_momentum"] = float(bank.config.get("momentum", cfg.get("prototype_momentum", 0.2)))
     if bank.config.get("projector_mode") is not None:
         cfg["prototype_projector"] = str(bank.config.get("projector_mode"))
-    cfg_use_local = bank.config.get("use_local")
-    cfg_feature_dim = scalar_int(bank.config.get("feature_dim"))
-    if cfg_use_local is True or cfg_feature_dim == 4096:
-        cfg["prototype_feature"] = "local"
-        cfg["only_global"] = False
-    elif cfg_use_local is False or cfg_feature_dim == 512:
-        cfg["prototype_feature"] = "global"
-    cfg["img_size"] = parse_img_size(cfg.get("img_size") if cli.config else cli.img_size)
+    cfg["only_global"] = True
+    cfg["prototype_feature"] = "global"
+    cfg["return_all"] = False
+    cfg["modify_k"] = False
+    cfg["topk_type"] = "mean"
+    cfg["average_attn_weights"] = True
+    cfg["loss_names"] = "tal+cid"
+    cfg["track_train_diagnostics"] = False
     cfg["text_length"] = int(cfg.get("text_length", cli.text_length))
     return SimpleNamespace(**cfg)
 
@@ -687,6 +687,10 @@ def require_local_layers(model: torch.nn.Module, label: str) -> None:
 
 
 def resolve_retrieval_mode(cli: argparse.Namespace, model: torch.nn.Module, model_args: SimpleNamespace) -> str:
+    if bool(getattr(model_args, "only_global", False)):
+        if cli.retrieval_branch not in ("auto", "global"):
+            print(f"[Retrieval] overriding --retrieval_branch={cli.retrieval_branch} to global because only_global=True")
+        return "global"
     if cli.retrieval_branch != "auto":
         mode = cli.retrieval_branch
     elif bool(getattr(model_args, "only_global", False)) or not has_local_layers(model):
@@ -1508,7 +1512,7 @@ def main() -> None:
     model_args = config_model_args(args, iapr_bank)
     num_classes = int(iapr_bank.num_classes)
     print(
-        f"[Model] num_classes={num_classes} prototype_feature={model_args.prototype_feature} "
+        f"[Model] num_classes={num_classes} only_global={model_args.only_global} prototype_feature={model_args.prototype_feature} "
         f"prototype_dim={model_args.prototype_dim} prototype_per_id={model_args.prototype_per_id}"
     )
 
@@ -1679,6 +1683,11 @@ def main() -> None:
             "alpha": float(args.retrieval_alpha),
             "margin_formula": "max_positive_similarity - max_hard_negative_similarity",
             "note": "This follows the repository margin diagnostic convention.",
+        },
+        "model_architecture": {
+            "only_global": bool(model_args.only_global),
+            "prototype_feature": str(model_args.prototype_feature),
+            "note": "Backbone/prototype-space feature extraction is forced to global-only in this diagnostic.",
         },
         "shared_iapr_prototype_anchors_for_diagnostic": bool(shared_iapr_anchors),
         "host_projection_decision": projection_decision,
