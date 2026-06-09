@@ -1152,9 +1152,10 @@ def pad_limits(ax: Any, coords: np.ndarray) -> None:
     apply_limits(ax, coordinate_limits(coords))
 
 
-def scatter_point(ax: Any, point: PointSpec, xy: np.ndarray) -> None:
+def scatter_point(ax: Any, point: PointSpec, xy: np.ndarray, alpha_override: Optional[float] = None) -> None:
+    alpha = float(point.alpha if alpha_override is None else alpha_override)
     if point.marker == "x":
-        ax.scatter([xy[0]], [xy[1]], marker="x", s=point.size, c=point.color, linewidths=1.5, alpha=point.alpha)
+        ax.scatter([xy[0]], [xy[1]], marker="x", s=point.size, c=point.color, linewidths=1.45, alpha=alpha, zorder=3)
     elif point.hollow:
         ax.scatter(
             [xy[0]],
@@ -1163,8 +1164,9 @@ def scatter_point(ax: Any, point: PointSpec, xy: np.ndarray) -> None:
             s=point.size,
             facecolors="none",
             edgecolors=point.color,
-            linewidths=1.3,
-            alpha=point.alpha,
+            linewidths=1.25,
+            alpha=alpha,
+            zorder=3,
         )
     else:
         ax.scatter(
@@ -1175,10 +1177,48 @@ def scatter_point(ax: Any, point: PointSpec, xy: np.ndarray) -> None:
             c=point.color,
             edgecolors=point.edgecolor if point.marker not in {"*"} else "black",
             linewidths=0.7,
-            alpha=point.alpha,
+            alpha=alpha,
+            zorder=3,
         )
     if point.annotate:
-        ax.annotate(point.annotate, (xy[0], xy[1]), xytext=(5, 5), textcoords="offset points", fontsize=8.0)
+        ax.annotate(
+            point.annotate,
+            (xy[0], xy[1]),
+            xytext=(4, 4),
+            textcoords="offset points",
+            fontsize=7.0,
+            color="#333333",
+            zorder=4,
+        )
+
+
+def compute_overlap_alphas(points: Sequence[PointSpec], coords: np.ndarray, limits: Tuple[float, float, float, float]) -> List[float]:
+    alphas = [float(point.alpha) for point in points]
+    if len(points) < 2 or coords.size == 0:
+        return alphas
+    x_span = max(float(limits[1] - limits[0]), 1e-6)
+    y_span = max(float(limits[3] - limits[2]), 1e-6)
+    scaled = coords.astype(np.float64).copy()
+    scaled[:, 0] = (scaled[:, 0] - float(limits[0])) / x_span
+    scaled[:, 1] = (scaled[:, 1] - float(limits[2])) / y_span
+    close_counts = [0 for _ in points]
+    threshold = 0.045
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            distance = float(np.linalg.norm(scaled[i] - scaled[j]))
+            if distance < threshold:
+                close_counts[i] += 1
+                close_counts[j] += 1
+    adjusted: List[float] = []
+    for point, alpha, count in zip(points, alphas, close_counts):
+        if count <= 0:
+            adjusted.append(alpha)
+            continue
+        if point.metadata.get("ghost_reference") == "vanilla":
+            adjusted.append(max(0.16, min(alpha, 0.24)))
+        else:
+            adjusted.append(max(0.48, alpha * max(0.62, 1.0 - 0.13 * count)))
+    return adjusted
 
 
 def draw_arrow(ax: Any, arrow: ArrowSpec, coords_by_label: Mapping[str, np.ndarray]) -> None:
@@ -1206,28 +1246,18 @@ def draw_arrow(ax: Any, arrow: ArrowSpec, coords_by_label: Mapping[str, np.ndarr
 def draw_panel(ax: Any, panel: PanelSpec, method: str) -> Dict[str, Any]:
     coords = local_project(panel.points, method)
     coords_by_label = {point.label: coords[index] for index, point in enumerate(panel.points)}
+    limits = coordinate_limits(coords)
+    overlap_alphas = compute_overlap_alphas(panel.points, coords, limits)
     for arrow in panel.arrows:
         draw_arrow(ax, arrow, coords_by_label)
-    for point, xy in zip(panel.points, coords):
-        scatter_point(ax, point, xy)
-    if panel.metric_text:
-        ax.text(
-            0.02,
-            0.02,
-            panel.metric_text,
-            transform=ax.transAxes,
-            ha="left",
-            va="bottom",
-            fontsize=7.5,
-            family="monospace",
-            bbox={"boxstyle": "round,pad=0.28", "facecolor": "white", "edgecolor": "#BBBBBB", "alpha": 0.88},
-        )
-    ax.set_title(panel.title, fontsize=13, fontweight="bold")
+    for point, xy, alpha in zip(panel.points, coords, overlap_alphas):
+        scatter_point(ax, point, xy, alpha_override=alpha)
+    ax.set_title(panel.title, fontsize=9.6, fontweight="bold", pad=4.0)
     ax.set_xticks([])
     ax.set_yticks([])
     for spine in ax.spines.values():
         spine.set_visible(False)
-    pad_limits(ax, coords)
+    apply_limits(ax, limits)
     raw_vectors = np.stack([p.vector.detach().float().cpu().numpy() for p in panel.points], axis=0)
     return {
         "num_points": int(len(panel.points)),
@@ -1253,23 +1283,12 @@ def draw_panel_with_shared_projection(ax: Any, panel: PanelSpec, projection: Sha
         coords_for_panel.append(projection.coords_by_label[point.label])
     coords = np.asarray(coords_for_panel, dtype=np.float64) if coords_for_panel else np.zeros((0, 2), dtype=np.float64)
     coords_by_label = {point.label: projection.coords_by_label[point.label] for point in panel.points}
+    overlap_alphas = compute_overlap_alphas(panel.points, coords, projection.limits)
     for arrow in panel.arrows:
         draw_arrow(ax, arrow, coords_by_label)
-    for point, xy in zip(panel.points, coords):
-        scatter_point(ax, point, xy)
-    if panel.metric_text:
-        ax.text(
-            0.02,
-            0.02,
-            panel.metric_text,
-            transform=ax.transAxes,
-            ha="left",
-            va="bottom",
-            fontsize=6.6,
-            family="monospace",
-            bbox={"boxstyle": "round,pad=0.24", "facecolor": "white", "edgecolor": "#BBBBBB", "alpha": 0.88},
-        )
-    ax.set_title(panel.title, fontsize=9.6, fontweight="bold", pad=4.0)
+    for point, xy, alpha in zip(panel.points, coords, overlap_alphas):
+        scatter_point(ax, point, xy, alpha_override=alpha)
+    ax.set_title(panel.title, fontsize=9.4, fontweight="bold", pad=3.0)
     ax.set_xticks([])
     ax.set_yticks([])
     for spine in ax.spines.values():
@@ -1288,14 +1307,64 @@ def legend_handles() -> Tuple[List[Any], List[str]]:
     from matplotlib.lines import Line2D
 
     handles = [
-        Line2D([0], [0], marker="*", color="w", label="query / translated query anchor", markerfacecolor=QUERY_COLOR, markeredgecolor="black", markersize=9),
-        Line2D([0], [0], marker="o", color="w", label="active centroid / anchor", markerfacecolor=POS_COLOR, markeredgecolor=PROTO_EDGE, markersize=6.5),
-        Line2D([0], [0], marker="o", color="w", label="Vanilla reference ghost", markerfacecolor="#9A9A9A", markeredgecolor="#9A9A9A", markersize=6, alpha=0.35),
-        Line2D([0], [0], marker="D", color="w", label="fixed positive prototype", markerfacecolor="none", markeredgecolor=POS_COLOR, markersize=6),
-        Line2D([0], [0], marker="^", color="w", label="fixed hard-negative prototype", markerfacecolor="none", markeredgecolor=NEG_COLORS[0], markersize=6),
-        Line2D([0], [0], color="#555555", label="Vanilla -> model movement", linestyle="--", linewidth=1.3),
+        Line2D([0], [0], marker="*", color="w", label="query / translated q", markerfacecolor=QUERY_COLOR, markeredgecolor="black", markersize=7.5),
+        Line2D([0], [0], marker="o", color="w", label="active centroid/anchor", markerfacecolor=POS_COLOR, markeredgecolor=PROTO_EDGE, markersize=5.8),
+        Line2D([0], [0], marker="o", color="w", label="Vanilla ghost", markerfacecolor="#9A9A9A", markeredgecolor="#9A9A9A", markersize=5.5, alpha=0.30),
+        Line2D([0], [0], marker="D", color="w", label="P+ proto", markerfacecolor="none", markeredgecolor=POS_COLOR, markersize=5.5),
+        Line2D([0], [0], marker="^", color="w", label="P- proto", markerfacecolor="none", markeredgecolor=NEG_COLORS[0], markersize=5.5),
+        Line2D([0], [0], color="#555555", label="Vanilla -> model", linestyle="--", linewidth=1.05),
     ]
     return handles, [h.get_label() for h in handles]
+
+
+def footer_metric_line(model_label: str, metrics: Mapping[str, Any]) -> str:
+    return (
+        f"{model_label}: "
+        f"pos={float(metrics['positive_score']):.3f}  "
+        f"neg={float(metrics['hard_negative_score']):.3f}  "
+        f"m={float(metrics['margin']):+.3f}"
+    )
+
+
+def draw_footer_metrics(fig: Any, metric_grid: Any, metrics_by_model: Mapping[str, Mapping[str, Any]]) -> List[str]:
+    order = [("vanilla", "Vanilla CLIP"), ("host", "Host"), ("iapr", "IAPR")]
+    lines: List[str] = []
+    for col, (key, label) in enumerate(order):
+        ax = fig.add_subplot(metric_grid[0, col])
+        ax.axis("off")
+        line = footer_metric_line(label, metrics_by_model[key])
+        lines.append(line)
+        ax.text(
+            0.5,
+            0.52,
+            line,
+            ha="center",
+            va="center",
+            fontsize=6.9,
+            family="monospace",
+            color="#333333",
+            bbox={"boxstyle": "round,pad=0.18", "facecolor": "#FAFAFA", "edgecolor": "#DDDDDD", "alpha": 0.82},
+        )
+    return lines
+
+
+def draw_footer_legend(fig: Any, legend_spec: Any) -> None:
+    ax = fig.add_subplot(legend_spec)
+    ax.axis("off")
+    handles, labels_text = legend_handles()
+    ax.legend(
+        handles,
+        labels_text,
+        loc="center",
+        ncol=len(handles),
+        frameon=False,
+        fontsize=6.4,
+        handlelength=1.05,
+        handletextpad=0.35,
+        columnspacing=0.85,
+        borderpad=0.0,
+        labelspacing=0.15,
+    )
 
 
 def build_row_panels(
@@ -1666,7 +1735,8 @@ def build_repair_panels(
                     f"visual_proto_pid_{pid}_slot_{local_slot}",
                     "D" if is_positive_pid else "^",
                     color,
-                    size=58,
+                    size=62,
+                    alpha=0.82,
                     hollow=True,
                     annotate=("P+" if is_positive_pid else "P-") if slot_index == 0 else "",
                     metadata={"pid": int(pid), "local_slot": int(local_slot), "global_index": int(global_idx)},
@@ -1679,7 +1749,8 @@ def build_repair_panels(
                     f"text_proto_pid_{pid}_slot_{local_slot}",
                     "D" if is_positive_pid else "^",
                     color,
-                    size=58,
+                    size=62,
+                    alpha=0.82,
                     hollow=True,
                     annotate=("P+" if is_positive_pid else "P-") if slot_index == 0 else "",
                     metadata={"pid": int(pid), "local_slot": int(local_slot), "global_index": int(global_idx)},
@@ -1689,17 +1760,17 @@ def build_repair_panels(
     def visual_state_points(model_key: str) -> List[PointSpec]:
         state = states[model_key]
         return [
-            PointSpec(state["query_visual_anchor"], "query_t2v_anchor", f"visual_{model_key}_query_anchor", "*", QUERY_COLOR, size=132, annotate="q"),
-            PointSpec(state["positive_visual"], "positive_visual_centroid", f"visual_{model_key}_positive_centroid", "o", POS_COLOR, size=74, annotate="pos"),
-            PointSpec(state["hard_negative_visual"], "hard_negative_visual_centroid", f"visual_{model_key}_hard_negative_centroid", "x", neg_color, size=78, annotate="hard neg"),
+            PointSpec(state["query_visual_anchor"], "query_t2v_anchor", f"visual_{model_key}_query_anchor", "*", QUERY_COLOR, size=142, alpha=0.86, annotate="q"),
+            PointSpec(state["positive_visual"], "positive_visual_centroid", f"visual_{model_key}_positive_centroid", "o", POS_COLOR, size=82, alpha=0.82, annotate="pos"),
+            PointSpec(state["hard_negative_visual"], "hard_negative_visual_centroid", f"visual_{model_key}_hard_negative_centroid", "x", neg_color, size=84, alpha=0.82, annotate="hard neg"),
         ]
 
     def text_state_points(model_key: str) -> List[PointSpec]:
         state = states[model_key]
         return [
-            PointSpec(state["query_text"], "query_text", f"text_{model_key}_query", "*", QUERY_COLOR, size=132, annotate="q"),
-            PointSpec(state["positive_text_anchor"], "positive_image_mode_anchor_centroid", f"text_{model_key}_positive_image_anchor_centroid", "o", POS_COLOR, size=74, annotate="pos"),
-            PointSpec(state["hard_negative_text_anchor"], "hard_negative_image_mode_anchor_centroid", f"text_{model_key}_hard_negative_image_anchor_centroid", "x", neg_color, size=78, annotate="hard neg"),
+            PointSpec(state["query_text"], "query_text", f"text_{model_key}_query", "*", QUERY_COLOR, size=142, alpha=0.86, annotate="q"),
+            PointSpec(state["positive_text_anchor"], "positive_image_mode_anchor_centroid", f"text_{model_key}_positive_image_anchor_centroid", "o", POS_COLOR, size=82, alpha=0.82, annotate="pos"),
+            PointSpec(state["hard_negative_text_anchor"], "hard_negative_image_mode_anchor_centroid", f"text_{model_key}_hard_negative_image_anchor_centroid", "x", neg_color, size=84, alpha=0.82, annotate="hard neg"),
         ]
 
     visual_by_model = {key: visual_state_points(key) for key, _display, _ctx in model_specs}
@@ -1707,16 +1778,16 @@ def build_repair_panels(
 
     def visual_arrows(target_key: str) -> List[ArrowSpec]:
         return [
-            ArrowSpec("visual_vanilla_query_anchor", f"visual_{target_key}_query_anchor", "#555555", linestyle="--", linewidth=1.15, alpha=0.72),
-            ArrowSpec("visual_vanilla_positive_centroid", f"visual_{target_key}_positive_centroid", POS_COLOR, linestyle="--", linewidth=1.25, alpha=0.80),
-            ArrowSpec("visual_vanilla_hard_negative_centroid", f"visual_{target_key}_hard_negative_centroid", neg_color, linestyle="--", linewidth=1.25, alpha=0.80),
+            ArrowSpec("visual_vanilla_query_anchor", f"visual_{target_key}_query_anchor", "#555555", linestyle="--", linewidth=1.05, alpha=0.58),
+            ArrowSpec("visual_vanilla_positive_centroid", f"visual_{target_key}_positive_centroid", POS_COLOR, linestyle="--", linewidth=1.10, alpha=0.66),
+            ArrowSpec("visual_vanilla_hard_negative_centroid", f"visual_{target_key}_hard_negative_centroid", neg_color, linestyle="--", linewidth=1.10, alpha=0.66),
         ]
 
     def text_arrows(target_key: str) -> List[ArrowSpec]:
         return [
-            ArrowSpec("text_vanilla_query", f"text_{target_key}_query", "#555555", linestyle="--", linewidth=1.15, alpha=0.72),
-            ArrowSpec("text_vanilla_positive_image_anchor_centroid", f"text_{target_key}_positive_image_anchor_centroid", POS_COLOR, linestyle="--", linewidth=1.25, alpha=0.80),
-            ArrowSpec("text_vanilla_hard_negative_image_anchor_centroid", f"text_{target_key}_hard_negative_image_anchor_centroid", neg_color, linestyle="--", linewidth=1.25, alpha=0.80),
+            ArrowSpec("text_vanilla_query", f"text_{target_key}_query", "#555555", linestyle="--", linewidth=1.05, alpha=0.58),
+            ArrowSpec("text_vanilla_positive_image_anchor_centroid", f"text_{target_key}_positive_image_anchor_centroid", POS_COLOR, linestyle="--", linewidth=1.10, alpha=0.66),
+            ArrowSpec("text_vanilla_hard_negative_image_anchor_centroid", f"text_{target_key}_hard_negative_image_anchor_centroid", neg_color, linestyle="--", linewidth=1.10, alpha=0.66),
         ]
 
     def metrics_for(model_key: str) -> str:
@@ -1849,7 +1920,7 @@ def draw_thumbnail_axis(ax: Any, record: MutableMapping[str, Any], title: str) -
     ax.set_xticks([])
     ax.set_yticks([])
     for spine in ax.spines.values():
-        spine.set_linewidth(0.6)
+        spine.set_linewidth(0.45)
         spine.set_edgecolor("#CCCCCC")
     path = str(record.get("path", ""))
     try:
@@ -1861,8 +1932,8 @@ def draw_thumbnail_axis(ax: Any, record: MutableMapping[str, Any], title: str) -
     except Exception as exc:  # keep the figure even when a local thumbnail cannot be opened
         record["loaded"] = False
         record["load_error"] = str(exc)
-        ax.text(0.5, 0.5, "thumbnail\nunavailable", ha="center", va="center", fontsize=6.5, color="#777777")
-    ax.set_title(title, fontsize=7.0, pad=2.0)
+        ax.text(0.5, 0.5, "thumbnail\nunavailable", ha="center", va="center", fontsize=5.4, color="#777777")
+    ax.set_title(title, fontsize=5.7, pad=1.2)
 
 
 def draw_thumbnail_strip(
@@ -1879,7 +1950,7 @@ def draw_thumbnail_strip(
     query_pid = int(candidate["query_pid"])
     hard_negative_pid = int(candidate["hard_negative_pid"])
     status = "fully repaired" if bool(candidate.get("fully_repaired")) else "improved, not fully repaired"
-    query_text = textwrap.fill(truncate_text(str(candidate["query_text"]), chars=100), width=42, break_long_words=False)
+    query_text = textwrap.fill(truncate_text(str(candidate["query_text"]), chars=82), width=45, break_long_words=False)
 
     ax_text = fig.add_subplot(thumb_grid[0, 0])
     ax_text.axis("off")
@@ -1889,8 +1960,8 @@ def draw_thumbnail_strip(
         f"q={query_index}  pid={query_pid}  hpid={hard_negative_pid}\n{status}\n{query_text}",
         ha="left",
         va="top",
-        fontsize=8.0,
-        linespacing=1.18,
+        fontsize=6.2,
+        linespacing=1.05,
     )
 
     items: List[Tuple[str, int, str]] = []
@@ -1913,7 +1984,7 @@ def draw_thumbnail_strip(
         thumbnail_records.append(dict(record))
 
     return {
-        "query_text_truncated": truncate_text(str(candidate["query_text"]), chars=100),
+        "query_text_truncated": truncate_text(str(candidate["query_text"]), chars=82),
         "status_text": status,
         "items": thumbnail_records,
     }
@@ -2087,20 +2158,21 @@ def render_case(
         "text row: Vanilla + Host + IAPR text-space state points and fixed IAPR text prototypes",
     )
 
-    fig = plt.figure(figsize=(10.8, 7.1), constrained_layout=False)
+    fig = plt.figure(figsize=(11.3, 7.8), constrained_layout=False)
     outer = GridSpec(
-        2,
+        4,
         1,
         figure=fig,
-        height_ratios=[0.92, 4.35],
-        hspace=0.18,
-        top=0.90,
-        bottom=0.12,
-        left=0.055,
-        right=0.985,
+        height_ratios=[0.42, 6.05, 0.38, 0.22],
+        hspace=0.055,
+        top=0.915,
+        bottom=0.045,
+        left=0.042,
+        right=0.990,
     )
-    thumb_grid = outer[0].subgridspec(1, 7, width_ratios=[2.35, 1, 1, 1, 1, 1, 1], wspace=0.18)
-    panel_grid = outer[1].subgridspec(2, 3, wspace=0.09, hspace=0.22)
+    thumb_grid = outer[0].subgridspec(1, 7, width_ratios=[2.10, 1, 1, 1, 1, 1, 1], wspace=0.12)
+    panel_grid = outer[1].subgridspec(2, 3, wspace=0.045, hspace=0.115)
+    metric_grid = outer[2].subgridspec(1, 3, wspace=0.06)
 
     thumbnail_meta = draw_thumbnail_strip(fig, thumb_grid, candidate, split_data, gallery_pids, sim_host, sim_iapr, sim_vanilla=sim_vanilla)
 
@@ -2117,6 +2189,9 @@ def render_case(
         ax = fig.add_subplot(panel_grid[1, col])
         panel_projection_meta["text_row"]["panels"].append(draw_panel_with_shared_projection(ax, panel, text_projection))
 
+    footer_metric_lines = draw_footer_metrics(fig, metric_grid, retrieval_metrics_by_model)
+    draw_footer_legend(fig, outer[3])
+
     status = "fully repaired" if bool(candidate.get("fully_repaired")) else "improved, not fully repaired"
     vanilla_margin = float(retrieval_metrics_by_model["vanilla"]["margin"])
     host_margin = float(retrieval_metrics_by_model["host"]["margin"])
@@ -2125,13 +2200,10 @@ def render_case(
     fig.suptitle(
         f"Dual-Space Local Repair: Vanilla / Host / IAPR | q={query_index}, pid={query_pid}, hn={hard_negative_pid} | "
         f"m V={vanilla_margin:+.3f}, H={host_margin:+.3f}, I={iapr_margin:+.3f}, dIH={delta_iapr_host:+.3f} | {status}",
-        fontsize=9.4,
+        fontsize=9.1,
         fontweight="bold",
-        y=0.975,
+        y=0.982,
     )
-
-    handles, labels_text = legend_handles()
-    fig.legend(handles, labels_text, loc="lower center", ncol=6, frameon=False, fontsize=7.1, bbox_to_anchor=(0.5, 0.012))
 
     pdf_path = output_dir / f"case_{case_id:03d}_dual_space_repair.pdf"
     png_path = output_dir / f"case_{case_id:03d}_dual_space_repair.png"
@@ -2160,6 +2232,7 @@ def render_case(
         "iapr_positive_score": float(retrieval_metrics_by_model["iapr"]["positive_score"]),
         "iapr_hard_negative_score": float(retrieval_metrics_by_model["iapr"]["hard_negative_score"]),
         "retrieval_metrics": retrieval_metrics_by_model,
+        "footer_metric_lines": footer_metric_lines,
         "selected_positive_images": [image_record(idx, split_data, gallery_pids, sim_host, sim_iapr, query_index, sim_vanilla=sim_vanilla) for idx in selected_positive],
         "selected_hard_negative_images": [image_record(idx, split_data, gallery_pids, sim_host, sim_iapr, query_index, sim_vanilla=sim_vanilla) for idx in selected_negative],
         "iapr_top_retrieved_images": [
