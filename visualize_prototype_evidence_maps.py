@@ -75,6 +75,9 @@ class ScoreRecord:
     pid: int
     sample_index: int
     contribution_score: float
+    mean_contribution: float
+    max_contribution: float
+    contribution_evenness: float
     attention_concentration: float
     inter_prototype_diversity: float
     visual_entropy: float
@@ -100,7 +103,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample_indices", nargs="*", type=int, default=None)
     p.add_argument("--prototype_per_id", type=int, default=None, help="Number of identity-owned slots to render per sample.")
     p.add_argument("--max_prototypes_per_id", type=int, default=None)
-    p.add_argument("--top_tokens", type=int, default=8)
+    p.add_argument("--contribution_reduction", default="max", choices=["max", "mean", "evenness"], help="How to aggregate identity-slot contribution for sample scoring. Use evenness to prefer balanced prototype activity.")
+    p.add_argument("--min_contribution", type=float, default=None, help="Keep only pairs whose selected contribution score is at least this value.")
+    p.add_argument("--min_mean_contribution", type=float, default=None, help="Keep only pairs whose mean identity-slot contribution is at least this value. For normalized slot-softmax contribution this is approximately 1/K.")
+    p.add_argument("--min_contribution_evenness", type=float, default=None, help="Keep only pairs whose normalized entropy over prototype-slot contribution is at least this value; 1.0 means uniform slots.")
+    p.add_argument("--max_contribution_peak", type=float, default=None, help="Keep only pairs whose maximum prototype-slot contribution is at most this value; useful for balanced examples.")
+    p.add_argument("--top_tokens", type=int, default=8, help="Number of highest-evidence caption tokens to highlight in the token strip and export in CSV/JSON.")
     p.add_argument("--image_size", type=int, default=160)
     p.add_argument("--alpha", type=float, default=0.45)
     p.add_argument("--seed", type=int, default=42)
@@ -618,20 +626,47 @@ def pairwise_diversity(matrix: torch.Tensor, mask: Optional[torch.Tensor] = None
     return float(np.mean(vals)) if vals else 0.0
 
 
-def score_one(evidence: Mapping[str, Any], batch_index: int, pair_pos: int, pair: PairSample) -> ScoreRecord:
+def score_one(evidence: Mapping[str, Any], batch_index: int, pair_pos: int, pair: PairSample, args: argparse.Namespace) -> ScoreRecord:
     slot_mask = evidence["prototype_slot_mask"][batch_index].bool()
     visual = evidence["visual_attention"][batch_index][slot_mask]
     text = evidence["text_attention"][batch_index][slot_mask]
     visual_mask = evidence.get("visual_token_mask", torch.ones(visual.shape[-1], dtype=torch.bool))[batch_index].bool()
     text_mask = evidence.get("text_token_mask", torch.ones(text.shape[-1], dtype=torch.bool))[batch_index].bool()
     contribution = evidence.get("contribution")
-    contribution_score = safe_float(contribution[batch_index][slot_mask].max().item()) if torch.is_tensor(contribution) and slot_mask.any() else 0.0
+    if torch.is_tensor(contribution) and slot_mask.any():
+        contribution_values = contribution[batch_index][slot_mask]
+        max_contribution = safe_float(contribution_values.max().item())
+        mean_contribution = safe_float(contribution_values.mean().item())
+        contribution_evenness = normalized_entropy(contribution_values)
+    else:
+        max_contribution = 0.0
+        mean_contribution = 0.0
+        contribution_evenness = 0.0
+    if args.contribution_reduction == "mean":
+        contribution_score = mean_contribution
+    elif args.contribution_reduction == "evenness":
+        contribution_score = contribution_evenness
+    else:
+        contribution_score = max_contribution
     visual_entropy = float(np.mean([normalized_entropy(visual[k], visual_mask) for k in range(visual.shape[0])])) if visual.shape[0] else 1.0
     text_entropy = float(np.mean([normalized_entropy(text[k], text_mask) for k in range(text.shape[0])])) if text.shape[0] else 1.0
     concentration = max(0.0, 1.0 - 0.5 * (visual_entropy + text_entropy))
     diversity = 0.5 * (pairwise_diversity(visual, visual_mask) + pairwise_diversity(text, text_mask))
     evidence_score = float(contribution_score + concentration + diversity)
-    return ScoreRecord(int(pair_pos), int(pair.pid), int(pair.sample_index), contribution_score, concentration, diversity, visual_entropy, text_entropy, evidence_score)
+    return ScoreRecord(
+        pair_pos=int(pair_pos),
+        pid=int(pair.pid),
+        sample_index=int(pair.sample_index),
+        contribution_score=contribution_score,
+        mean_contribution=mean_contribution,
+        max_contribution=max_contribution,
+        contribution_evenness=contribution_evenness,
+        attention_concentration=concentration,
+        inter_prototype_diversity=diversity,
+        visual_entropy=visual_entropy,
+        text_entropy=text_entropy,
+        evidence_score=evidence_score,
+    )
 
 
 @torch.inference_mode()
@@ -648,16 +683,29 @@ def score_pairs(model: torch.nn.Module, pairs: Sequence[PairSample], args: argpa
         if "visual_attention" not in evidence or "text_attention" not in evidence:
             raise RuntimeError("Prototype evidence extraction failed: expected visual_attention and text_attention tensors were missing. This script does not fall back to cosine nearest-neighbor retrieval.")
         for row, pair_pos in enumerate(batch["pair_pos"].tolist()):
-            records.append(score_one(evidence, row, int(pair_pos), pairs[int(pair_pos)]))
-    logger.log(f"Scored {len(records)} candidate pairs with contribution + concentration + diversity.")
+            records.append(score_one(evidence, row, int(pair_pos), pairs[int(pair_pos)], args))
+    logger.log(f"Scored {len(records)} candidate pairs with {args.contribution_reduction} contribution + concentration + diversity.")
     return records, first_shapes
 
 
 def select_records(records: Sequence[ScoreRecord], args: argparse.Namespace) -> List[ScoreRecord]:
+    filtered = list(records)
+    if args.min_mean_contribution is not None:
+        threshold = float(args.min_mean_contribution)
+        filtered = [r for r in filtered if r.mean_contribution >= threshold]
+    if args.min_contribution_evenness is not None:
+        threshold = float(args.min_contribution_evenness)
+        filtered = [r for r in filtered if r.contribution_evenness >= threshold]
+    if args.max_contribution_peak is not None:
+        threshold = float(args.max_contribution_peak)
+        filtered = [r for r in filtered if r.max_contribution <= threshold]
+    if args.min_contribution is not None:
+        threshold = float(args.min_contribution)
+        filtered = [r for r in filtered if r.contribution_score >= threshold]
     if args.sample_indices:
         order = {int(v): i for i, v in enumerate(args.sample_indices)}
-        return sorted(records, key=lambda r: order.get(r.sample_index, 10**9))
-    return sorted(records, key=lambda r: (r.evidence_score, r.attention_concentration, r.inter_prototype_diversity), reverse=True)[: max(0, int(args.num_pairs))]
+        return sorted(filtered, key=lambda r: order.get(r.sample_index, 10**9))[: max(0, int(args.num_pairs))]
+    return sorted(filtered, key=lambda r: (r.evidence_score, r.attention_concentration, r.inter_prototype_diversity), reverse=True)[: max(0, int(args.num_pairs))]
 
 
 def image_display_size(args: argparse.Namespace) -> Tuple[int, int]:
@@ -969,8 +1017,14 @@ def main() -> None:
             raise RuntimeError("No candidate image-text pairs overlap with the loaded prototype PIDs.")
         records, evidence_shapes = score_pairs(model, pairs, args, render_k, device, logger)
         selected_scores = select_records(records, args)
+        logger.log(
+            f"Selected {len(selected_scores)} / {len(records)} pairs after contribution filters "
+            f"(reduction={args.contribution_reduction}, min_contribution={args.min_contribution}, "
+            f"min_mean_contribution={args.min_mean_contribution}, "
+            f"min_evenness={args.min_contribution_evenness}, max_peak={args.max_contribution_peak})."
+        )
         if not selected_scores:
-            raise RuntimeError("No pairs selected for rendering.")
+            raise RuntimeError("No pairs selected for rendering. Loosen --min_contribution/--min_mean_contribution or inspect logs.txt.")
         selected_pairs = [pairs[r.pair_pos] for r in selected_scores]
         logger.log("Selected samples: " + ", ".join(f"pid={p.pid}/sample={p.sample_index}" for p in selected_pairs))
         rows, fig_paths, fig_meta, raw_items = render_selected(model, selected_pairs, selected_scores, args, render_k, outdir, device, logger)
@@ -1007,7 +1061,11 @@ def main() -> None:
             "evidence_shapes": evidence_shapes,
             "scoring": {
                 "formula": "contribution_score + attention_concentration + inter_prototype_diversity",
-                "contribution_score": "max diagnostic identity-slot contribution; no learned gate is present",
+                "contribution_reduction": args.contribution_reduction,
+                "min_contribution": args.min_contribution,
+                "min_mean_contribution": args.min_mean_contribution,
+                "contribution_score": "diagnostic identity-slot contribution reduced by --contribution_reduction; no learned gate is present",
+                "mean_contribution_note": "For normalized slot-softmax contribution, mean contribution is approximately 1 / rendered_prototypes_per_id when all slots are valid.",
                 "attention_concentration": "1 - mean normalized entropy over visual/text evidence",
                 "inter_prototype_diversity": "mean pairwise JS divergence over visual/text evidence maps",
             },
