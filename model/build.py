@@ -256,6 +256,173 @@ class ITSELF(nn.Module):
             return features["i_grab_f"], features["t_grab_f"]
         return features["i_feats"], features["t_feats"]
 
+    def _diagnostic_layer_attention(self, attentions):
+        head_averaged = [a.mean(dim=1) if a.ndim == 4 else a for a in attentions]
+        if not getattr(self.args, "return_all", False):
+            return head_averaged[-1], "last_layer"
+
+        topk_type = getattr(self.args, "topk_type", "mean")
+        stacked = torch.stack(head_averaged, dim=0)
+        if topk_type == "mean":
+            return stacked.mean(0), "mean_layer"
+        if topk_type == "std":
+            return stacked.std(0, unbiased=False), "std_layer"
+        if topk_type == "layer_index" and getattr(self.args, "layer_index", None) is not None:
+            idx = int(getattr(self.args, "layer_index"))
+            idx = max(-len(head_averaged), min(len(head_averaged) - 1, idx))
+            return head_averaged[idx], f"layer_{idx}"
+        if topk_type == "custom":
+            return self.rollout(stacked), "rollout"
+        return head_averaged[-1], "last_layer"
+
+    @staticmethod
+    def _diagnostic_topk_count(total_tokens, special_tokens, ratio, current_step=None):
+        usable = max(int(total_tokens) - int(special_tokens), 1)
+        if current_step is not None:
+            ratio_start = 0.65
+            ratio_end = 0.5
+            total_steps = 10 * 145
+            current_step = min(max(int(current_step), 1), total_steps)
+            progress = current_step / total_steps
+            k = int(usable * ratio_start * ((ratio_end / ratio_start) ** progress))
+        else:
+            k = int(usable * float(ratio))
+        return max(1, min(usable, k))
+
+    def _visual_evidence_prior(self, attention, use_local, current_step=None):
+        bsz, ntokens, _ = attention.shape
+        scores = attention[:, 0, :].float().clone()
+        scores[:, 0] = 0.0
+        prior = scores[:, 1:].clamp_min(0.0)
+        mask = torch.ones((bsz, ntokens - 1), device=attention.device, dtype=torch.bool)
+        if use_local:
+            ratio = getattr(getattr(self, "visul_emb_layer", None), "ratio", getattr(self.args, "select_ratio", 0.4))
+            k = self._diagnostic_topk_count(ntokens, 1, ratio, current_step=current_step)
+            top_idx = scores.topk(dim=-1, k=k).indices
+            full_mask = torch.zeros_like(scores, dtype=torch.bool)
+            full_mask.scatter_(1, top_idx, True)
+            mask = full_mask[:, 1:]
+            prior = prior * mask.to(dtype=prior.dtype)
+        return prior, mask
+
+    def _text_evidence_prior(self, attention, caption_ids, use_local, current_step=None):
+        bsz, ntokens, _ = attention.shape
+        text_mask = caption_ids.ne(0)
+        eot = caption_ids.argmax(dim=-1)
+        rows = torch.arange(bsz, device=attention.device)
+        scores = attention[rows, eot, :].float().clone()
+        scores[:, 0] = 0.0
+        scores[rows, eot] = 0.0
+        token_mask = text_mask.bool().clone()
+        token_mask[:, 0] = False
+        token_mask[rows, eot] = False
+        prior = scores.clamp_min(0.0) * token_mask.to(dtype=scores.dtype)
+        if use_local:
+            ratio = getattr(getattr(self, "texual_emb_layer", None), "ratio", getattr(self.args, "select_ratio", 0.4))
+            k = self._diagnostic_topk_count(ntokens, 2, ratio, current_step=current_step)
+            masked_scores = scores.masked_fill(~token_mask, float("-inf"))
+            top_idx = masked_scores.topk(dim=-1, k=k).indices
+            top_mask = torch.zeros_like(token_mask)
+            top_mask.scatter_(1, top_idx, True)
+            token_mask = token_mask & top_mask
+            prior = prior * token_mask.to(dtype=prior.dtype)
+        return prior, token_mask
+
+    def _visual_tokens_for_prototype_evidence(self, image_tokens):
+        patch_tokens = image_tokens[:, 1:, :].float()
+        branch = getattr(self, "prototype_branch", None)
+        if branch is not None and branch.use_local and not self.args.only_global:
+            layer = self.visul_emb_layer
+            patch_tokens = l2norm(patch_tokens, dim=-1)
+            dtype = layer.fc.weight.dtype
+            patch_tokens = patch_tokens.to(dtype=dtype)
+            return (layer.mlp(patch_tokens) + layer.fc(patch_tokens)).float()
+        return patch_tokens
+
+    def _text_tokens_for_prototype_evidence(self, text_tokens):
+        token_features = text_tokens.float()
+        branch = getattr(self, "prototype_branch", None)
+        if branch is not None and branch.use_local and not self.args.only_global:
+            layer = self.texual_emb_layer
+            token_features = l2norm(token_features, dim=-1)
+            dtype = layer.linear.weight.dtype
+            token_features = token_features.to(dtype=dtype)
+            return (layer.mlp(token_features) + layer.linear(token_features)).float()
+        return token_features
+
+    @torch.no_grad()
+    def collect_prototype_evidence(
+        self,
+        batch,
+        current_step=None,
+        max_prototypes_per_id=None,
+        include_raw_heads=False,
+    ):
+        branch = getattr(self, "prototype_branch", None)
+        if branch is None:
+            raise RuntimeError("Prototype evidence requested, but the model has no prototype branch.")
+        if not branch.is_ready():
+            raise RuntimeError("Prototype evidence requested, but the prototype bank is not initialized/loaded.")
+
+        images = batch["images"]
+        caption_ids = batch["caption_ids"].long()
+        pids = batch["pids"].long()
+        image_tokens, image_attentions = self.base_model.encode_image_all_atten(
+            images,
+            average_attn_weights=not include_raw_heads,
+        )
+        text_tokens, text_attentions = self.base_model.encode_text_all_atten(
+            caption_ids,
+            average_attn_weights=not include_raw_heads,
+        )
+        image_attention, image_attention_source = self._diagnostic_layer_attention(image_attentions)
+        text_attention, text_attention_source = self._diagnostic_layer_attention(text_attentions)
+
+        image_feats = image_tokens[:, 0, :].float()
+        rows = torch.arange(text_tokens.shape[0], device=text_tokens.device)
+        text_feats = text_tokens[rows, caption_ids.argmax(dim=-1)].float()
+        features = {"i_feats": image_feats, "t_feats": text_feats}
+        use_local = bool(branch.use_local and not self.args.only_global)
+        if use_local:
+            features["i_grab_f"] = self.visul_emb_layer(image_tokens, image_attention.clone(), current_step).float()
+            features["t_grab_f"] = self.texual_emb_layer(text_tokens, caption_ids, text_attention.clone(), current_step).float()
+
+        proto_image_feats, proto_text_feats = self._select_prototype_features(features)
+        use_local = bool(branch.use_local and not self.args.only_global)
+        visual_prior, visual_mask = self._visual_evidence_prior(image_attention, use_local, current_step=current_step)
+        text_prior, text_mask = self._text_evidence_prior(text_attention, caption_ids, use_local, current_step=current_step)
+        evidence = branch.evidence(
+            proto_image_feats,
+            proto_text_feats,
+            pids,
+            image_token_features=self._visual_tokens_for_prototype_evidence(image_tokens),
+            text_token_features=self._text_tokens_for_prototype_evidence(text_tokens),
+            image_attention_prior=visual_prior,
+            text_attention_prior=text_prior,
+            image_token_mask=visual_mask,
+            text_token_mask=text_mask,
+            max_prototypes_per_id=max_prototypes_per_id,
+        )
+        visual = getattr(self.base_model, "visual", None)
+        evidence.update({
+            "visual_token_mask": visual_mask.detach(),
+            "text_token_mask": text_mask.detach(),
+            "image_attention_prior": visual_prior.detach(),
+            "text_attention_prior": text_prior.detach(),
+            "image_grid": (
+                int(getattr(visual, "num_y", 0) or 0),
+                int(getattr(visual, "num_x", 0) or 0),
+            ),
+            "prototype_feature_source": "local" if use_local else "global",
+            "image_attention_source": image_attention_source,
+            "text_attention_source": text_attention_source,
+        })
+        if include_raw_heads:
+            evidence["raw_image_attentions"] = [a.detach() for a in image_attentions]
+            evidence["raw_text_attentions"] = [a.detach() for a in text_attentions]
+        return evidence
+
+
     @torch.no_grad()
     def extract_prototype_features(self, batch, current_step=None):
         features = self._compute_host_embeddings(batch['images'], batch['caption_ids'], current_step=current_step)

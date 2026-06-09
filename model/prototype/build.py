@@ -191,6 +191,154 @@ class PrototypeBranch(nn.Module):
         text_features = F.normalize(self.text_projector(text_features), p=2, dim=1)
         return image_features, text_features
 
+    def _project_token_sequence(self, token_features, projector, name):
+        if token_features is None:
+            return None
+        if token_features.ndim != 3:
+            raise ValueError(f"{name} token evidence expects a 3D tensor, got shape={tuple(token_features.shape)}")
+        if token_features.shape[-1] != self.feature_dim:
+            raise ValueError(
+                f"{name} token evidence feature_dim mismatch: tokens have dim={token_features.shape[-1]}, "
+                f"prototype branch expects dim={self.feature_dim}"
+            )
+        projector.float()
+        device = _first_device(self, token_features.device)
+        token_features = token_features.to(device=device, dtype=torch.float32, non_blocking=True)
+        bsz, ntokens, _ = token_features.shape
+        projected = projector(token_features.reshape(bsz * ntokens, -1))
+        projected = projected.reshape(bsz, ntokens, self.prototype_dim)
+        return F.normalize(projected.float(), p=2, dim=-1)
+
+    def _prototype_banks_for_loss(self):
+        if getattr(self.args, "no_pbt", False):
+            return self.memory.text_prototypes, self.memory.image_prototypes, "text_prototypes", "image_prototypes"
+        return self.memory.text_to_image, self.memory.image_to_text, "text_to_image", "image_to_text"
+
+    def _identity_slot_indices(self, pids, max_prototypes_per_id=None):
+        pids = pids.detach().long().cpu().tolist()
+        proto_pids = self.memory.proto_pids.detach().cpu().long()
+        slots = []
+        for pid in pids:
+            idx = (proto_pids == int(pid)).nonzero(as_tuple=False).flatten().tolist()
+            if max_prototypes_per_id is not None:
+                idx = idx[: int(max_prototypes_per_id)]
+            slots.append(idx)
+        width = max((len(x) for x in slots), default=0)
+        if width <= 0:
+            raise RuntimeError("No identity-owned prototype slots found for the requested pids.")
+        device = self.memory.proto_pids.device
+        indices = torch.full((len(slots), width), -1, device=device, dtype=torch.long)
+        mask = torch.zeros((len(slots), width), device=device, dtype=torch.bool)
+        for row, idx in enumerate(slots):
+            if not idx:
+                continue
+            values = torch.tensor(idx, device=device, dtype=torch.long)
+            indices[row, : values.numel()] = values
+            mask[row, : values.numel()] = True
+        return indices, mask
+
+    @staticmethod
+    def _masked_token_softmax(scores, token_mask=None, slot_mask=None, prior=None, eps=1e-8):
+        if token_mask is None:
+            token_mask = torch.ones(scores.shape[0], scores.shape[-1], device=scores.device, dtype=torch.bool)
+        else:
+            token_mask = token_mask.to(device=scores.device, dtype=torch.bool)
+        if slot_mask is None:
+            slot_mask = torch.ones(scores.shape[0], scores.shape[1], device=scores.device, dtype=torch.bool)
+        else:
+            slot_mask = slot_mask.to(device=scores.device, dtype=torch.bool)
+
+        valid = slot_mask.unsqueeze(-1) & token_mask.unsqueeze(1)
+        if prior is not None:
+            prior = prior.to(device=scores.device, dtype=scores.dtype).clamp_min(0.0)
+            prior = prior * token_mask.to(dtype=scores.dtype)
+            prior_sum = prior.sum(dim=-1, keepdim=True)
+            uniform = token_mask.to(dtype=scores.dtype)
+            uniform = uniform / uniform.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            prior = torch.where(prior_sum > eps, prior / prior_sum.clamp_min(eps), uniform)
+            scores = scores + prior.clamp_min(eps).log().unsqueeze(1)
+
+        scores = scores.masked_fill(~valid, float("-inf"))
+        weights = torch.softmax(scores, dim=-1)
+        weights = torch.where(valid, weights, torch.zeros_like(weights))
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(eps)
+        return weights
+
+    @torch.no_grad()
+    def evidence(
+        self,
+        image_features,
+        text_features,
+        pids,
+        image_token_features=None,
+        text_token_features=None,
+        image_attention_prior=None,
+        text_attention_prior=None,
+        image_token_mask=None,
+        text_token_mask=None,
+        max_prototypes_per_id=None,
+    ):
+        """Collect prototype-conditioned diagnostic evidence without changing training forward outputs."""
+        image_features, text_features = self._project(image_features, text_features)
+        zero = image_features.sum() * 0.0
+        if not self.is_ready():
+            raise RuntimeError("Prototype evidence requested, but prototype memory is not initialized.")
+
+        image_token_features = self._project_token_sequence(image_token_features, self.image_projector, "visual")
+        text_token_features = self._project_token_sequence(text_token_features, self.text_projector, "text")
+        if image_token_features is None and text_token_features is None:
+            raise RuntimeError("Prototype evidence requested, but no visual or text token features were provided.")
+
+        slot_indices, slot_mask = self._identity_slot_indices(pids, max_prototypes_per_id=max_prototypes_per_id)
+        safe_slot_indices = slot_indices.clamp_min(0)
+        visual_bank, text_bank, visual_bank_key, text_bank_key = self._prototype_banks_for_loss()
+        visual_bank = F.normalize(visual_bank.to(image_features.device).float(), p=2, dim=1)
+        text_bank = F.normalize(text_bank.to(text_features.device).float(), p=2, dim=1)
+        visual_slots = visual_bank[safe_slot_indices.to(visual_bank.device)]
+        text_slots = text_bank[safe_slot_indices.to(text_bank.device)]
+
+        visual_slot_logits = torch.bmm(visual_slots, image_features.unsqueeze(-1)).squeeze(-1)
+        text_slot_logits = torch.bmm(text_slots, text_features.unsqueeze(-1)).squeeze(-1)
+        slot_logits = 0.5 * (visual_slot_logits.to(text_features.device) + text_slot_logits)
+        slot_logits = slot_logits.masked_fill(~slot_mask.to(slot_logits.device), float("-inf"))
+        tau = max(float(getattr(self.args, "prototype_tau", 0.05)), 1e-6)
+        contribution = torch.softmax(slot_logits / tau, dim=1)
+        contribution = torch.where(slot_mask.to(contribution.device), contribution, torch.zeros_like(contribution))
+        contribution = contribution / contribution.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+        ret = {
+            "prototype_indices": slot_indices.detach(),
+            "prototype_slot_mask": slot_mask.detach(),
+            "prototype_pids": self.memory.proto_pids[safe_slot_indices].detach(),
+            "gate": None,
+            "gate_available": False,
+            "contribution": contribution.detach(),
+            "slot_similarity": slot_logits.detach(),
+            "visual_bank_key": visual_bank_key,
+            "text_bank_key": text_bank_key,
+            "diagnostic_zero": zero.detach(),
+        }
+
+        scale = 1.0 / tau
+        if image_token_features is not None:
+            visual_scores = torch.einsum("bkd,bmd->bkm", visual_slots.to(image_token_features.device), image_token_features)
+            ret["visual_attention"] = self._masked_token_softmax(
+                visual_scores * scale,
+                token_mask=image_token_mask,
+                slot_mask=slot_mask,
+                prior=image_attention_prior,
+            ).detach()
+        if text_token_features is not None:
+            text_scores = torch.einsum("bkd,bld->bkl", text_slots.to(text_token_features.device), text_token_features)
+            ret["text_attention"] = self._masked_token_softmax(
+                text_scores * scale,
+                token_mask=text_token_mask,
+                slot_mask=slot_mask,
+                prior=text_attention_prior,
+            ).detach()
+        return ret
+
+
     @torch.no_grad()
     def initialize(self, image_features, text_features, pids):
         if self.needs_pca_init():
