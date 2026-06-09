@@ -1486,6 +1486,31 @@ def retrieval_metrics_for_query(
     }
 
 
+def rank1_summary(sim: torch.Tensor, query_pids: torch.Tensor, gallery_pids: torch.Tensor) -> Dict[str, Any]:
+    if sim.ndim != 2:
+        raise ValueError(f"R1 expects a 2D similarity matrix, got shape={tuple(sim.shape)}")
+    if int(sim.shape[0]) != int(query_pids.numel()):
+        raise ValueError("R1 similarity/query pid count mismatch")
+    if int(sim.shape[1]) != int(gallery_pids.numel()):
+        raise ValueError("R1 similarity/gallery pid count mismatch")
+    if sim.numel() == 0 or int(query_pids.numel()) == 0:
+        return {"R1": 0.0, "r1_percent": 0.0, "hits": 0, "num_queries": 0}
+    top_indices = torch.argmax(sim.float().cpu(), dim=1)
+    top_pids = gallery_pids.cpu().long()[top_indices]
+    hits = top_pids.eq(query_pids.cpu().long())
+    hit_count = int(hits.sum().item())
+    num_queries = int(hits.numel())
+    r1 = 100.0 * float(hit_count) / float(max(num_queries, 1))
+    return {"R1": r1, "r1_percent": r1, "hits": hit_count, "num_queries": num_queries}
+
+
+def print_rank1_summaries(metrics: Mapping[str, Mapping[str, Any]]) -> None:
+    print("[R1 before plotting]")
+    for key in ("vanilla", "host", "iapr"):
+        row = metrics[key]
+        print(f"  {key.capitalize():<8} R1={float(row['R1']):6.2f}% ({int(row['hits'])}/{int(row['num_queries'])})")
+
+
 def metric_box_text(model_label: str, metrics: Mapping[str, Any], vanilla_metrics: Optional[Mapping[str, Any]] = None) -> str:
     lines = [
         model_label,
@@ -2329,6 +2354,12 @@ def main() -> None:
     sim_vanilla = vanilla_retrieval.similarity().cpu()
     sim_host = host_retrieval.similarity().cpu()
     sim_iapr = iapr_retrieval.similarity().cpu()
+    rank1_before_plotting = {
+        "vanilla": rank1_summary(sim_vanilla, vanilla_retrieval.query_pids, vanilla_retrieval.gallery_pids),
+        "host": rank1_summary(sim_host, host_retrieval.query_pids, host_retrieval.gallery_pids),
+        "iapr": rank1_summary(sim_iapr, iapr_retrieval.query_pids, iapr_retrieval.gallery_pids),
+    }
+    print_rank1_summaries(rank1_before_plotting)
 
     diagnostic_projection_decision = "IAPR projection heads and IAPR prototype bank used as the common diagnostic space for Vanilla, Host, and IAPR features"
 
@@ -2469,6 +2500,7 @@ def main() -> None:
             "margin_formula": "max_positive_similarity - max_hard_negative_similarity",
             "note": "This follows the repository margin diagnostic convention.",
         },
+        "rank1_before_plotting": rank1_before_plotting,
         "model_architecture": {
             "only_global": bool(model_args.only_global),
             "prototype_feature": str(model_args.prototype_feature),
