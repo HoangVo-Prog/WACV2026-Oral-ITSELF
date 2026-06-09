@@ -189,6 +189,7 @@ class RetrievalBundle:
 
 @dataclass
 class RowContext:
+    key: str
     label: str
     projected: ProjectedBundle
     bank: PrototypeBankData
@@ -229,6 +230,13 @@ class ArrowSpec:
     linestyle: str = "-"
     linewidth: float = 1.5
     alpha: float = 0.85
+
+
+@dataclass
+class SharedProjectionResult:
+    coords_by_label: Dict[str, np.ndarray]
+    limits: Tuple[float, float, float, float]
+    metadata: Dict[str, Any]
 
 
 def parse_args() -> argparse.Namespace:
@@ -679,6 +687,22 @@ def build_loaded_model(
     return model, report, aux_report
 
 
+def build_vanilla_model(
+    label: str,
+    model_args: SimpleNamespace,
+    num_classes: int,
+    device: torch.device,
+) -> torch.nn.Module:
+    run_args = SimpleNamespace(**vars(model_args))
+    model = build_repo_model(run_args, num_classes=num_classes)
+    model.to(device)
+    if device.type == "cpu":
+        model.float()
+    model.eval()
+    print(f"[{label}] no fine-tuned checkpoint loaded")
+    return model
+
+
 def feature_tensor(output: Any, kind: str) -> torch.Tensor:
     if isinstance(output, (tuple, list)):
         output = output[0]
@@ -1067,17 +1091,65 @@ def local_project(points: Sequence[PointSpec], method: str) -> np.ndarray:
     return np.asarray(projected[:, :2], dtype=np.float64)
 
 
-def pad_limits(ax: Any, coords: np.ndarray) -> None:
+def unique_points_by_label(points: Sequence[PointSpec]) -> List[PointSpec]:
+    unique: List[PointSpec] = []
+    vectors_by_label: Dict[str, torch.Tensor] = {}
+    for point in points:
+        vector = point.vector.detach().float().cpu().view(-1)
+        previous = vectors_by_label.get(point.label)
+        if previous is not None:
+            if previous.shape != vector.shape or not torch.allclose(previous, vector, rtol=1e-4, atol=1e-5):
+                raise ValueError(f"point label {point.label!r} is reused for different vectors")
+            continue
+        vectors_by_label[point.label] = vector
+        unique.append(point)
+    return unique
+
+
+def coordinate_limits(coords: np.ndarray) -> Tuple[float, float, float, float]:
     if coords.size == 0:
-        ax.set_xlim(-1, 1)
-        ax.set_ylim(-1, 1)
-        return
+        return -1.0, 1.0, -1.0, 1.0
     mins = coords.min(axis=0)
     maxs = coords.max(axis=0)
     span = np.maximum(maxs - mins, 1e-3)
     pad = span * 0.16
-    ax.set_xlim(float(mins[0] - pad[0]), float(maxs[0] + pad[0]))
-    ax.set_ylim(float(mins[1] - pad[1]), float(maxs[1] + pad[1]))
+    return (
+        float(mins[0] - pad[0]),
+        float(maxs[0] + pad[0]),
+        float(mins[1] - pad[1]),
+        float(maxs[1] + pad[1]),
+    )
+
+
+def apply_limits(ax: Any, limits: Tuple[float, float, float, float]) -> None:
+    ax.set_xlim(float(limits[0]), float(limits[1]))
+    ax.set_ylim(float(limits[2]), float(limits[3]))
+
+
+def fit_shared_projection(points: Sequence[PointSpec], method: str, scope: str) -> SharedProjectionResult:
+    unique_points = unique_points_by_label(points)
+    coords = local_project(unique_points, method)
+    coords_by_label = {point.label: coords[index] for index, point in enumerate(unique_points)}
+    raw_vectors = np.stack([point.vector.detach().float().cpu().numpy() for point in unique_points], axis=0)
+    return SharedProjectionResult(
+        coords_by_label=coords_by_label,
+        limits=coordinate_limits(coords),
+        metadata={
+            "scope": scope,
+            "method": method,
+            "num_points": int(len(unique_points)),
+            "unique_points": int(vector_unique_count(raw_vectors)),
+            "point_labels": [point.label for point in unique_points],
+            "axis_limits": {
+                "x": [float(coordinate_limits(coords)[0]), float(coordinate_limits(coords)[1])],
+                "y": [float(coordinate_limits(coords)[2]), float(coordinate_limits(coords)[3])],
+            },
+        },
+    )
+
+
+def pad_limits(ax: Any, coords: np.ndarray) -> None:
+    apply_limits(ax, coordinate_limits(coords))
 
 
 def scatter_point(ax: Any, point: PointSpec, xy: np.ndarray) -> None:
@@ -1166,17 +1238,62 @@ def draw_panel(ax: Any, panel: PanelSpec, method: str) -> Dict[str, Any]:
     }
 
 
+def panel_points(panels: Sequence[PanelSpec]) -> List[PointSpec]:
+    points: List[PointSpec] = []
+    for panel in panels:
+        points.extend(panel.points)
+    return points
+
+
+def draw_panel_with_shared_projection(ax: Any, panel: PanelSpec, projection: SharedProjectionResult) -> Dict[str, Any]:
+    coords_for_panel: List[np.ndarray] = []
+    for point in panel.points:
+        if point.label not in projection.coords_by_label:
+            raise KeyError(f"point {point.label!r} is missing from the shared projection")
+        coords_for_panel.append(projection.coords_by_label[point.label])
+    coords = np.asarray(coords_for_panel, dtype=np.float64) if coords_for_panel else np.zeros((0, 2), dtype=np.float64)
+    coords_by_label = {point.label: projection.coords_by_label[point.label] for point in panel.points}
+    for arrow in panel.arrows:
+        draw_arrow(ax, arrow, coords_by_label)
+    for point, xy in zip(panel.points, coords):
+        scatter_point(ax, point, xy)
+    if panel.metric_text:
+        ax.text(
+            0.02,
+            0.02,
+            panel.metric_text,
+            transform=ax.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=6.6,
+            family="monospace",
+            bbox={"boxstyle": "round,pad=0.24", "facecolor": "white", "edgecolor": "#BBBBBB", "alpha": 0.88},
+        )
+    ax.set_title(panel.title, fontsize=9.6, fontweight="bold", pad=4.0)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    apply_limits(ax, projection.limits)
+    return {
+        "title": panel.title,
+        "num_points": int(len(panel.points)),
+        "point_labels": [point.label for point in panel.points],
+        "arrows": [arrow.__dict__ for arrow in panel.arrows],
+        "metric_text": panel.metric_text,
+    }
+
+
 def legend_handles() -> Tuple[List[Any], List[str]]:
     from matplotlib.lines import Line2D
 
     handles = [
-        Line2D([0], [0], marker="*", color="w", label="query evidence", markerfacecolor=QUERY_COLOR, markeredgecolor="black", markersize=10),
-        Line2D([0], [0], marker="o", color="w", label="HOST centroid", markerfacecolor="none", markeredgecolor="#555555", markersize=7),
-        Line2D([0], [0], marker="o", color="w", label="IAPR centroid", markerfacecolor="#777777", markeredgecolor=PROTO_EDGE, markersize=7),
-        Line2D([0], [0], marker="D", color="w", label="positive prototype", markerfacecolor="none", markeredgecolor=POS_COLOR, markersize=6),
-        Line2D([0], [0], marker="^", color="w", label="hard-negative prototype", markerfacecolor="none", markeredgecolor=NEG_COLORS[0], markersize=6),
-        Line2D([0], [0], color=POS_COLOR, label="positive movement", linestyle="-", linewidth=1.6),
-        Line2D([0], [0], color=NEG_COLORS[0], label="hard-negative movement", linestyle="--", linewidth=1.6),
+        Line2D([0], [0], marker="*", color="w", label="query / translated query anchor", markerfacecolor=QUERY_COLOR, markeredgecolor="black", markersize=9),
+        Line2D([0], [0], marker="o", color="w", label="active centroid / anchor", markerfacecolor=POS_COLOR, markeredgecolor=PROTO_EDGE, markersize=6.5),
+        Line2D([0], [0], marker="o", color="w", label="Vanilla reference ghost", markerfacecolor="#9A9A9A", markeredgecolor="#9A9A9A", markersize=6, alpha=0.35),
+        Line2D([0], [0], marker="D", color="w", label="fixed positive prototype", markerfacecolor="none", markeredgecolor=POS_COLOR, markersize=6),
+        Line2D([0], [0], marker="^", color="w", label="fixed hard-negative prototype", markerfacecolor="none", markeredgecolor=NEG_COLORS[0], markersize=6),
+        Line2D([0], [0], color="#555555", label="Vanilla -> model movement", linestyle="--", linewidth=1.3),
     ]
     return handles, [h.get_label() for h in handles]
 
@@ -1350,6 +1467,57 @@ def metric_line(label: str, pos_sim: float, neg_sim: float) -> str:
     return f"{label}: pos={pos_sim:.3f} neg={neg_sim:.3f} margin={pos_sim - neg_sim:+.3f}"
 
 
+def retrieval_metrics_for_query(
+    sim: torch.Tensor,
+    query_index: int,
+    query_pid: int,
+    gallery_pids: torch.Tensor,
+) -> Dict[str, Any]:
+    pos_mask = gallery_pids.eq(int(query_pid))
+    neg_mask = ~pos_mask
+    pos, neg, margin, pos_idx, neg_idx = score_extrema(sim[int(query_index)], pos_mask, neg_mask)
+    return {
+        "positive_score": float(pos),
+        "hard_negative_score": float(neg),
+        "margin": float(margin),
+        "best_positive_index": int(pos_idx),
+        "hard_negative_index": int(neg_idx),
+        "hard_negative_pid": int(gallery_pids[int(neg_idx)].item()),
+    }
+
+
+def metric_box_text(model_label: str, metrics: Mapping[str, Any], vanilla_metrics: Optional[Mapping[str, Any]] = None) -> str:
+    lines = [
+        model_label,
+        f"pos={float(metrics['positive_score']):.3f} neg={float(metrics['hard_negative_score']):.3f}",
+        f"m={float(metrics['margin']):+.3f}",
+    ]
+    if vanilla_metrics is not None and metrics is not vanilla_metrics:
+        lines.append(f"dV={float(metrics['margin']) - float(vanilla_metrics['margin']):+.3f}")
+    return "\n".join(lines)
+
+
+def ghost_points(points: Sequence[PointSpec]) -> List[PointSpec]:
+    ghosts: List[PointSpec] = []
+    for point in points:
+        ghosts.append(
+            PointSpec(
+                vector=point.vector,
+                kind=f"{point.kind}_vanilla_ghost",
+                label=point.label,
+                marker=point.marker,
+                color="#8F8F8F",
+                edgecolor="#8F8F8F",
+                size=max(float(point.size) * 0.66, 34.0),
+                alpha=0.28,
+                hollow=point.hollow,
+                annotate="",
+                metadata={"ghost_reference": "vanilla", **dict(point.metadata)},
+            )
+        )
+    return ghosts
+
+
 def image_mode_anchor_centroid(
     ctx: RowContext,
     bank: PrototypeBankData,
@@ -1369,6 +1537,7 @@ def image_mode_anchor_centroid(
 
 
 def build_repair_panels(
+    vanilla_ctx: RowContext,
     host_ctx: RowContext,
     iapr_ctx: RowContext,
     query_index: int,
@@ -1378,163 +1547,205 @@ def build_repair_panels(
     selected_negative: Sequence[int],
     gallery_pids: torch.Tensor,
     max_prototypes_per_id: int,
-) -> Tuple[PanelSpec, PanelSpec, Dict[str, Any]]:
+    retrieval_metrics_by_model: Optional[Mapping[str, Mapping[str, Any]]] = None,
+) -> Tuple[List[PanelSpec], List[PanelSpec], Dict[str, Any]]:
     bank = iapr_ctx.bank
     neg_color = NEG_COLORS[0]
-
-    host_pos_visual = feature_centroid(host_ctx.projected.image_features, selected_positive)
-    iapr_pos_visual = feature_centroid(iapr_ctx.projected.image_features, selected_positive)
-    host_neg_visual = feature_centroid(host_ctx.projected.image_features, selected_negative)
-    iapr_neg_visual = feature_centroid(iapr_ctx.projected.image_features, selected_negative)
-    host_query_text = host_ctx.projected.text_features[query_index]
-    iapr_query_text = iapr_ctx.projected.text_features[query_index]
-
-    host_query_text_assignment = assign_to_pid_slots(host_query_text, bank.text_prototypes, bank, query_pid)
-    iapr_query_text_assignment = assign_to_pid_slots(iapr_query_text, bank.text_prototypes, bank, query_pid)
-    q_anchor_visual = bank.text_to_image[int(iapr_query_text_assignment["global_index"])]
-
-    host_pos_visual_assignment = assign_to_pid_slots(host_pos_visual, bank.image_prototypes, bank, query_pid)
-    iapr_pos_visual_assignment = assign_to_pid_slots(iapr_pos_visual, bank.image_prototypes, bank, query_pid)
-    host_neg_visual_assignment = assign_to_pid_slots(host_neg_visual, bank.image_prototypes, bank, hard_negative_pid)
-    iapr_neg_visual_assignment = assign_to_pid_slots(iapr_neg_visual, bank.image_prototypes, bank, hard_negative_pid)
-
-    host_pos_text_anchor, host_pos_image_assignments = image_mode_anchor_centroid(host_ctx, bank, selected_positive, gallery_pids)
-    iapr_pos_text_anchor, iapr_pos_image_assignments = image_mode_anchor_centroid(iapr_ctx, bank, selected_positive, gallery_pids)
-    host_neg_text_anchor, host_neg_image_assignments = image_mode_anchor_centroid(host_ctx, bank, selected_negative, gallery_pids)
-    iapr_neg_text_anchor, iapr_neg_image_assignments = image_mode_anchor_centroid(iapr_ctx, bank, selected_negative, gallery_pids)
+    model_specs = [
+        ("vanilla", "Vanilla CLIP", vanilla_ctx),
+        ("host", "Host", host_ctx),
+        ("iapr", "IAPR", iapr_ctx),
+    ]
+    for _key, label, ctx in model_specs:
+        if ctx.bank.source_path != bank.source_path:
+            raise RuntimeError(f"{label} context does not use the shared IAPR prototype bank")
 
     required_by_pid: Dict[int, List[int]] = defaultdict(list)
-    required_by_pid[int(query_pid)].extend(
-        [
-            int(host_query_text_assignment["global_index"]),
-            int(iapr_query_text_assignment["global_index"]),
-            int(host_pos_visual_assignment["global_index"]),
-            int(iapr_pos_visual_assignment["global_index"]),
-        ]
-    )
-    required_by_pid[int(hard_negative_pid)].extend(
-        [
-            int(host_neg_visual_assignment["global_index"]),
-            int(iapr_neg_visual_assignment["global_index"]),
-        ]
-    )
-    for assignment_map in [host_pos_image_assignments, iapr_pos_image_assignments, host_neg_image_assignments, iapr_neg_image_assignments]:
-        for image_index, assignment in assignment_map.items():
-            pid = int(gallery_pids[int(image_index)].item())
-            required_by_pid[pid].append(int(assignment["global_index"]))
+    states: Dict[str, Dict[str, Any]] = {}
+    for key, display_label, ctx in model_specs:
+        query_text = ctx.projected.text_features[int(query_index)]
+        positive_visual = feature_centroid(ctx.projected.image_features, selected_positive)
+        hard_negative_visual = feature_centroid(ctx.projected.image_features, selected_negative)
 
+        query_text_assignment = assign_to_pid_slots(query_text, bank.text_prototypes, bank, query_pid)
+        query_visual_anchor = bank.text_to_image[int(query_text_assignment["global_index"])]
+        positive_visual_assignment = assign_to_pid_slots(positive_visual, bank.image_prototypes, bank, query_pid)
+        hard_negative_visual_assignment = assign_to_pid_slots(hard_negative_visual, bank.image_prototypes, bank, hard_negative_pid)
+
+        positive_text_anchor, positive_image_assignments = image_mode_anchor_centroid(ctx, bank, selected_positive, gallery_pids)
+        hard_negative_text_anchor, hard_negative_image_assignments = image_mode_anchor_centroid(ctx, bank, selected_negative, gallery_pids)
+
+        required_by_pid[int(query_pid)].extend(
+            [
+                int(query_text_assignment["global_index"]),
+                int(positive_visual_assignment["global_index"]),
+            ]
+        )
+        required_by_pid[int(hard_negative_pid)].append(int(hard_negative_visual_assignment["global_index"]))
+        for assignment_map in (positive_image_assignments, hard_negative_image_assignments):
+            for image_index, assignment in assignment_map.items():
+                pid = int(gallery_pids[int(image_index)].item())
+                required_by_pid[pid].append(int(assignment["global_index"]))
+
+        visual_pos_sim = cosine_similarity_value(query_visual_anchor, positive_visual)
+        visual_neg_sim = cosine_similarity_value(query_visual_anchor, hard_negative_visual)
+        text_pos_sim = cosine_similarity_value(query_text, positive_text_anchor)
+        text_neg_sim = cosine_similarity_value(query_text, hard_negative_text_anchor)
+        states[key] = {
+            "display_label": display_label,
+            "context": ctx,
+            "query_text": query_text,
+            "query_visual_anchor": query_visual_anchor,
+            "positive_visual": positive_visual,
+            "hard_negative_visual": hard_negative_visual,
+            "positive_text_anchor": positive_text_anchor,
+            "hard_negative_text_anchor": hard_negative_text_anchor,
+            "query_text_assignment": query_text_assignment,
+            "positive_visual_assignment": positive_visual_assignment,
+            "hard_negative_visual_assignment": hard_negative_visual_assignment,
+            "positive_image_assignments": positive_image_assignments,
+            "hard_negative_image_assignments": hard_negative_image_assignments,
+            "visual_metrics": {
+                "positive_similarity": visual_pos_sim,
+                "hard_negative_similarity": visual_neg_sim,
+                "margin": visual_pos_sim - visual_neg_sim,
+            },
+            "text_metrics": {
+                "positive_similarity": text_pos_sim,
+                "hard_negative_similarity": text_neg_sim,
+                "margin": text_pos_sim - text_neg_sim,
+            },
+        }
+
+    pids_to_plot = list(
+        dict.fromkeys(
+            [int(query_pid), int(hard_negative_pid)]
+            + [int(gallery_pids[int(index)].item()) for index in selected_negative]
+        )
+    )
     selected_slots = {
-        int(query_pid): choose_slots_for_pid(bank, query_pid, required_by_pid.get(int(query_pid), []), max_prototypes_per_id),
-        int(hard_negative_pid): choose_slots_for_pid(bank, hard_negative_pid, required_by_pid.get(int(hard_negative_pid), []), max_prototypes_per_id),
+        int(pid): choose_slots_for_pid(bank, int(pid), required_by_pid.get(int(pid), []), max_prototypes_per_id)
+        for pid in pids_to_plot
     }
 
-    visual_host_pos_sim = cosine_similarity_value(q_anchor_visual, host_pos_visual)
-    visual_host_neg_sim = cosine_similarity_value(q_anchor_visual, host_neg_visual)
-    visual_iapr_pos_sim = cosine_similarity_value(q_anchor_visual, iapr_pos_visual)
-    visual_iapr_neg_sim = cosine_similarity_value(q_anchor_visual, iapr_neg_visual)
-    text_host_pos_sim = cosine_similarity_value(host_query_text, host_pos_text_anchor)
-    text_host_neg_sim = cosine_similarity_value(host_query_text, host_neg_text_anchor)
-    text_iapr_pos_sim = cosine_similarity_value(iapr_query_text, iapr_pos_text_anchor)
-    text_iapr_neg_sim = cosine_similarity_value(iapr_query_text, iapr_neg_text_anchor)
-
-    visual_points: List[PointSpec] = [
-        PointSpec(q_anchor_visual, "query_t2v_anchor", "visual_q_t2v_anchor", "*", QUERY_COLOR, size=165, annotate="q t->v"),
-        PointSpec(host_pos_visual, "host_positive_centroid", "visual_host_pos_centroid", "o", POS_COLOR, size=85, alpha=0.95, hollow=True),
-        PointSpec(iapr_pos_visual, "iapr_positive_centroid", "visual_iapr_pos_centroid", "o", POS_COLOR, size=92, annotate="Pos centroid"),
-        PointSpec(host_neg_visual, "host_hard_negative_centroid", "visual_host_hardneg_centroid", "x", neg_color, size=90, alpha=0.95),
-        PointSpec(iapr_neg_visual, "iapr_hard_negative_centroid", "visual_iapr_hardneg_centroid", "X", neg_color, size=94, annotate="HardNeg centroid"),
-    ]
-    text_points: List[PointSpec] = [
-        PointSpec(host_query_text, "host_query_text", "text_host_query", "*", QUERY_COLOR, size=145, alpha=0.35),
-        PointSpec(iapr_query_text, "iapr_query_text", "text_iapr_query", "*", QUERY_COLOR, size=165, annotate="q text"),
-        PointSpec(host_pos_text_anchor, "host_positive_v2t_centroid", "text_host_pos_anchor", "o", POS_COLOR, size=85, alpha=0.95, hollow=True),
-        PointSpec(iapr_pos_text_anchor, "iapr_positive_v2t_centroid", "text_iapr_pos_anchor", "o", POS_COLOR, size=92, annotate="Pos centroid"),
-        PointSpec(host_neg_text_anchor, "host_hard_negative_v2t_centroid", "text_host_hardneg_anchor", "x", neg_color, size=90, alpha=0.95),
-        PointSpec(iapr_neg_text_anchor, "iapr_hard_negative_v2t_centroid", "text_iapr_hardneg_anchor", "X", neg_color, size=94, annotate="HardNeg centroid"),
-    ]
-
+    visual_prototypes: List[PointSpec] = []
+    text_prototypes: List[PointSpec] = []
     for pid, slots in selected_slots.items():
         is_positive_pid = int(pid) == int(query_pid)
         color = POS_COLOR if is_positive_pid else neg_color
         for slot_index, (local_slot, global_idx) in enumerate(slots):
-            visual_points.append(
+            visual_prototypes.append(
                 PointSpec(
                     bank.image_prototypes[int(global_idx)],
                     "positive_visual_prototype" if is_positive_pid else "hard_negative_visual_prototype",
                     f"visual_proto_pid_{pid}_slot_{local_slot}",
                     "D" if is_positive_pid else "^",
                     color,
-                    size=64,
+                    size=58,
                     hollow=True,
-                    annotate=("P+ proto" if is_positive_pid else "P- proto") if slot_index == 0 else "",
+                    annotate=("P+" if is_positive_pid else "P-") if slot_index == 0 else "",
                     metadata={"pid": int(pid), "local_slot": int(local_slot), "global_index": int(global_idx)},
                 )
             )
-            text_points.append(
+            text_prototypes.append(
                 PointSpec(
                     bank.text_prototypes[int(global_idx)],
                     "positive_text_prototype" if is_positive_pid else "hard_negative_text_prototype",
                     f"text_proto_pid_{pid}_slot_{local_slot}",
                     "D" if is_positive_pid else "^",
                     color,
-                    size=64,
+                    size=58,
                     hollow=True,
-                    annotate=("P+ proto" if is_positive_pid else "P- proto") if slot_index == 0 else "",
+                    annotate=("P+" if is_positive_pid else "P-") if slot_index == 0 else "",
                     metadata={"pid": int(pid), "local_slot": int(local_slot), "global_index": int(global_idx)},
                 )
             )
 
-    visual_panel = PanelSpec(
-        "(a) Visual-Side Repair",
-        visual_points,
-        arrows=[
-            ArrowSpec("visual_host_pos_centroid", "visual_iapr_pos_centroid", POS_COLOR, linestyle="-"),
-            ArrowSpec("visual_host_hardneg_centroid", "visual_iapr_hardneg_centroid", neg_color, linestyle="--"),
-        ],
-        metric_text="\n".join(
-            [
-                metric_line("HOST", visual_host_pos_sim, visual_host_neg_sim),
-                metric_line("IAPR", visual_iapr_pos_sim, visual_iapr_neg_sim),
-            ]
-        ),
-    )
-    text_panel = PanelSpec(
-        "(b) Text-Side Repair",
-        text_points,
-        arrows=[
-            ArrowSpec("text_host_pos_anchor", "text_iapr_pos_anchor", POS_COLOR, linestyle="-"),
-            ArrowSpec("text_host_hardneg_anchor", "text_iapr_hardneg_anchor", neg_color, linestyle="--"),
-            ArrowSpec("text_host_query", "text_iapr_query", "#555555", linestyle="-.", linewidth=1.2, alpha=0.65),
-        ],
-        metric_text="\n".join(
-            [
-                metric_line("HOST", text_host_pos_sim, text_host_neg_sim),
-                metric_line("IAPR", text_iapr_pos_sim, text_iapr_neg_sim),
-            ]
-        ),
-    )
+    def visual_state_points(model_key: str) -> List[PointSpec]:
+        state = states[model_key]
+        return [
+            PointSpec(state["query_visual_anchor"], "query_t2v_anchor", f"visual_{model_key}_query_anchor", "*", QUERY_COLOR, size=132, annotate="q"),
+            PointSpec(state["positive_visual"], "positive_visual_centroid", f"visual_{model_key}_positive_centroid", "o", POS_COLOR, size=74, annotate="pos"),
+            PointSpec(state["hard_negative_visual"], "hard_negative_visual_centroid", f"visual_{model_key}_hard_negative_centroid", "x", neg_color, size=78, annotate="hard neg"),
+        ]
+
+    def text_state_points(model_key: str) -> List[PointSpec]:
+        state = states[model_key]
+        return [
+            PointSpec(state["query_text"], "query_text", f"text_{model_key}_query", "*", QUERY_COLOR, size=132, annotate="q"),
+            PointSpec(state["positive_text_anchor"], "positive_image_mode_anchor_centroid", f"text_{model_key}_positive_image_anchor_centroid", "o", POS_COLOR, size=74, annotate="pos"),
+            PointSpec(state["hard_negative_text_anchor"], "hard_negative_image_mode_anchor_centroid", f"text_{model_key}_hard_negative_image_anchor_centroid", "x", neg_color, size=78, annotate="hard neg"),
+        ]
+
+    visual_by_model = {key: visual_state_points(key) for key, _display, _ctx in model_specs}
+    text_by_model = {key: text_state_points(key) for key, _display, _ctx in model_specs}
+
+    def visual_arrows(target_key: str) -> List[ArrowSpec]:
+        return [
+            ArrowSpec("visual_vanilla_query_anchor", f"visual_{target_key}_query_anchor", "#555555", linestyle="--", linewidth=1.15, alpha=0.72),
+            ArrowSpec("visual_vanilla_positive_centroid", f"visual_{target_key}_positive_centroid", POS_COLOR, linestyle="--", linewidth=1.25, alpha=0.80),
+            ArrowSpec("visual_vanilla_hard_negative_centroid", f"visual_{target_key}_hard_negative_centroid", neg_color, linestyle="--", linewidth=1.25, alpha=0.80),
+        ]
+
+    def text_arrows(target_key: str) -> List[ArrowSpec]:
+        return [
+            ArrowSpec("text_vanilla_query", f"text_{target_key}_query", "#555555", linestyle="--", linewidth=1.15, alpha=0.72),
+            ArrowSpec("text_vanilla_positive_image_anchor_centroid", f"text_{target_key}_positive_image_anchor_centroid", POS_COLOR, linestyle="--", linewidth=1.25, alpha=0.80),
+            ArrowSpec("text_vanilla_hard_negative_image_anchor_centroid", f"text_{target_key}_hard_negative_image_anchor_centroid", neg_color, linestyle="--", linewidth=1.25, alpha=0.80),
+        ]
+
+    def metrics_for(model_key: str) -> str:
+        if retrieval_metrics_by_model is None or model_key not in retrieval_metrics_by_model:
+            return ""
+        vanilla_metrics = retrieval_metrics_by_model.get("vanilla") if model_key != "vanilla" else None
+        return metric_box_text(states[model_key]["display_label"], retrieval_metrics_by_model[model_key], vanilla_metrics)
+
+    visual_panels = [
+        PanelSpec("Vanilla visual space", visual_by_model["vanilla"] + visual_prototypes, metric_text=metrics_for("vanilla")),
+        PanelSpec("Host visual space", ghost_points(visual_by_model["vanilla"]) + visual_by_model["host"] + visual_prototypes, arrows=visual_arrows("host"), metric_text=metrics_for("host")),
+        PanelSpec("IAPR visual space", ghost_points(visual_by_model["vanilla"]) + visual_by_model["iapr"] + visual_prototypes, arrows=visual_arrows("iapr"), metric_text=metrics_for("iapr")),
+    ]
+    text_panels = [
+        PanelSpec("Vanilla text space", text_by_model["vanilla"] + text_prototypes, metric_text=metrics_for("vanilla")),
+        PanelSpec("Host text space", ghost_points(text_by_model["vanilla"]) + text_by_model["host"] + text_prototypes, arrows=text_arrows("host"), metric_text=metrics_for("host")),
+        PanelSpec("IAPR text space", ghost_points(text_by_model["vanilla"]) + text_by_model["iapr"] + text_prototypes, arrows=text_arrows("iapr"), metric_text=metrics_for("iapr")),
+    ]
+
+    model_metadata: Dict[str, Any] = {}
+    for key, _display, ctx in model_specs:
+        state = states[key]
+        model_metadata[key] = {
+            "feature_source": ctx.projected.feature_source,
+            "projection_source": ctx.projected.projection_source,
+            "projection_decision": ctx.projection_decision,
+            "bank_source": ctx.bank_source,
+            "query_text_assignment_slot": state["query_text_assignment"],
+            "visual_centroid_assignment_slots": {
+                "positive": state["positive_visual_assignment"],
+                "hard_negative": state["hard_negative_visual_assignment"],
+            },
+            "image_visual_assignment_slots": {
+                "positive": {str(k): v for k, v in sorted(state["positive_image_assignments"].items())},
+                "hard_negative": {str(k): v for k, v in sorted(state["hard_negative_image_assignments"].items())},
+            },
+            "visual_side_metrics": state["visual_metrics"],
+            "text_side_metrics": state["text_metrics"],
+        }
 
     metadata = {
+        "layout": "2x3",
         "plot_bank_source": bank.source_path,
-        "host_projection_decision": host_ctx.projection_decision,
-        "iapr_projection_decision": iapr_ctx.projection_decision,
-        "shared_iapr_anchors": bool(host_ctx.shared_iapr_anchors),
-        "query_t2v_anchor_source": "iapr_projected_text_assignment_to_iapr_bank",
-        "query_text_assignment_slots": {
-            "host": host_query_text_assignment,
-            "iapr": iapr_query_text_assignment,
+        "diagnostic_anchor_space": {
+            "projectors": "IAPR projection heads for Vanilla, Host, and IAPR projected features",
+            "prototype_bank": "IAPR prototype bank for every plotted prototype anchor",
+            "text_to_visual_translation": "IAPR text_to_image translated prototypes",
+            "visual_to_text_translation": "IAPR image_to_text translated prototypes",
         },
-        "visual_centroid_assignment_slots": {
-            "host_positive": host_pos_visual_assignment,
-            "iapr_positive": iapr_pos_visual_assignment,
-            "host_hard_negative": host_neg_visual_assignment,
-            "iapr_hard_negative": iapr_neg_visual_assignment,
-        },
-        "image_visual_assignment_slots": {
-            "host_positive": {str(k): v for k, v in sorted(host_pos_image_assignments.items())},
-            "iapr_positive": {str(k): v for k, v in sorted(iapr_pos_image_assignments.items())},
-            "host_hard_negative": {str(k): v for k, v in sorted(host_neg_image_assignments.items())},
-            "iapr_hard_negative": {str(k): v for k, v in sorted(iapr_neg_image_assignments.items())},
+        "query_t2v_anchor_source": "each model projected text query is assigned to IAPR text_prototypes and rendered through IAPR text_to_image",
+        "image_mode_anchor_source": "each model projected image evidence is assigned to IAPR image_prototypes and rendered through IAPR image_to_text",
+        "model_states": model_metadata,
+        "retrieval_metrics": {
+            str(key): dict(value) for key, value in (retrieval_metrics_by_model or {}).items()
         },
         "plotted_prototype_slots": {
             str(pid): [
@@ -1543,34 +1754,53 @@ def build_repair_panels(
             ]
             for pid, slots in selected_slots.items()
         },
-        "visual_side_metrics": {
-            "host_positive_similarity": visual_host_pos_sim,
-            "host_hard_negative_similarity": visual_host_neg_sim,
-            "host_margin": visual_host_pos_sim - visual_host_neg_sim,
-            "iapr_positive_similarity": visual_iapr_pos_sim,
-            "iapr_hard_negative_similarity": visual_iapr_neg_sim,
-            "iapr_margin": visual_iapr_pos_sim - visual_iapr_neg_sim,
-        },
-        "text_side_metrics": {
-            "host_positive_similarity": text_host_pos_sim,
-            "host_hard_negative_similarity": text_host_neg_sim,
-            "host_margin": text_host_pos_sim - text_host_neg_sim,
-            "iapr_positive_similarity": text_iapr_pos_sim,
-            "iapr_hard_negative_similarity": text_iapr_neg_sim,
-            "iapr_margin": text_iapr_pos_sim - text_iapr_neg_sim,
+        "stateful_point_labels": {
+            "visual": [
+                "visual_vanilla_query_anchor",
+                "visual_vanilla_positive_centroid",
+                "visual_vanilla_hard_negative_centroid",
+                "visual_host_query_anchor",
+                "visual_host_positive_centroid",
+                "visual_host_hard_negative_centroid",
+                "visual_iapr_query_anchor",
+                "visual_iapr_positive_centroid",
+                "visual_iapr_hard_negative_centroid",
+            ],
+            "text": [
+                "text_vanilla_query",
+                "text_vanilla_positive_image_anchor_centroid",
+                "text_vanilla_hard_negative_image_anchor_centroid",
+                "text_host_query",
+                "text_host_positive_image_anchor_centroid",
+                "text_host_hard_negative_image_anchor_centroid",
+                "text_iapr_query",
+                "text_iapr_positive_image_anchor_centroid",
+                "text_iapr_hard_negative_image_anchor_centroid",
+            ],
         },
     }
-    return visual_panel, text_panel, metadata
+    return visual_panels, text_panels, metadata
 
 
-def image_record(index: int, split_data: SplitData, gallery_pids: torch.Tensor, sim_host: torch.Tensor, sim_iapr: torch.Tensor, query_index: int) -> Dict[str, Any]:
-    return {
+def image_record(
+    index: int,
+    split_data: SplitData,
+    gallery_pids: torch.Tensor,
+    sim_host: torch.Tensor,
+    sim_iapr: torch.Tensor,
+    query_index: int,
+    sim_vanilla: Optional[torch.Tensor] = None,
+) -> Dict[str, Any]:
+    record = {
         "gallery_index": int(index),
         "pid": int(gallery_pids[index].item()),
         "path": str(split_data.img_paths[index]),
         "host_similarity": float(sim_host[query_index, index].item()),
         "iapr_similarity": float(sim_iapr[query_index, index].item()),
     }
+    if sim_vanilla is not None:
+        record["vanilla_similarity"] = float(sim_vanilla[query_index, index].item())
+    return record
 
 
 def thumbnail_record(
@@ -1581,8 +1811,9 @@ def thumbnail_record(
     sim_host: torch.Tensor,
     sim_iapr: torch.Tensor,
     query_index: int,
+    sim_vanilla: Optional[torch.Tensor] = None,
 ) -> Dict[str, Any]:
-    record = image_record(index, split_data, gallery_pids, sim_host, sim_iapr, query_index)
+    record = image_record(index, split_data, gallery_pids, sim_host, sim_iapr, query_index, sim_vanilla=sim_vanilla)
     record["role"] = role
     record["loaded"] = False
     record["load_error"] = None
@@ -1617,6 +1848,7 @@ def draw_thumbnail_strip(
     gallery_pids: torch.Tensor,
     sim_host: torch.Tensor,
     sim_iapr: torch.Tensor,
+    sim_vanilla: Optional[torch.Tensor] = None,
 ) -> Dict[str, Any]:
     query_index = int(candidate["query_index"])
     query_pid = int(candidate["query_pid"])
@@ -1651,7 +1883,7 @@ def draw_thumbnail_strip(
             ax.axis("off")
             continue
         role, image_index, title = items[col - 1]
-        record = thumbnail_record(role, image_index, split_data, gallery_pids, sim_host, sim_iapr, query_index)
+        record = thumbnail_record(role, image_index, split_data, gallery_pids, sim_host, sim_iapr, query_index, sim_vanilla=sim_vanilla)
         draw_thumbnail_axis(ax, record, title)
         thumbnail_records.append(dict(record))
 
@@ -1772,27 +2004,18 @@ def select_candidates(
 def render_case(
     case_id: int,
     candidate: Mapping[str, Any],
+    vanilla_ctx: RowContext,
     host_ctx: RowContext,
     iapr_ctx: RowContext,
     split_data: SplitData,
     gallery_pids: torch.Tensor,
+    sim_vanilla: torch.Tensor,
     sim_host: torch.Tensor,
     sim_iapr: torch.Tensor,
     args: argparse.Namespace,
     output_dir: Path,
 ) -> Dict[str, Any]:
-    """Render the compact repaired Figure 2 version.
-
-    This function intentionally does not draw the older 2x2 HOST/IAPR-by-space grid.
-    Instead, it draws two repair panels where HOST and IAPR states are projected in the
-    same local coordinate system for each modality-specific space. This makes the
-    movement arrows meaningful:
-
-      * visual-side: image centroids move with respect to the q t->v anchor
-      * text-side: v->t image-mode anchors move with respect to q text
-
-    Raw cross-modal embeddings are still not directly mixed.
-    """
+    """Render the 2x3 Vanilla/Host/IAPR dual-space diagnostic figure."""
     try:
         import matplotlib
 
@@ -1808,10 +2031,14 @@ def render_case(
     selected_positive = [int(x) for x in candidate["selected_positive"]]
     selected_negative = [int(x) for x in candidate["selected_negative"]]
 
-    # New compact design: build one visual-side repair panel and one text-side repair panel.
-    # Each panel contains both HOST and IAPR states, so local PCA/MDS is fit over the union
-    # of before/after points inside the same modality-specific space.
-    visual_panel, text_panel, repair_meta = build_repair_panels(
+    retrieval_metrics_by_model = {
+        "vanilla": retrieval_metrics_for_query(sim_vanilla, query_index, query_pid, gallery_pids),
+        "host": retrieval_metrics_for_query(sim_host, query_index, query_pid, gallery_pids),
+        "iapr": retrieval_metrics_for_query(sim_iapr, query_index, query_pid, gallery_pids),
+    }
+
+    visual_panels, text_panels, repair_meta = build_repair_panels(
+        vanilla_ctx=vanilla_ctx,
         host_ctx=host_ctx,
         iapr_ctx=iapr_ctx,
         query_index=query_index,
@@ -1821,45 +2048,65 @@ def render_case(
         selected_negative=selected_negative,
         gallery_pids=gallery_pids,
         max_prototypes_per_id=args.prototype_per_id,
+        retrieval_metrics_by_model=retrieval_metrics_by_model,
     )
 
-    # Publication-style layout: a thin thumbnail/query strip on top, two repair panels below.
-    fig = plt.figure(figsize=(8.2, 5.9), constrained_layout=False)
+    visual_projection = fit_shared_projection(
+        panel_points(visual_panels),
+        args.projection,
+        "visual row: Vanilla + Host + IAPR visual-space state points and fixed IAPR visual prototypes",
+    )
+    text_projection = fit_shared_projection(
+        panel_points(text_panels),
+        args.projection,
+        "text row: Vanilla + Host + IAPR text-space state points and fixed IAPR text prototypes",
+    )
+
+    fig = plt.figure(figsize=(10.8, 7.1), constrained_layout=False)
     outer = GridSpec(
         2,
         1,
         figure=fig,
-        height_ratios=[1.05, 3.25],
-        hspace=0.22,
+        height_ratios=[0.92, 4.35],
+        hspace=0.18,
         top=0.90,
-        bottom=0.14,
+        bottom=0.12,
         left=0.055,
         right=0.985,
     )
     thumb_grid = outer[0].subgridspec(1, 7, width_ratios=[2.35, 1, 1, 1, 1, 1, 1], wspace=0.18)
-    panel_grid = outer[1].subgridspec(1, 2, wspace=0.13)
+    panel_grid = outer[1].subgridspec(2, 3, wspace=0.09, hspace=0.22)
 
-    thumbnail_meta = draw_thumbnail_strip(fig, thumb_grid, candidate, split_data, gallery_pids, sim_host, sim_iapr)
+    thumbnail_meta = draw_thumbnail_strip(fig, thumb_grid, candidate, split_data, gallery_pids, sim_host, sim_iapr, sim_vanilla=sim_vanilla)
 
-    panel_projection_meta: Dict[str, Any] = {}
-    ax_visual = fig.add_subplot(panel_grid[0, 0])
-    ax_text = fig.add_subplot(panel_grid[0, 1])
-    panel_projection_meta["visual_side"] = draw_panel(ax_visual, visual_panel, args.projection)
-    panel_projection_meta["text_side"] = draw_panel(ax_text, text_panel, args.projection)
+    panel_projection_meta: Dict[str, Any] = {
+        "visual_row": dict(visual_projection.metadata),
+        "text_row": dict(text_projection.metadata),
+    }
+    panel_projection_meta["visual_row"]["panels"] = []
+    panel_projection_meta["text_row"]["panels"] = []
+    for col, panel in enumerate(visual_panels):
+        ax = fig.add_subplot(panel_grid[0, col])
+        panel_projection_meta["visual_row"]["panels"].append(draw_panel_with_shared_projection(ax, panel, visual_projection))
+    for col, panel in enumerate(text_panels):
+        ax = fig.add_subplot(panel_grid[1, col])
+        panel_projection_meta["text_row"]["panels"].append(draw_panel_with_shared_projection(ax, panel, text_projection))
 
-    # Short title only; long query text lives in the thumbnail strip.
     status = "fully repaired" if bool(candidate.get("fully_repaired")) else "improved, not fully repaired"
+    vanilla_margin = float(retrieval_metrics_by_model["vanilla"]["margin"])
+    host_margin = float(retrieval_metrics_by_model["host"]["margin"])
+    iapr_margin = float(retrieval_metrics_by_model["iapr"]["margin"])
+    delta_iapr_host = iapr_margin - host_margin
     fig.suptitle(
-        f"Dual-Space Local Repair | q={query_index}, pid={query_pid}, hard-neg pid={hard_negative_pid} | "
-        f"host m={float(candidate['host_margin']):+.3f}, IAPR m={float(candidate['iapr_margin']):+.3f}, "
-        f"Δ={float(candidate['delta_margin']):+.3f} ({status})",
-        fontsize=10.5,
+        f"Dual-Space Local Repair: Vanilla / Host / IAPR | q={query_index}, pid={query_pid}, hn={hard_negative_pid} | "
+        f"m V={vanilla_margin:+.3f}, H={host_margin:+.3f}, I={iapr_margin:+.3f}, dIH={delta_iapr_host:+.3f} | {status}",
+        fontsize=9.4,
         fontweight="bold",
         y=0.975,
     )
 
     handles, labels_text = legend_handles()
-    fig.legend(handles, labels_text, loc="lower center", ncol=4, frameon=False, fontsize=7.3, bbox_to_anchor=(0.5, 0.012))
+    fig.legend(handles, labels_text, loc="lower center", ncol=6, frameon=False, fontsize=7.1, bbox_to_anchor=(0.5, 0.012))
 
     pdf_path = output_dir / f"case_{case_id:03d}_dual_space_repair.pdf"
     png_path = output_dir / f"case_{case_id:03d}_dual_space_repair.png"
@@ -1872,28 +2119,37 @@ def render_case(
         "query_text": str(candidate["query_text"]),
         "query_pid": query_pid,
         "hard_negative_pid": hard_negative_pid,
+        "rendering_layout": "2x3",
         "repair_status": str(candidate.get("repair_status", status.replace(" ", "_"))),
         "fully_repaired": bool(candidate.get("fully_repaired")),
         "preferred_repair_case": bool(candidate.get("preferred_repair_case")),
-        "host_margin": float(candidate["host_margin"]),
-        "iapr_margin": float(candidate["iapr_margin"]),
-        "delta_margin": float(candidate["delta_margin"]),
-        "host_positive_score": float(candidate["host_pos_score"]),
-        "host_hard_negative_score": float(candidate["host_neg_score"]),
-        "iapr_positive_score": float(candidate["iapr_pos_score"]),
-        "iapr_hard_negative_score": float(candidate["iapr_neg_score"]),
-        "selected_positive_images": [image_record(idx, split_data, gallery_pids, sim_host, sim_iapr, query_index) for idx in selected_positive],
-        "selected_hard_negative_images": [image_record(idx, split_data, gallery_pids, sim_host, sim_iapr, query_index) for idx in selected_negative],
+        "vanilla_margin": vanilla_margin,
+        "host_margin": host_margin,
+        "iapr_margin": iapr_margin,
+        "delta_margin": delta_iapr_host,
+        "delta_iapr_host_margin": delta_iapr_host,
+        "vanilla_positive_score": float(retrieval_metrics_by_model["vanilla"]["positive_score"]),
+        "vanilla_hard_negative_score": float(retrieval_metrics_by_model["vanilla"]["hard_negative_score"]),
+        "host_positive_score": float(retrieval_metrics_by_model["host"]["positive_score"]),
+        "host_hard_negative_score": float(retrieval_metrics_by_model["host"]["hard_negative_score"]),
+        "iapr_positive_score": float(retrieval_metrics_by_model["iapr"]["positive_score"]),
+        "iapr_hard_negative_score": float(retrieval_metrics_by_model["iapr"]["hard_negative_score"]),
+        "retrieval_metrics": retrieval_metrics_by_model,
+        "selected_positive_images": [image_record(idx, split_data, gallery_pids, sim_host, sim_iapr, query_index, sim_vanilla=sim_vanilla) for idx in selected_positive],
+        "selected_hard_negative_images": [image_record(idx, split_data, gallery_pids, sim_host, sim_iapr, query_index, sim_vanilla=sim_vanilla) for idx in selected_negative],
         "iapr_top_retrieved_images": [
-            image_record(int(idx), split_data, gallery_pids, sim_host, sim_iapr, query_index)
+            image_record(int(idx), split_data, gallery_pids, sim_host, sim_iapr, query_index, sim_vanilla=sim_vanilla)
             for idx in [int(x) for x in candidate.get("iapr_top_retrieved", [])]
         ],
         "thumbnail_strip": thumbnail_meta,
         "hard_negative_pids": [int(gallery_pids[idx].item()) for idx in selected_negative],
         "selected_prototype_slots": repair_meta.get("plotted_prototype_slots", {}),
         "repair_panel_metadata": repair_meta,
+        "diagnostic_anchor_space": repair_meta.get("diagnostic_anchor_space", {}),
         "similarities_used_for_ranking": {
             "margin_formula": "max_positive_similarity - max_hard_negative_similarity",
+            "vanilla_best_positive_index": int(retrieval_metrics_by_model["vanilla"]["best_positive_index"]),
+            "vanilla_hard_negative_index": int(retrieval_metrics_by_model["vanilla"]["hard_negative_index"]),
             "host_best_positive_index": int(candidate["host_best_pos_index"]),
             "host_hard_negative_index": int(candidate["host_hard_neg_index"]),
             "iapr_best_positive_index": int(candidate["iapr_best_pos_index"]),
@@ -1901,8 +2157,12 @@ def render_case(
         },
         "projection": {
             "method": args.projection,
-            "fit_scope": "one local fit per modality-specific panel over the union of HOST and IAPR points",
-            "panels": panel_projection_meta,
+            "layout": "2x3",
+            "fit_scope": {
+                "visual_row": "one shared fit over Vanilla + Host + IAPR visual-space points, including fixed IAPR visual prototypes",
+                "text_row": "one shared fit over Vanilla + Host + IAPR text-space points, including fixed IAPR text prototypes",
+            },
+            "rows": panel_projection_meta,
         },
         "output_pdf": str(pdf_path),
         "output_png": str(png_path),
@@ -2019,8 +2279,10 @@ def main() -> None:
     if host_aux_report is not None:
         print_load_report("Host auxiliary", host_aux_report)
 
+    vanilla_model = build_vanilla_model("Vanilla CLIP", model_args, num_classes, device)
+
     host_bank = load_prototype_bank(host_ckpt, required=False)
-    host_uses_own_bank = False
+    host_own_bank_available = False
     host_bank_reason = "host checkpoint has no compatible prototype memory"
     if host_bank is not None:
         try:
@@ -2028,77 +2290,113 @@ def main() -> None:
             if not host_projectors_ok:
                 host_bank_reason = "host prototype memory exists but compatible projection heads were not loaded"
             else:
-                load_memory_into_branch(host_branch, host_bank)
-                host_uses_own_bank = True
-                host_bank_reason = "host checkpoint contains compatible prototype memory and projectors"
+                host_own_bank_available = True
+                host_bank_reason = "host checkpoint contains compatible prototype memory and projectors, ignored for the shared 3-way diagnostic"
         except Exception as exc:
-            host_uses_own_bank = False
+            host_own_bank_available = False
             host_bank_reason = f"host prototype memory was found but not usable: {exc}"
 
-    shared_iapr_anchors = not host_uses_own_bank
-    print(f"[Host prototype anchors] {'own host bank' if host_uses_own_bank else 'shared IAPR bank'} ({host_bank_reason})")
+    shared_iapr_anchors = True
+    print(f"[Diagnostic anchors] shared IAPR projectors + shared IAPR bank for Vanilla/Host/IAPR ({host_bank_reason})")
 
     host_retrieval_mode = resolve_retrieval_mode(args, host_model, model_args)
     iapr_retrieval_mode = resolve_retrieval_mode(args, iapr_model, model_args)
-    if host_retrieval_mode != iapr_retrieval_mode:
-        raise RuntimeError(f"Host and IAPR retrieval modes differ: {host_retrieval_mode} vs {iapr_retrieval_mode}")
+    vanilla_retrieval_mode = resolve_retrieval_mode(args, vanilla_model, model_args)
+    if host_retrieval_mode != iapr_retrieval_mode or host_retrieval_mode != vanilla_retrieval_mode:
+        raise RuntimeError(
+            "Retrieval modes differ: "
+            f"Vanilla={vanilla_retrieval_mode}, Host={host_retrieval_mode}, IAPR={iapr_retrieval_mode}"
+        )
     print(f"[Retrieval] mode={host_retrieval_mode} alpha={args.retrieval_alpha}")
 
+    vanilla_retrieval = extract_retrieval_bundle(
+        "Vanilla", vanilla_model, split_data, model_args, vanilla_retrieval_mode, args.retrieval_alpha, args.batch_size, args.num_workers, device
+    )
     host_retrieval = extract_retrieval_bundle(
         "Host", host_model, split_data, model_args, host_retrieval_mode, args.retrieval_alpha, args.batch_size, args.num_workers, device
     )
     iapr_retrieval = extract_retrieval_bundle(
         "IAPR", iapr_model, split_data, model_args, iapr_retrieval_mode, args.retrieval_alpha, args.batch_size, args.num_workers, device
     )
+    if not torch.equal(vanilla_retrieval.query_pids, host_retrieval.query_pids):
+        raise RuntimeError("Vanilla and Host query pids differ.")
+    if not torch.equal(vanilla_retrieval.gallery_pids, host_retrieval.gallery_pids):
+        raise RuntimeError("Vanilla and Host gallery pids differ.")
     if not torch.equal(host_retrieval.query_pids, iapr_retrieval.query_pids):
         raise RuntimeError("Host and IAPR query pids differ.")
     if not torch.equal(host_retrieval.gallery_pids, iapr_retrieval.gallery_pids):
         raise RuntimeError("Host and IAPR gallery pids differ.")
+    sim_vanilla = vanilla_retrieval.similarity().cpu()
     sim_host = host_retrieval.similarity().cpu()
     sim_iapr = iapr_retrieval.similarity().cpu()
 
-    projection_branch_for_host = host_branch if host_uses_own_bank else iapr_branch
-    bank_for_host = host_bank if host_uses_own_bank and host_bank is not None else iapr_bank
-    projection_decision = (
-        "host checkpoint prototype projectors and memory"
-        if host_uses_own_bank
-        else "IAPR projection heads and IAPR prototype bank used as fixed diagnostic anchors for host features"
-    )
+    diagnostic_projection_decision = "IAPR projection heads and IAPR prototype bank used as the common diagnostic space for Vanilla, Host, and IAPR features"
 
-    host_projected = extract_projected_bundle(
-        "Host",
-        host_model,
-        projection_branch_for_host,
+    vanilla_projected = extract_projected_bundle(
+        "Vanilla",
+        vanilla_model,
+        iapr_branch,
         split_data,
         model_args,
-        "host" if host_uses_own_bank else "iapr_diagnostic_projector",
+        "iapr_diagnostic_projector",
         args.batch_size,
         args.num_workers,
         device,
     )
-    iapr_projected = extract_projected_bundle("IAPR", iapr_model, iapr_branch, split_data, model_args, "iapr", args.batch_size, args.num_workers, device)
+    host_projected = extract_projected_bundle(
+        "Host",
+        host_model,
+        iapr_branch,
+        split_data,
+        model_args,
+        "iapr_diagnostic_projector",
+        args.batch_size,
+        args.num_workers,
+        device,
+    )
+    iapr_projected = extract_projected_bundle("IAPR", iapr_model, iapr_branch, split_data, model_args, "iapr_diagnostic_projector", args.batch_size, args.num_workers, device)
+    if not torch.equal(vanilla_projected.query_pids, vanilla_retrieval.query_pids):
+        raise RuntimeError("Vanilla projected query pids differ from retrieval query pids.")
+    if not torch.equal(vanilla_projected.gallery_pids, vanilla_retrieval.gallery_pids):
+        raise RuntimeError("Vanilla projected gallery pids differ from retrieval gallery pids.")
     if not torch.equal(host_projected.query_pids, host_retrieval.query_pids):
         raise RuntimeError("Host projected query pids differ from retrieval query pids.")
+    if not torch.equal(host_projected.gallery_pids, host_retrieval.gallery_pids):
+        raise RuntimeError("Host projected gallery pids differ from retrieval gallery pids.")
+    if not torch.equal(iapr_projected.query_pids, iapr_retrieval.query_pids):
+        raise RuntimeError("IAPR projected query pids differ from retrieval query pids.")
     if not torch.equal(iapr_projected.gallery_pids, iapr_retrieval.gallery_pids):
         raise RuntimeError("IAPR projected gallery pids differ from retrieval gallery pids.")
 
+    vanilla_ctx = RowContext(
+        key="vanilla",
+        label="Vanilla CLIP",
+        projected=vanilla_projected,
+        bank=iapr_bank,
+        branch=iapr_branch,
+        bank_source=iapr_bank.source_path,
+        projection_decision="Vanilla CLIP features extracted without fine-tuned checkpoint, then projected by IAPR projection heads",
+        shared_iapr_anchors=True,
+    )
     host_ctx = RowContext(
+        key="host",
         label="HOST",
         projected=host_projected,
-        bank=bank_for_host,
-        branch=projection_branch_for_host,
-        bank_source=bank_for_host.source_path,
-        projection_decision=projection_decision,
+        bank=iapr_bank,
+        branch=iapr_branch,
+        bank_source=iapr_bank.source_path,
+        projection_decision="Host features projected by IAPR projection heads for shared diagnostic comparability",
         shared_iapr_anchors=shared_iapr_anchors,
     )
     iapr_ctx = RowContext(
+        key="iapr",
         label="IAPR",
         projected=iapr_projected,
         bank=iapr_bank,
         branch=iapr_branch,
         bank_source=iapr_bank.source_path,
-        projection_decision="IAPR projection heads and IAPR prototype bank",
-        shared_iapr_anchors=False,
+        projection_decision="IAPR features projected by IAPR projection heads with the shared IAPR prototype bank",
+        shared_iapr_anchors=shared_iapr_anchors,
     )
 
     candidates, selection_counters = select_candidates(sim_host, sim_iapr, host_retrieval.query_pids, host_retrieval.gallery_pids, split_data, iapr_bank, args)
@@ -2122,10 +2420,12 @@ def main() -> None:
             metadata = render_case(
                 len(selected_cases),
                 candidate,
+                vanilla_ctx,
                 host_ctx,
                 iapr_ctx,
                 split_data,
                 host_retrieval.gallery_pids,
+                sim_vanilla,
                 sim_host,
                 sim_iapr,
                 args,
@@ -2147,15 +2447,21 @@ def main() -> None:
         "dataset_name": args.dataset_name,
         "data_root": str(data_root),
         "split": args.split,
+        "vanilla_ckpt": None,
+        "vanilla_definition": "repo model architecture with the selected config/pretrain choice and no fine-tuned checkpoint loaded",
         "host_ckpt": str(host_ckpt),
         "iapr_ckpt": str(iapr_ckpt),
         "prototype_ckpt": str(prototype_path),
         "prototype_projector_ckpt": str(prototype_projector_path),
+        "rendering_layout": "2x3",
         "num_cases_requested": int(args.num_cases),
         "num_cases_rendered": int(len(selected_cases)),
         "skipped_render_cases": int(skipped_render),
         "retrieval_scoring": {
             "mode": host_retrieval_mode,
+            "vanilla_mode": vanilla_retrieval_mode,
+            "host_mode": host_retrieval_mode,
+            "iapr_mode": iapr_retrieval_mode,
             "alpha": float(args.retrieval_alpha),
             "host_margin_max": float(args.host_margin_max),
             "min_delta_margin": float(args.min_delta_margin),
@@ -2169,7 +2475,17 @@ def main() -> None:
             "note": "Backbone/prototype-space feature extraction is forced to global-only in this diagnostic.",
         },
         "shared_iapr_prototype_anchors_for_diagnostic": bool(shared_iapr_anchors),
-        "host_projection_decision": projection_decision,
+        "diagnostic_anchor_space": {
+            "projectors": "IAPR projection heads are used for Vanilla, Host, and IAPR projected bundles",
+            "prototype_bank": "IAPR prototype bank is used for every plotted prototype anchor",
+            "projection_decision": diagnostic_projection_decision,
+            "projection_fit_scope": {
+                "visual_row": "one shared 2D fit over Vanilla + Host + IAPR visual-space points",
+                "text_row": "one shared 2D fit over Vanilla + Host + IAPR text-space points",
+            },
+        },
+        "host_projection_decision": "Host features projected by IAPR projection heads for shared diagnostic comparability",
+        "host_own_bank_available_but_unused": bool(host_own_bank_available),
         "host_bank_reason": host_bank_reason,
         "prototype_memory": {
             "source_path": iapr_bank.source_path,
@@ -2182,6 +2498,7 @@ def main() -> None:
         },
         "iapr_memory_loaded_into_branch_shapes": iapr_memory_shapes,
         "checkpoint_load_reports": {
+            "vanilla": {"path": None, "loaded": 0, "note": "no fine-tuned checkpoint loaded"},
             "host": host_report.to_json(),
             "host_auxiliary": host_aux_report.to_json() if host_aux_report else None,
             "iapr": iapr_report.to_json(),
@@ -2205,6 +2522,7 @@ def main() -> None:
     }
     save_json(summary, output_dir / "summary.json")
     print(f"[Summary] wrote {output_dir / 'summary.json'}")
+    cleanup_model(vanilla_model, device)
     cleanup_model(host_model, device)
     cleanup_model(iapr_model, device)
 
