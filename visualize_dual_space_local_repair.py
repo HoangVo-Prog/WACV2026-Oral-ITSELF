@@ -1214,8 +1214,13 @@ def compute_overlap_alphas(points: Sequence[PointSpec], coords: np.ndarray, limi
         if count <= 0:
             adjusted.append(alpha)
             continue
+        role = str(point.metadata.get("role", ""))
         if point.metadata.get("ghost_reference") == "vanilla":
             adjusted.append(max(0.16, min(alpha, 0.24)))
+        elif role in {"selected_positive_image", "selected_hard_negative_image"}:
+            adjusted.append(max(0.18, min(alpha, alpha * max(0.42, 1.0 - 0.17 * count))))
+        elif "centroid" in point.kind or "anchor" in point.kind or point.kind == "query_t2v_anchor" or point.kind == "query_text":
+            adjusted.append(max(0.60, alpha * max(0.74, 1.0 - 0.08 * count)))
         else:
             adjusted.append(max(0.48, alpha * max(0.62, 1.0 - 0.13 * count)))
     return adjusted
@@ -1308,6 +1313,7 @@ def legend_handles() -> Tuple[List[Any], List[str]]:
 
     handles = [
         Line2D([0], [0], marker="*", color="w", label="query / translated q", markerfacecolor=QUERY_COLOR, markeredgecolor="black", markersize=7.5),
+        Line2D([0], [0], marker="o", color="w", label="image sample", markerfacecolor=POS_COLOR, markeredgecolor=POS_COLOR, markersize=4.8, alpha=0.36),
         Line2D([0], [0], marker="o", color="w", label="active centroid/anchor", markerfacecolor=POS_COLOR, markeredgecolor=PROTO_EDGE, markersize=5.8),
         Line2D([0], [0], marker="o", color="w", label="Vanilla ghost", markerfacecolor="#9A9A9A", markeredgecolor="#9A9A9A", markersize=5.5, alpha=0.30),
         Line2D([0], [0], marker="D", color="w", label="P+ proto", markerfacecolor="none", markeredgecolor=POS_COLOR, markersize=5.5),
@@ -1645,6 +1651,8 @@ def build_repair_panels(
 ) -> Tuple[List[PanelSpec], List[PanelSpec], Dict[str, Any]]:
     bank = iapr_ctx.bank
     neg_color = NEG_COLORS[0]
+    visual_image_sample_labels: Dict[str, Dict[str, List[str]]] = {}
+    visual_image_samples: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     model_specs = [
         ("vanilla", "Vanilla CLIP", vanilla_ctx),
         ("host", "Host", host_ctx),
@@ -1759,11 +1767,66 @@ def build_repair_panels(
 
     def visual_state_points(model_key: str) -> List[PointSpec]:
         state = states[model_key]
-        return [
+        ctx = state["context"]
+        points: List[PointSpec] = [
             PointSpec(state["query_visual_anchor"], "query_t2v_anchor", f"visual_{model_key}_query_anchor", "*", QUERY_COLOR, size=142, alpha=0.86, annotate="q"),
-            PointSpec(state["positive_visual"], "positive_visual_centroid", f"visual_{model_key}_positive_centroid", "o", POS_COLOR, size=82, alpha=0.82, annotate="pos"),
-            PointSpec(state["hard_negative_visual"], "hard_negative_visual_centroid", f"visual_{model_key}_hard_negative_centroid", "x", neg_color, size=84, alpha=0.82, annotate="hard neg"),
         ]
+        positive_labels: List[str] = []
+        positive_records: List[Dict[str, Any]] = []
+        for rank, image_index in enumerate(selected_positive, start=1):
+            label = f"visual_{model_key}_positive_image_{rank}_{int(image_index)}"
+            pid = int(gallery_pids[int(image_index)].item())
+            points.append(
+                PointSpec(
+                    ctx.projected.image_features[int(image_index)],
+                    "positive_visual_sample",
+                    label,
+                    "o",
+                    POS_COLOR,
+                    size=38,
+                    alpha=0.36,
+                    hollow=True,
+                    annotate="",
+                    metadata={
+                        "gallery_index": int(image_index),
+                        "pid": pid,
+                        "rank": int(rank),
+                        "role": "selected_positive_image",
+                    },
+                )
+            )
+            positive_labels.append(label)
+            positive_records.append({"gallery_index": int(image_index), "pid": pid, "rank": int(rank), "label": label})
+        points.append(PointSpec(state["positive_visual"], "positive_visual_centroid", f"visual_{model_key}_positive_centroid", "o", POS_COLOR, size=82, alpha=0.82, annotate="pos"))
+        hard_negative_labels: List[str] = []
+        hard_negative_records: List[Dict[str, Any]] = []
+        for rank, image_index in enumerate(selected_negative, start=1):
+            label = f"visual_{model_key}_hard_negative_image_{rank}_{int(image_index)}"
+            pid = int(gallery_pids[int(image_index)].item())
+            points.append(
+                PointSpec(
+                    ctx.projected.image_features[int(image_index)],
+                    "hard_negative_visual_sample",
+                    label,
+                    "x",
+                    neg_color,
+                    size=40,
+                    alpha=0.38,
+                    annotate="",
+                    metadata={
+                        "gallery_index": int(image_index),
+                        "pid": pid,
+                        "rank": int(rank),
+                        "role": "selected_hard_negative_image",
+                    },
+                )
+            )
+            hard_negative_labels.append(label)
+            hard_negative_records.append({"gallery_index": int(image_index), "pid": pid, "rank": int(rank), "label": label})
+        points.append(PointSpec(state["hard_negative_visual"], "hard_negative_visual_centroid", f"visual_{model_key}_hard_negative_centroid", "x", neg_color, size=84, alpha=0.82, annotate="hard neg"))
+        visual_image_sample_labels[model_key] = {"positive": positive_labels, "hard_negative": hard_negative_labels}
+        visual_image_samples[model_key] = {"positive": positive_records, "hard_negative": hard_negative_records}
+        return points
 
     def text_state_points(model_key: str) -> List[PointSpec]:
         state = states[model_key]
@@ -1826,6 +1889,7 @@ def build_repair_panels(
             },
             "visual_side_metrics": state["visual_metrics"],
             "text_side_metrics": state["text_metrics"],
+            "visual_image_samples": visual_image_samples.get(key, {"positive": [], "hard_negative": []}),
         }
 
     metadata = {
@@ -1840,6 +1904,7 @@ def build_repair_panels(
         "query_t2v_anchor_source": "each model projected text query is assigned to IAPR text_prototypes and rendered through IAPR text_to_image",
         "image_mode_anchor_source": "each model projected image evidence is assigned to IAPR image_prototypes and rendered through IAPR image_to_text",
         "model_states": model_metadata,
+        "visual_image_samples": visual_image_samples,
         "retrieval_metrics": {
             str(key): dict(value) for key, value in (retrieval_metrics_by_model or {}).items()
         },
@@ -1862,6 +1927,7 @@ def build_repair_panels(
                 "visual_iapr_positive_centroid",
                 "visual_iapr_hard_negative_centroid",
             ],
+            "visual_image_sample_labels": visual_image_sample_labels,
             "text": [
                 "text_vanilla_query",
                 "text_vanilla_positive_image_anchor_centroid",
