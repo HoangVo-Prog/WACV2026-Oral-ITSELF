@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Dual-space local embedding repair diagnostic for IAPR/TBPS results.
+"""Local repair diagnostics for visual and text prototype spaces.
 
-Raw cross-modal embeddings are not directly mixed. In the visual-side panel,
-text evidence is represented through text-to-visual translated prototypes. In
-the text-side panel, image evidence is represented through visual-to-text
-translated prototypes.
+Raw cross-modal embeddings are not directly mixed. Visual-space translated
+evidence is built only through ``text_to_image``; text-space translated evidence
+is built only through ``image_to_text``.
 """
 
 from __future__ import annotations
@@ -14,12 +13,11 @@ import gc
 import json
 import random
 import sys
-import textwrap
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -65,7 +63,7 @@ except ModuleNotFoundError:
 
 
 
-TITLE = "Dual-Space Local Embedding Repair around Identity-Level Ambiguity"
+TITLE = "Local Embedding Repair around Identity-Level Ambiguity"
 MEMORY_NAMES = (
     "image_prototypes",
     "text_prototypes",
@@ -76,9 +74,11 @@ MEMORY_NAMES = (
 )
 PROTOTYPE_KEY_TERMS = ("proto", "prototype", "memory", "bank", "pid", "pbt", "text_to", "image_to")
 POS_COLOR = "#1B9E77"
-NEG_COLORS = ["#D95F02", "#E15759", "#B07AA1", "#A6761D", "#CC6677"]
-QUERY_COLOR = "#111111"
+HARD_NEG_COLOR = "#D95F02"
 PROTO_EDGE = "#222222"
+TRANSLATED_COLOR = "#4C78A8"
+POS_MOTION_COLOR = "#007A55"
+NEG_MOTION_COLOR = "#C33A2C"
 
 
 @dataclass
@@ -230,6 +230,7 @@ class ArrowSpec:
     linestyle: str = "-"
     linewidth: float = 1.5
     alpha: float = 0.85
+    label: str = ""
 
 
 @dataclass
@@ -255,9 +256,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="train", choices=["train", "val", "test"])
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--num_cases", type=int, default=5)
-    parser.add_argument("--top_pos", type=int, default=2)
-    parser.add_argument("--top_hard_neg", type=int, default=2)
-    parser.add_argument("--prototype_per_id", type=int, default=2)
+    parser.add_argument(
+        "--top_pos",
+        type=int,
+        default=2,
+        help="Legacy candidate-selection positive count; plotted positives now use all gallery items with pid == query_pid.",
+    )
+    parser.add_argument(
+        "--top_hard_neg",
+        type=int,
+        default=2,
+        help="Number of hard negative samples to plot per panel.",
+    )
+    parser.add_argument(
+        "--prototype_per_id",
+        type=int,
+        default=2,
+        help="Number of positive prototypes to plot per identity in the IAPR panels.",
+    )
+    parser.add_argument(
+        "--prototype_hard_k",
+        type=int,
+        default=2,
+        help="Number of hard negative prototypes to plot in the IAPR panels.",
+    )
     parser.add_argument("--projection", default="pca", choices=["pca", "mds", "umap"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
@@ -1004,38 +1026,6 @@ def assign_to_pid_slots(feature: torch.Tensor, bank_vectors: torch.Tensor, bank:
     }
 
 
-def choose_slots_for_pid(bank: PrototypeBankData, pid: int, required_global: Iterable[int], max_slots: int) -> List[Tuple[int, int]]:
-    all_slots = pid_slot_indices(bank, pid)
-    if not all_slots:
-        return []
-    selected: List[Tuple[int, int]] = []
-    used = set()
-    by_global = {global_idx: (slot, global_idx) for slot, global_idx in all_slots}
-    for global_idx in [int(x) for x in required_global]:
-        if global_idx in by_global and global_idx not in used:
-            selected.append(by_global[global_idx])
-            used.add(global_idx)
-    for slot, global_idx in all_slots:
-        if len(selected) >= max(int(max_slots), 1):
-            break
-        if global_idx not in used:
-            selected.append((slot, global_idx))
-            used.add(global_idx)
-    return selected[: max(int(max_slots), 1)]
-
-
-def hard_negative_color(pid: int, neg_pids: Sequence[int]) -> str:
-    ordered: List[int] = []
-    for item in neg_pids:
-        if int(item) not in ordered:
-            ordered.append(int(item))
-    try:
-        idx = ordered.index(int(pid))
-    except ValueError:
-        idx = 0
-    return NEG_COLORS[idx % len(NEG_COLORS)]
-
-
 def truncate_text(text: str, chars: int = 150) -> str:
     clean = " ".join(str(text).split())
     if len(clean) <= chars:
@@ -1148,10 +1138,6 @@ def fit_shared_projection(points: Sequence[PointSpec], method: str, scope: str) 
     )
 
 
-def pad_limits(ax: Any, coords: np.ndarray) -> None:
-    apply_limits(ax, coordinate_limits(coords))
-
-
 def scatter_point(ax: Any, point: PointSpec, xy: np.ndarray, alpha_override: Optional[float] = None) -> None:
     alpha = float(point.alpha if alpha_override is None else alpha_override)
     if point.marker == "x":
@@ -1216,13 +1202,15 @@ def compute_overlap_alphas(points: Sequence[PointSpec], coords: np.ndarray, limi
             continue
         role = str(point.metadata.get("role", ""))
         if point.metadata.get("ghost_reference") == "vanilla":
-            adjusted.append(max(0.16, min(alpha, 0.24)))
-        elif role in {"selected_positive_image", "selected_hard_negative_image"}:
-            adjusted.append(max(0.18, min(alpha, alpha * max(0.42, 1.0 - 0.17 * count))))
-        elif "centroid" in point.kind or "anchor" in point.kind or point.kind == "query_t2v_anchor" or point.kind == "query_text":
-            adjusted.append(max(0.60, alpha * max(0.74, 1.0 - 0.08 * count)))
+            adjusted.append(max(0.12, min(alpha, 0.22)))
+        elif role in {"positive_sample", "hard_negative_sample"}:
+            adjusted.append(max(0.16, min(alpha, alpha * max(0.38, 1.0 - 0.16 * count))))
+        elif bool(point.metadata.get("motion_annotation")):
+            adjusted.append(max(0.36, min(alpha, alpha * max(0.70, 1.0 - 0.08 * count))))
+        elif role in {"translated_centroid", "positive_prototype", "negative_prototype"} or "centroid" in point.kind:
+            adjusted.append(max(0.54, alpha * max(0.72, 1.0 - 0.08 * count)))
         else:
-            adjusted.append(max(0.48, alpha * max(0.62, 1.0 - 0.13 * count)))
+            adjusted.append(max(0.46, alpha * max(0.60, 1.0 - 0.13 * count)))
     return adjusted
 
 
@@ -1246,31 +1234,6 @@ def draw_arrow(ax: Any, arrow: ArrowSpec, coords_by_label: Mapping[str, np.ndarr
         },
         zorder=1,
     )
-
-
-def draw_panel(ax: Any, panel: PanelSpec, method: str) -> Dict[str, Any]:
-    coords = local_project(panel.points, method)
-    coords_by_label = {point.label: coords[index] for index, point in enumerate(panel.points)}
-    limits = coordinate_limits(coords)
-    overlap_alphas = compute_overlap_alphas(panel.points, coords, limits)
-    for arrow in panel.arrows:
-        draw_arrow(ax, arrow, coords_by_label)
-    for point, xy, alpha in zip(panel.points, coords, overlap_alphas):
-        scatter_point(ax, point, xy, alpha_override=alpha)
-    ax.set_title(panel.title, fontsize=9.6, fontweight="bold", pad=4.0)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    apply_limits(ax, limits)
-    raw_vectors = np.stack([p.vector.detach().float().cpu().numpy() for p in panel.points], axis=0)
-    return {
-        "num_points": int(len(panel.points)),
-        "unique_points": int(vector_unique_count(raw_vectors)),
-        "point_labels": [p.label for p in panel.points],
-        "arrows": [arrow.__dict__ for arrow in panel.arrows],
-        "metric_text": panel.metric_text,
-    }
 
 
 def panel_points(panels: Sequence[PanelSpec]) -> List[PointSpec]:
@@ -1312,16 +1275,18 @@ def legend_handles() -> Tuple[List[Any], List[str]]:
     from matplotlib.lines import Line2D
 
     handles = [
-        Line2D([0], [0], marker="*", color="w", label="query / translated q", markerfacecolor=QUERY_COLOR, markeredgecolor="black", markersize=7.5),
-        Line2D([0], [0], marker="o", color="w", label="image sample", markerfacecolor=POS_COLOR, markeredgecolor=POS_COLOR, markersize=4.8, alpha=0.36),
-        Line2D([0], [0], marker="o", color="w", label="active centroid/anchor", markerfacecolor=POS_COLOR, markeredgecolor=PROTO_EDGE, markersize=5.8),
-        Line2D([0], [0], marker="o", color="w", label="Vanilla ghost", markerfacecolor="#9A9A9A", markeredgecolor="#9A9A9A", markersize=5.5, alpha=0.30),
-        Line2D([0], [0], marker="D", color="w", label="P+ proto", markerfacecolor="none", markeredgecolor=POS_COLOR, markersize=5.5),
-        Line2D([0], [0], marker="^", color="w", label="P- proto", markerfacecolor="none", markeredgecolor=NEG_COLORS[0], markersize=5.5),
-        Line2D([0], [0], color="#555555", label="Vanilla -> model", linestyle="--", linewidth=1.05),
+        Line2D([0], [0], marker="o", color="w", label="positive samples", markerfacecolor=POS_COLOR, markeredgecolor=POS_COLOR, markersize=5.2, alpha=0.58),
+        Line2D([0], [0], marker="x", color=HARD_NEG_COLOR, label="hard negative samples", markersize=5.7, linestyle="None", markeredgewidth=1.4, alpha=0.78),
+        Line2D([0], [0], marker="*", color="w", label="translated centroid (IAPR)", markerfacecolor=TRANSLATED_COLOR, markeredgecolor="#111111", markersize=8.8),
+        Line2D([0], [0], marker="D", color="w", label="positive prototypes (IAPR)", markerfacecolor="none", markeredgecolor=POS_COLOR, markersize=6.0),
+        Line2D([0], [0], marker="^", color="w", label="negative prototypes (IAPR)", markerfacecolor="none", markeredgecolor=HARD_NEG_COLOR, markersize=6.0),
+        Line2D([0], [0], marker="o", color="#999999", label="group centroid marker", markerfacecolor="#FFFFFF", markeredgecolor="#777777", markersize=5.4, alpha=0.72),
+        Line2D([0], [0], color=POS_MOTION_COLOR, label="Vanilla -> Host positive group", linestyle="--", linewidth=1.35),
+        Line2D([0], [0], color=POS_MOTION_COLOR, label="Vanilla -> IAPR positive group", linestyle=":", linewidth=1.55),
+        Line2D([0], [0], color=NEG_MOTION_COLOR, label="Vanilla -> Host hard-negative group", linestyle="-.", linewidth=1.35),
+        Line2D([0], [0], color=NEG_MOTION_COLOR, label="Vanilla -> IAPR hard-negative group", linestyle="-", linewidth=1.20),
     ]
     return handles, [h.get_label() for h in handles]
-
 
 def footer_metric_line(model_label: str, metrics: Mapping[str, Any]) -> str:
     return (
@@ -1362,159 +1327,15 @@ def draw_footer_legend(fig: Any, legend_spec: Any) -> None:
         handles,
         labels_text,
         loc="center",
-        ncol=len(handles),
+        ncol=5,
         frameon=False,
-        fontsize=6.4,
-        handlelength=1.05,
-        handletextpad=0.35,
-        columnspacing=0.85,
+        fontsize=6.3,
+        handlelength=1.35,
+        handletextpad=0.38,
+        columnspacing=0.95,
         borderpad=0.0,
         labelspacing=0.15,
     )
-
-
-def build_row_panels(
-    ctx: RowContext,
-    query_index: int,
-    query_pid: int,
-    selected_positive: Sequence[int],
-    selected_negative: Sequence[int],
-    gallery_pids: torch.Tensor,
-    max_prototypes_per_id: int,
-) -> Tuple[PanelSpec, PanelSpec, Dict[str, Any]]:
-    bank = ctx.bank
-    q_text = ctx.projected.text_features[query_index]
-    query_text_assignment = assign_to_pid_slots(q_text, bank.text_prototypes, bank, query_pid)
-    q_anchor_visual = bank.text_to_image[query_text_assignment["global_index"]]
-
-    image_assignments: Dict[int, Dict[str, Any]] = {}
-    required_by_pid: Dict[int, List[int]] = defaultdict(list)
-    required_by_pid[int(query_pid)].append(int(query_text_assignment["global_index"]))
-    for image_index in list(selected_positive) + list(selected_negative):
-        pid = int(gallery_pids[image_index].item())
-        assign = assign_to_pid_slots(ctx.projected.image_features[image_index], bank.image_prototypes, bank, pid)
-        image_assignments[int(image_index)] = assign
-        required_by_pid[pid].append(int(assign["global_index"]))
-
-    neg_pids = [int(gallery_pids[i].item()) for i in selected_negative]
-    pids_to_plot = [int(query_pid)] + [pid for pid in neg_pids if pid != int(query_pid)]
-    pids_to_plot = list(dict.fromkeys(pids_to_plot))
-
-    selected_slots: Dict[int, List[Tuple[int, int]]] = {}
-    for pid in pids_to_plot:
-        selected_slots[pid] = choose_slots_for_pid(bank, pid, required_by_pid.get(pid, []), max_prototypes_per_id)
-
-    visual_points: List[PointSpec] = [
-        PointSpec(q_anchor_visual, "query_t2v_anchor", "query t->v", "*", QUERY_COLOR, size=150, annotate="q t->v")
-    ]
-    for image_index in selected_positive:
-        visual_points.append(
-            PointSpec(
-                ctx.projected.image_features[image_index],
-                "positive_image_embedding",
-                f"pos image {image_index}",
-                "o",
-                POS_COLOR,
-                size=54,
-                metadata={"gallery_index": int(image_index), "pid": int(gallery_pids[image_index].item())},
-            )
-        )
-    for image_index in selected_negative:
-        pid = int(gallery_pids[image_index].item())
-        visual_points.append(
-            PointSpec(
-                ctx.projected.image_features[image_index],
-                "hard_negative_image_embedding",
-                f"neg image {image_index}",
-                "x",
-                hard_negative_color(pid, neg_pids),
-                size=58,
-                metadata={"gallery_index": int(image_index), "pid": pid},
-            )
-        )
-    for pid, slots in selected_slots.items():
-        is_pos = int(pid) == int(query_pid)
-        for local_slot, global_idx in slots:
-            color = POS_COLOR if is_pos else hard_negative_color(pid, neg_pids)
-            visual_points.append(
-                PointSpec(
-                    bank.image_prototypes[global_idx],
-                    "positive_visual_prototype" if is_pos else "hard_negative_visual_prototype",
-                    f"visual proto pid={pid} r={local_slot}",
-                    "D" if is_pos else "^",
-                    color,
-                    size=62,
-                    hollow=not is_pos,
-                    annotate=f"P+ r={local_slot}" if is_pos else f"P- {pid} r={local_slot}",
-                    metadata={"pid": int(pid), "local_slot": int(local_slot), "global_index": int(global_idx)},
-                )
-            )
-
-    text_points: List[PointSpec] = [
-        PointSpec(q_text, "query_text_embedding", "query text", "*", QUERY_COLOR, size=150, annotate="q text")
-    ]
-    for image_index in selected_positive:
-        assign = image_assignments[int(image_index)]
-        text_points.append(
-            PointSpec(
-                bank.image_to_text[int(assign["global_index"])],
-                "positive_v2t_anchor",
-                f"pos image-mode anchor {image_index}",
-                "o",
-                POS_COLOR,
-                size=54,
-                metadata={"gallery_index": int(image_index), "assignment": assign},
-            )
-        )
-    for image_index in selected_negative:
-        pid = int(gallery_pids[image_index].item())
-        assign = image_assignments[int(image_index)]
-        text_points.append(
-            PointSpec(
-                bank.image_to_text[int(assign["global_index"])],
-                "hard_negative_v2t_anchor",
-                f"neg image-mode anchor {image_index}",
-                "x",
-                hard_negative_color(pid, neg_pids),
-                size=58,
-                metadata={"gallery_index": int(image_index), "pid": pid, "assignment": assign},
-            )
-        )
-    for pid, slots in selected_slots.items():
-        is_pos = int(pid) == int(query_pid)
-        for local_slot, global_idx in slots:
-            color = POS_COLOR if is_pos else hard_negative_color(pid, neg_pids)
-            text_points.append(
-                PointSpec(
-                    bank.text_prototypes[global_idx],
-                    "positive_text_prototype" if is_pos else "hard_negative_text_prototype",
-                    f"text proto pid={pid} r={local_slot}",
-                    "D" if is_pos else "^",
-                    color,
-                    size=62,
-                    hollow=not is_pos,
-                    annotate=f"P+ r={local_slot}" if is_pos else f"P- {pid} r={local_slot}",
-                    metadata={"pid": int(pid), "local_slot": int(local_slot), "global_index": int(global_idx)},
-                )
-            )
-
-    metadata = {
-        "row_label": ctx.label,
-        "bank_source": ctx.bank_source,
-        "projection_decision": ctx.projection_decision,
-        "shared_iapr_anchors": bool(ctx.shared_iapr_anchors),
-        "prototype_feature_source": ctx.projected.feature_source,
-        "query_text_assignment_slot": query_text_assignment,
-        "image_visual_assignment_slots": {str(k): v for k, v in sorted(image_assignments.items())},
-        "plotted_prototype_slots": {
-            str(pid): [
-                {"local_slot": int(local_slot), "global_index": int(global_idx)}
-                for local_slot, global_idx in slots
-            ]
-            for pid, slots in selected_slots.items()
-        },
-    }
-    return PanelSpec(f"{ctx.label} visual-side space", visual_points), PanelSpec(f"{ctx.label} text-side space", text_points), metadata
 
 
 def normalized_centroid(vectors: torch.Tensor) -> torch.Tensor:
@@ -1528,18 +1349,8 @@ def normalized_centroid(vectors: torch.Tensor) -> torch.Tensor:
 
 def feature_centroid(features: torch.Tensor, indices: Sequence[int]) -> torch.Tensor:
     if not indices:
-        raise ValueError("cannot compute a centroid without selected gallery indices")
+        raise ValueError("cannot compute a centroid without selected sample indices")
     return normalized_centroid(features[[int(index) for index in indices]])
-
-
-def cosine_similarity_value(left: torch.Tensor, right: torch.Tensor) -> float:
-    left_n = F.normalize(left.detach().float().view(1, -1), p=2, dim=1)
-    right_n = F.normalize(right.detach().float().view(1, -1), p=2, dim=1)
-    return float((left_n @ right_n.t()).item())
-
-
-def metric_line(label: str, pos_sim: float, neg_sim: float) -> str:
-    return f"{label}: pos={pos_sim:.3f} neg={neg_sim:.3f} margin={pos_sim - neg_sim:+.3f}"
 
 
 def retrieval_metrics_for_query(
@@ -1586,363 +1397,540 @@ def print_rank1_summaries(metrics: Mapping[str, Mapping[str, Any]]) -> None:
         print(f"  {key.capitalize():<8} R1={float(row['R1']):6.2f}% ({int(row['hits'])}/{int(row['num_queries'])})")
 
 
-def metric_box_text(model_label: str, metrics: Mapping[str, Any], vanilla_metrics: Optional[Mapping[str, Any]] = None) -> str:
-    lines = [
-        model_label,
-        f"pos={float(metrics['positive_score']):.3f} neg={float(metrics['hard_negative_score']):.3f}",
-        f"m={float(metrics['margin']):+.3f}",
+def model_context_sequence(
+    vanilla_ctx: RowContext,
+    host_ctx: RowContext,
+    iapr_ctx: RowContext,
+) -> List[Tuple[str, str, RowContext]]:
+    return [
+        ("vanilla", "Vanilla CLIP", vanilla_ctx),
+        ("host", "Host", host_ctx),
+        ("iapr", "IAPR", iapr_ctx),
     ]
-    if vanilla_metrics is not None and metrics is not vanilla_metrics:
-        lines.append(f"dV={float(metrics['margin']) - float(vanilla_metrics['margin']):+.3f}")
-    return "\n".join(lines)
 
 
-def ghost_points(points: Sequence[PointSpec]) -> List[PointSpec]:
-    ghosts: List[PointSpec] = []
-    for point in points:
-        ghosts.append(
-            PointSpec(
-                vector=point.vector,
-                kind=f"{point.kind}_vanilla_ghost",
-                label=point.label,
-                marker=point.marker,
-                color="#8F8F8F",
-                edgecolor="#8F8F8F",
-                size=max(float(point.size) * 0.66, 34.0),
-                alpha=0.28,
-                hollow=point.hollow,
-                annotate="",
-                metadata={"ghost_reference": "vanilla", **dict(point.metadata)},
-            )
-        )
-    return ghosts
+def collect_positive_image_indices(gallery_pids: torch.Tensor, pid: int) -> List[int]:
+    return [int(index.item()) for index in torch.nonzero(gallery_pids.eq(int(pid)), as_tuple=False).flatten()]
 
 
-def image_mode_anchor_centroid(
-    ctx: RowContext,
-    bank: PrototypeBankData,
-    indices: Sequence[int],
+def collect_positive_text_indices(text_pids: torch.Tensor, pid: int) -> List[int]:
+    return [int(index.item()) for index in torch.nonzero(text_pids.eq(int(pid)), as_tuple=False).flatten()]
+
+
+def select_hard_negative_image_indices(
+    query_index: int,
+    query_pid: int,
     gallery_pids: torch.Tensor,
-) -> Tuple[torch.Tensor, Dict[int, Dict[str, Any]]]:
+    host_similarity: torch.Tensor,
+    top_k: int,
+) -> List[int]:
+    mask = ~gallery_pids.eq(int(query_pid))
+    return topk_from_mask(host_similarity[int(query_index)], mask, int(top_k))
+
+
+def select_hard_negative_text_indices(
+    text_features: torch.Tensor,
+    text_pids: torch.Tensor,
+    query_pid: int,
+    reference: torch.Tensor,
+    top_k: int,
+) -> Tuple[List[int], torch.Tensor]:
+    reference = F.normalize(reference.detach().float().view(1, -1), p=2, dim=1).cpu()
+    features = F.normalize(text_features.detach().float().cpu(), p=2, dim=1)
+    scores = (features @ reference.t()).flatten()
+    mask = ~text_pids.cpu().long().eq(int(query_pid))
+    return topk_from_mask(scores, mask, int(top_k)), scores
+
+
+def prototype_slot_record(bank: PrototypeBankData, global_index: int, similarity: Optional[float] = None) -> Dict[str, Any]:
+    global_index = int(global_index)
+    pid = int(bank.proto_pids[global_index].item())
+    local_slot = 0
+    for slot, slot_global in pid_slot_indices(bank, pid):
+        if int(slot_global) == global_index:
+            local_slot = int(slot)
+            break
+    record: Dict[str, Any] = {"pid": pid, "local_slot": local_slot, "global_index": global_index}
+    if similarity is not None:
+        record["similarity_to_translated_centroid"] = float(similarity)
+    return record
+
+
+def positive_prototype_records(bank: PrototypeBankData, query_pid: int, max_slots: int) -> List[Dict[str, Any]]:
+    slots = pid_slot_indices(bank, int(query_pid))[: max(int(max_slots), 0)]
+    return [prototype_slot_record(bank, global_idx) for _local_slot, global_idx in slots]
+
+
+def select_hard_negative_prototypes(
+    reference: torch.Tensor,
+    prototype_vectors: torch.Tensor,
+    bank: PrototypeBankData,
+    query_pid: int,
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    if int(top_k) <= 0:
+        return []
+    reference_n = F.normalize(reference.detach().float().view(1, -1), p=2, dim=1).cpu()
+    prototypes_n = F.normalize(prototype_vectors.detach().float().cpu(), p=2, dim=1)
+    scores = (prototypes_n @ reference_n.t()).flatten()
+    mask = ~bank.proto_pids.cpu().long().eq(int(query_pid))
+    indices = topk_from_mask(scores, mask, int(top_k))
+    return [prototype_slot_record(bank, index, float(scores[int(index)].item())) for index in indices]
+
+
+def build_text_translated_centroid(
+    iapr_ctx: RowContext,
+    bank: PrototypeBankData,
+    query_pid: int,
+    positive_text_indices: Sequence[int],
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    # Text evidence enters visual space only through text prototype assignment and text_to_image translation.
     anchors: List[torch.Tensor] = []
-    assignments: Dict[int, Dict[str, Any]] = {}
-    for image_index in indices:
-        pid = int(gallery_pids[int(image_index)].item())
-        assignment = assign_to_pid_slots(ctx.projected.image_features[int(image_index)], bank.image_prototypes, bank, pid)
-        assignments[int(image_index)] = assignment
-        anchors.append(bank.image_to_text[int(assignment["global_index"])])
+    assignments: Dict[str, Any] = {}
+    for text_index in positive_text_indices:
+        assignment = assign_to_pid_slots(iapr_ctx.projected.text_features[int(text_index)], bank.text_prototypes, bank, int(query_pid))
+        assignments[str(int(text_index))] = assignment
+        anchors.append(bank.text_to_image[int(assignment["global_index"])])
     if not anchors:
-        raise ValueError("no visual-to-text anchors were available for the selected images")
+        raise ValueError("no positive text samples are available for the text-translated visual centroid")
     return normalized_centroid(torch.stack(anchors, dim=0)), assignments
 
 
-def build_repair_panels(
+def build_image_translated_centroid(
+    iapr_ctx: RowContext,
+    bank: PrototypeBankData,
+    query_pid: int,
+    positive_image_indices: Sequence[int],
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    # Image evidence enters text space only through image prototype assignment and image_to_text translation.
+    anchors: List[torch.Tensor] = []
+    assignments: Dict[str, Any] = {}
+    for image_index in positive_image_indices:
+        assignment = assign_to_pid_slots(iapr_ctx.projected.image_features[int(image_index)], bank.image_prototypes, bank, int(query_pid))
+        assignments[str(int(image_index))] = assignment
+        anchors.append(bank.image_to_text[int(assignment["global_index"])])
+    if not anchors:
+        raise ValueError("no positive image samples are available for the image-translated text centroid")
+    return normalized_centroid(torch.stack(anchors, dim=0)), assignments
+
+
+def sample_point(
+    vector: torch.Tensor,
+    space_key: str,
+    model_key: str,
+    group: str,
+    sample_index: int,
+    pid: int,
+    rank: int,
+) -> PointSpec:
+    is_positive = group == "positive"
+    index_key = "gallery_index" if space_key == "visual" else "text_index"
+    return PointSpec(
+        vector,
+        f"{group}_{space_key}_sample",
+        f"{space_key}_{model_key}_{group}_sample_{rank}_{sample_index}",
+        "o" if is_positive else "x",
+        POS_COLOR if is_positive else HARD_NEG_COLOR,
+        edgecolor=POS_COLOR if is_positive else HARD_NEG_COLOR,
+        size=34 if is_positive else 45,
+        alpha=0.48 if is_positive else 0.66,
+        metadata={
+            "role": "positive_sample" if is_positive else "hard_negative_sample",
+            "group": group,
+            index_key: int(sample_index),
+            "pid": int(pid),
+            "rank": int(rank),
+        },
+    )
+
+
+def motion_centroid_point(vector: torch.Tensor, space_key: str, model_key: str, group: str, ghost: bool = False) -> PointSpec:
+    is_positive = group == "positive"
+    label_model = "vanilla" if ghost else model_key
+    return PointSpec(
+        vector,
+        f"{group}_{space_key}_group_centroid",
+        f"{space_key}_{label_model}_{group}_group_centroid",
+        "o" if is_positive else "s",
+        "#8F8F8F" if ghost else (POS_MOTION_COLOR if is_positive else NEG_MOTION_COLOR),
+        edgecolor="#8F8F8F" if ghost else (POS_MOTION_COLOR if is_positive else NEG_MOTION_COLOR),
+        size=76 if is_positive else 84,
+        alpha=0.20 if ghost else 0.48,
+        hollow=True,
+        annotate="" if ghost else ("P" if is_positive else "HN"),
+        metadata={
+            "role": "motion_positive_group_centroid" if is_positive else "motion_hard_negative_group_centroid",
+            "group": group,
+            "model": label_model,
+            "motion_annotation": True,
+            "ghost_reference": "vanilla" if ghost else None,
+        },
+    )
+
+
+def translated_centroid_point(vector: torch.Tensor, space_key: str) -> PointSpec:
+    kind = "text_translated_centroid" if space_key == "visual" else "image_translated_centroid"
+    return PointSpec(
+        vector,
+        kind,
+        f"{space_key}_iapr_translated_centroid",
+        "*",
+        TRANSLATED_COLOR,
+        size=170,
+        alpha=0.92,
+        annotate="translated",
+        metadata={"role": "translated_centroid", "model": "iapr", "space": space_key},
+    )
+
+
+def prototype_point(
+    vector: torch.Tensor,
+    space_key: str,
+    positive: bool,
+    record: Mapping[str, Any],
+    annotate: str = "",
+) -> PointSpec:
+    role = "positive_prototype" if positive else "negative_prototype"
+    proto_space = "visual" if space_key == "visual" else "text"
+    return PointSpec(
+        vector,
+        f"{role}_{proto_space}",
+        f"{space_key}_iapr_{role}_pid_{int(record['pid'])}_slot_{int(record['local_slot'])}_global_{int(record['global_index'])}",
+        "D" if positive else "^",
+        POS_COLOR if positive else HARD_NEG_COLOR,
+        size=72 if positive else 76,
+        alpha=0.88,
+        hollow=True,
+        annotate=annotate,
+        metadata={"role": role, **dict(record)},
+    )
+
+
+def motion_arrows(space_key: str, target_model: str) -> List[ArrowSpec]:
+    is_host = target_model == "host"
+    return [
+        ArrowSpec(
+            f"{space_key}_vanilla_positive_group_centroid",
+            f"{space_key}_{target_model}_positive_group_centroid",
+            POS_MOTION_COLOR,
+            linestyle="--" if is_host else ":",
+            linewidth=1.35 if is_host else 1.55,
+            alpha=0.72,
+            label=f"Vanilla -> {'Host' if is_host else 'IAPR'} positive group",
+        ),
+        ArrowSpec(
+            f"{space_key}_vanilla_hard_negative_group_centroid",
+            f"{space_key}_{target_model}_hard_negative_group_centroid",
+            NEG_MOTION_COLOR,
+            linestyle="-." if is_host else "-",
+            linewidth=1.35 if is_host else 1.20,
+            alpha=0.72,
+            label=f"Vanilla -> {'Host' if is_host else 'IAPR'} hard-negative group",
+        ),
+    ]
+
+
+def motion_metadata(space_key: str, panels: Sequence[PanelSpec]) -> Dict[str, Any]:
+    tracks: List[Dict[str, Any]] = []
+    for panel in panels:
+        for arrow in panel.arrows:
+            tracks.append(
+                {
+                    "label": arrow.label,
+                    "start_label": arrow.start_label,
+                    "end_label": arrow.end_label,
+                    "color": arrow.color,
+                    "linestyle": arrow.linestyle,
+                }
+            )
+    return {
+        "space": space_key,
+        "centroid_definition": "L2-normalized mean of the plotted sample group embeddings in each model panel.",
+        "tracks": tracks,
+    }
+
+
+def build_visual_space_panels(
     vanilla_ctx: RowContext,
     host_ctx: RowContext,
     iapr_ctx: RowContext,
     query_index: int,
     query_pid: int,
-    hard_negative_pid: int,
-    selected_positive: Sequence[int],
-    selected_negative: Sequence[int],
+    positive_image_indices: Sequence[int],
+    hard_negative_image_indices: Sequence[int],
+    positive_text_indices: Sequence[int],
     gallery_pids: torch.Tensor,
     max_prototypes_per_id: int,
-    retrieval_metrics_by_model: Optional[Mapping[str, Mapping[str, Any]]] = None,
-) -> Tuple[List[PanelSpec], List[PanelSpec], Dict[str, Any]]:
+    prototype_hard_k: int,
+) -> Tuple[List[PanelSpec], Dict[str, Any]]:
     bank = iapr_ctx.bank
-    neg_color = NEG_COLORS[0]
-    visual_image_sample_labels: Dict[str, Dict[str, List[str]]] = {}
-    visual_image_samples: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-    model_specs = [
-        ("vanilla", "Vanilla CLIP", vanilla_ctx),
-        ("host", "Host", host_ctx),
-        ("iapr", "IAPR", iapr_ctx),
-    ]
-    for _key, label, ctx in model_specs:
-        if ctx.bank.source_path != bank.source_path:
-            raise RuntimeError(f"{label} context does not use the shared IAPR prototype bank")
+    text_translated_centroid, text_assignments = build_text_translated_centroid(iapr_ctx, bank, query_pid, positive_text_indices)
+    positive_proto_records = positive_prototype_records(bank, query_pid, max_prototypes_per_id)
+    negative_proto_records = select_hard_negative_prototypes(text_translated_centroid, bank.image_prototypes, bank, query_pid, prototype_hard_k)
 
-    required_by_pid: Dict[int, List[int]] = defaultdict(list)
-    states: Dict[str, Dict[str, Any]] = {}
-    for key, display_label, ctx in model_specs:
-        query_text = ctx.projected.text_features[int(query_index)]
-        positive_visual = feature_centroid(ctx.projected.image_features, selected_positive)
-        hard_negative_visual = feature_centroid(ctx.projected.image_features, selected_negative)
-
-        query_text_assignment = assign_to_pid_slots(query_text, bank.text_prototypes, bank, query_pid)
-        query_visual_anchor = bank.text_to_image[int(query_text_assignment["global_index"])]
-        positive_visual_assignment = assign_to_pid_slots(positive_visual, bank.image_prototypes, bank, query_pid)
-        hard_negative_visual_assignment = assign_to_pid_slots(hard_negative_visual, bank.image_prototypes, bank, hard_negative_pid)
-
-        positive_text_anchor, positive_image_assignments = image_mode_anchor_centroid(ctx, bank, selected_positive, gallery_pids)
-        hard_negative_text_anchor, hard_negative_image_assignments = image_mode_anchor_centroid(ctx, bank, selected_negative, gallery_pids)
-
-        required_by_pid[int(query_pid)].extend(
-            [
-                int(query_text_assignment["global_index"]),
-                int(positive_visual_assignment["global_index"]),
-            ]
-        )
-        required_by_pid[int(hard_negative_pid)].append(int(hard_negative_visual_assignment["global_index"]))
-        for assignment_map in (positive_image_assignments, hard_negative_image_assignments):
-            for image_index, assignment in assignment_map.items():
-                pid = int(gallery_pids[int(image_index)].item())
-                required_by_pid[pid].append(int(assignment["global_index"]))
-
-        visual_pos_sim = cosine_similarity_value(query_visual_anchor, positive_visual)
-        visual_neg_sim = cosine_similarity_value(query_visual_anchor, hard_negative_visual)
-        text_pos_sim = cosine_similarity_value(query_text, positive_text_anchor)
-        text_neg_sim = cosine_similarity_value(query_text, hard_negative_text_anchor)
-        states[key] = {
-            "display_label": display_label,
-            "context": ctx,
-            "query_text": query_text,
-            "query_visual_anchor": query_visual_anchor,
-            "positive_visual": positive_visual,
-            "hard_negative_visual": hard_negative_visual,
-            "positive_text_anchor": positive_text_anchor,
-            "hard_negative_text_anchor": hard_negative_text_anchor,
-            "query_text_assignment": query_text_assignment,
-            "positive_visual_assignment": positive_visual_assignment,
-            "hard_negative_visual_assignment": hard_negative_visual_assignment,
-            "positive_image_assignments": positive_image_assignments,
-            "hard_negative_image_assignments": hard_negative_image_assignments,
-            "visual_metrics": {
-                "positive_similarity": visual_pos_sim,
-                "hard_negative_similarity": visual_neg_sim,
-                "margin": visual_pos_sim - visual_neg_sim,
-            },
-            "text_metrics": {
-                "positive_similarity": text_pos_sim,
-                "hard_negative_similarity": text_neg_sim,
-                "margin": text_pos_sim - text_neg_sim,
-            },
+    centroids: Dict[str, Dict[str, torch.Tensor]] = {}
+    sample_records: Dict[str, Any] = {}
+    for model_key, _display, ctx in model_context_sequence(vanilla_ctx, host_ctx, iapr_ctx):
+        centroids[model_key] = {
+            "positive": feature_centroid(ctx.projected.image_features, positive_image_indices),
+            "hard_negative": feature_centroid(ctx.projected.image_features, hard_negative_image_indices),
+        }
+        sample_records[model_key] = {
+            "positive": [
+                {"gallery_index": int(index), "pid": int(gallery_pids[int(index)].item())}
+                for index in positive_image_indices
+            ],
+            "hard_negative": [
+                {"gallery_index": int(index), "pid": int(gallery_pids[int(index)].item())}
+                for index in hard_negative_image_indices
+            ],
         }
 
-    pids_to_plot = list(
-        dict.fromkeys(
-            [int(query_pid), int(hard_negative_pid)]
-            + [int(gallery_pids[int(index)].item()) for index in selected_negative]
-        )
-    )
-    selected_slots = {
-        int(pid): choose_slots_for_pid(bank, int(pid), required_by_pid.get(int(pid), []), max_prototypes_per_id)
-        for pid in pids_to_plot
-    }
-
-    visual_prototypes: List[PointSpec] = []
-    text_prototypes: List[PointSpec] = []
-    for pid, slots in selected_slots.items():
-        is_positive_pid = int(pid) == int(query_pid)
-        color = POS_COLOR if is_positive_pid else neg_color
-        for slot_index, (local_slot, global_idx) in enumerate(slots):
-            visual_prototypes.append(
-                PointSpec(
-                    bank.image_prototypes[int(global_idx)],
-                    "positive_visual_prototype" if is_positive_pid else "hard_negative_visual_prototype",
-                    f"visual_proto_pid_{pid}_slot_{local_slot}",
-                    "D" if is_positive_pid else "^",
-                    color,
-                    size=62,
-                    alpha=0.82,
-                    hollow=True,
-                    annotate=("P+" if is_positive_pid else "P-") if slot_index == 0 else "",
-                    metadata={"pid": int(pid), "local_slot": int(local_slot), "global_index": int(global_idx)},
-                )
-            )
-            text_prototypes.append(
-                PointSpec(
-                    bank.text_prototypes[int(global_idx)],
-                    "positive_text_prototype" if is_positive_pid else "hard_negative_text_prototype",
-                    f"text_proto_pid_{pid}_slot_{local_slot}",
-                    "D" if is_positive_pid else "^",
-                    color,
-                    size=62,
-                    alpha=0.82,
-                    hollow=True,
-                    annotate=("P+" if is_positive_pid else "P-") if slot_index == 0 else "",
-                    metadata={"pid": int(pid), "local_slot": int(local_slot), "global_index": int(global_idx)},
-                )
-            )
-
-    def visual_state_points(model_key: str) -> List[PointSpec]:
-        state = states[model_key]
-        ctx = state["context"]
-        points: List[PointSpec] = [
-            PointSpec(state["query_visual_anchor"], "query_t2v_anchor", f"visual_{model_key}_query_anchor", "*", QUERY_COLOR, size=142, alpha=0.86, annotate="q"),
-        ]
-        positive_labels: List[str] = []
-        positive_records: List[Dict[str, Any]] = []
-        for rank, image_index in enumerate(selected_positive, start=1):
-            label = f"visual_{model_key}_positive_image_{rank}_{int(image_index)}"
-            pid = int(gallery_pids[int(image_index)].item())
+    def model_points(model_key: str, ctx: RowContext) -> List[PointSpec]:
+        points: List[PointSpec] = []
+        for rank, image_index in enumerate(positive_image_indices, start=1):
             points.append(
-                PointSpec(
+                sample_point(
                     ctx.projected.image_features[int(image_index)],
-                    "positive_visual_sample",
-                    label,
-                    "o",
-                    POS_COLOR,
-                    size=38,
-                    alpha=0.36,
-                    hollow=True,
-                    annotate="",
-                    metadata={
-                        "gallery_index": int(image_index),
-                        "pid": pid,
-                        "rank": int(rank),
-                        "role": "selected_positive_image",
-                    },
+                    "visual",
+                    model_key,
+                    "positive",
+                    int(image_index),
+                    int(gallery_pids[int(image_index)].item()),
+                    rank,
                 )
             )
-            positive_labels.append(label)
-            positive_records.append({"gallery_index": int(image_index), "pid": pid, "rank": int(rank), "label": label})
-        points.append(PointSpec(state["positive_visual"], "positive_visual_centroid", f"visual_{model_key}_positive_centroid", "o", POS_COLOR, size=82, alpha=0.82, annotate="pos"))
-        hard_negative_labels: List[str] = []
-        hard_negative_records: List[Dict[str, Any]] = []
-        for rank, image_index in enumerate(selected_negative, start=1):
-            label = f"visual_{model_key}_hard_negative_image_{rank}_{int(image_index)}"
-            pid = int(gallery_pids[int(image_index)].item())
+        for rank, image_index in enumerate(hard_negative_image_indices, start=1):
             points.append(
-                PointSpec(
+                sample_point(
                     ctx.projected.image_features[int(image_index)],
-                    "hard_negative_visual_sample",
-                    label,
-                    "x",
-                    neg_color,
-                    size=40,
-                    alpha=0.38,
-                    annotate="",
-                    metadata={
-                        "gallery_index": int(image_index),
-                        "pid": pid,
-                        "rank": int(rank),
-                        "role": "selected_hard_negative_image",
-                    },
+                    "visual",
+                    model_key,
+                    "hard_negative",
+                    int(image_index),
+                    int(gallery_pids[int(image_index)].item()),
+                    rank,
                 )
             )
-            hard_negative_labels.append(label)
-            hard_negative_records.append({"gallery_index": int(image_index), "pid": pid, "rank": int(rank), "label": label})
-        points.append(PointSpec(state["hard_negative_visual"], "hard_negative_visual_centroid", f"visual_{model_key}_hard_negative_centroid", "x", neg_color, size=84, alpha=0.82, annotate="hard neg"))
-        visual_image_sample_labels[model_key] = {"positive": positive_labels, "hard_negative": hard_negative_labels}
-        visual_image_samples[model_key] = {"positive": positive_records, "hard_negative": hard_negative_records}
         return points
 
-    def text_state_points(model_key: str) -> List[PointSpec]:
-        state = states[model_key]
-        return [
-            PointSpec(state["query_text"], "query_text", f"text_{model_key}_query", "*", QUERY_COLOR, size=142, alpha=0.86, annotate="q"),
-            PointSpec(state["positive_text_anchor"], "positive_image_mode_anchor_centroid", f"text_{model_key}_positive_image_anchor_centroid", "o", POS_COLOR, size=82, alpha=0.82, annotate="pos"),
-            PointSpec(state["hard_negative_text_anchor"], "hard_negative_image_mode_anchor_centroid", f"text_{model_key}_hard_negative_image_anchor_centroid", "x", neg_color, size=84, alpha=0.82, annotate="hard neg"),
-        ]
+    semantic_iapr_points: List[PointSpec] = [translated_centroid_point(text_translated_centroid, "visual")]
+    for idx, record in enumerate(positive_proto_records):
+        semantic_iapr_points.append(prototype_point(bank.image_prototypes[int(record["global_index"])], "visual", True, record, annotate="P+" if idx == 0 else ""))
+    for idx, record in enumerate(negative_proto_records):
+        semantic_iapr_points.append(prototype_point(bank.image_prototypes[int(record["global_index"])], "visual", False, record, annotate="P-" if idx == 0 else ""))
 
-    visual_by_model = {key: visual_state_points(key) for key, _display, _ctx in model_specs}
-    text_by_model = {key: text_state_points(key) for key, _display, _ctx in model_specs}
-
-    def visual_arrows(target_key: str) -> List[ArrowSpec]:
-        return [
-            ArrowSpec("visual_vanilla_query_anchor", f"visual_{target_key}_query_anchor", "#555555", linestyle="--", linewidth=1.05, alpha=0.58),
-            ArrowSpec("visual_vanilla_positive_centroid", f"visual_{target_key}_positive_centroid", POS_COLOR, linestyle="--", linewidth=1.10, alpha=0.66),
-            ArrowSpec("visual_vanilla_hard_negative_centroid", f"visual_{target_key}_hard_negative_centroid", neg_color, linestyle="--", linewidth=1.10, alpha=0.66),
-        ]
-
-    def text_arrows(target_key: str) -> List[ArrowSpec]:
-        return [
-            ArrowSpec("text_vanilla_query", f"text_{target_key}_query", "#555555", linestyle="--", linewidth=1.05, alpha=0.58),
-            ArrowSpec("text_vanilla_positive_image_anchor_centroid", f"text_{target_key}_positive_image_anchor_centroid", POS_COLOR, linestyle="--", linewidth=1.10, alpha=0.66),
-            ArrowSpec("text_vanilla_hard_negative_image_anchor_centroid", f"text_{target_key}_hard_negative_image_anchor_centroid", neg_color, linestyle="--", linewidth=1.10, alpha=0.66),
-        ]
-
-    def metrics_for(model_key: str) -> str:
-        if retrieval_metrics_by_model is None or model_key not in retrieval_metrics_by_model:
-            return ""
-        vanilla_metrics = retrieval_metrics_by_model.get("vanilla") if model_key != "vanilla" else None
-        return metric_box_text(states[model_key]["display_label"], retrieval_metrics_by_model[model_key], vanilla_metrics)
-
-    visual_panels = [
-        PanelSpec("Vanilla visual space", visual_by_model["vanilla"] + visual_prototypes, metric_text=metrics_for("vanilla")),
-        PanelSpec("Host visual space", ghost_points(visual_by_model["vanilla"]) + visual_by_model["host"] + visual_prototypes, arrows=visual_arrows("host"), metric_text=metrics_for("host")),
-        PanelSpec("IAPR visual space", ghost_points(visual_by_model["vanilla"]) + visual_by_model["iapr"] + visual_prototypes, arrows=visual_arrows("iapr"), metric_text=metrics_for("iapr")),
+    vanilla_points = model_points("vanilla", vanilla_ctx) + [
+        motion_centroid_point(centroids["vanilla"]["positive"], "visual", "vanilla", "positive"),
+        motion_centroid_point(centroids["vanilla"]["hard_negative"], "visual", "vanilla", "hard_negative"),
     ]
-    text_panels = [
-        PanelSpec("Vanilla text space", text_by_model["vanilla"] + text_prototypes, metric_text=metrics_for("vanilla")),
-        PanelSpec("Host text space", ghost_points(text_by_model["vanilla"]) + text_by_model["host"] + text_prototypes, arrows=text_arrows("host"), metric_text=metrics_for("host")),
-        PanelSpec("IAPR text space", ghost_points(text_by_model["vanilla"]) + text_by_model["iapr"] + text_prototypes, arrows=text_arrows("iapr"), metric_text=metrics_for("iapr")),
+    host_points = model_points("host", host_ctx) + [
+        motion_centroid_point(centroids["vanilla"]["positive"], "visual", "vanilla", "positive", ghost=True),
+        motion_centroid_point(centroids["vanilla"]["hard_negative"], "visual", "vanilla", "hard_negative", ghost=True),
+        motion_centroid_point(centroids["host"]["positive"], "visual", "host", "positive"),
+        motion_centroid_point(centroids["host"]["hard_negative"], "visual", "host", "hard_negative"),
     ]
+    iapr_points = model_points("iapr", iapr_ctx) + [
+        motion_centroid_point(centroids["vanilla"]["positive"], "visual", "vanilla", "positive", ghost=True),
+        motion_centroid_point(centroids["vanilla"]["hard_negative"], "visual", "vanilla", "hard_negative", ghost=True),
+        motion_centroid_point(centroids["iapr"]["positive"], "visual", "iapr", "positive"),
+        motion_centroid_point(centroids["iapr"]["hard_negative"], "visual", "iapr", "hard_negative"),
+    ] + semantic_iapr_points
 
-    model_metadata: Dict[str, Any] = {}
-    for key, _display, ctx in model_specs:
-        state = states[key]
-        model_metadata[key] = {
-            "feature_source": ctx.projected.feature_source,
-            "projection_source": ctx.projected.projection_source,
-            "projection_decision": ctx.projection_decision,
-            "bank_source": ctx.bank_source,
-            "query_text_assignment_slot": state["query_text_assignment"],
-            "visual_centroid_assignment_slots": {
-                "positive": state["positive_visual_assignment"],
-                "hard_negative": state["hard_negative_visual_assignment"],
-            },
-            "image_visual_assignment_slots": {
-                "positive": {str(k): v for k, v in sorted(state["positive_image_assignments"].items())},
-                "hard_negative": {str(k): v for k, v in sorted(state["hard_negative_image_assignments"].items())},
-            },
-            "visual_side_metrics": state["visual_metrics"],
-            "text_side_metrics": state["text_metrics"],
-            "visual_image_samples": visual_image_samples.get(key, {"positive": [], "hard_negative": []}),
+    panels = [
+        PanelSpec("Vanilla CLIP", vanilla_points),
+        PanelSpec("Host", host_points, arrows=motion_arrows("visual", "host")),
+        PanelSpec("IAPR", iapr_points, arrows=motion_arrows("visual", "iapr")),
+    ]
+    metadata = {
+        "space": "visual",
+        "layout": "1x3",
+        "positive_samples": {
+            "rule": "all gallery images whose pid == query_pid",
+            "indices": [int(index) for index in positive_image_indices],
+            "count": int(len(positive_image_indices)),
+        },
+        "hard_negative_samples": {
+            "rule": "shared sample set selected once from the Host image-retrieval ranking; positives are excluded before taking top_hard_neg",
+            "shared_across_models": True,
+            "top_hard_neg": int(len(hard_negative_image_indices)),
+            "indices": [int(index) for index in hard_negative_image_indices],
+            "pids": [int(gallery_pids[int(index)].item()) for index in hard_negative_image_indices],
+        },
+        "translated_centroid": {
+            "name": "text-translated centroid",
+            "plotted_in": "IAPR visual panel only",
+            "construction": "all positive text samples -> IAPR text projector -> assign within query pid text_prototypes -> text_to_image -> mean -> L2 normalize",
+            "positive_text_indices": [int(index) for index in positive_text_indices],
+            "assignments_by_text_index": text_assignments,
+        },
+        "prototypes": {
+            "positive_visual_prototypes": positive_proto_records,
+            "negative_visual_prototypes": negative_proto_records,
+            "negative_ranking": "top prototype_hard_k non-query image_prototypes by cosine similarity to the text-translated centroid",
+        },
+        "panel_semantics": {
+            "vanilla": "positive image samples + shared hard negative image samples; centroid markers are motion annotations only",
+            "host": "positive image samples + shared hard negative image samples; centroid markers/arrows are motion annotations only",
+            "iapr": "positive image samples + shared hard negative image samples + text-translated centroid + visual prototypes",
+        },
+        "samples_by_model": sample_records,
+        "group_motion": motion_metadata("visual", panels),
+        "conceptual_guardrail": "No raw text embedding is plotted directly in visual space; translated text evidence is represented through IAPR text_to_image only.",
+    }
+    return panels, metadata
+
+
+def build_text_space_panels(
+    vanilla_ctx: RowContext,
+    host_ctx: RowContext,
+    iapr_ctx: RowContext,
+    query_index: int,
+    query_pid: int,
+    positive_text_indices: Sequence[int],
+    positive_image_indices: Sequence[int],
+    max_prototypes_per_id: int,
+    prototype_hard_k: int,
+    top_hard_negative: int,
+) -> Tuple[List[PanelSpec], Dict[str, Any]]:
+    bank = iapr_ctx.bank
+    image_translated_centroid, image_assignments = build_image_translated_centroid(iapr_ctx, bank, query_pid, positive_image_indices)
+    positive_proto_records = positive_prototype_records(bank, query_pid, max_prototypes_per_id)
+    negative_proto_records = select_hard_negative_prototypes(image_translated_centroid, bank.text_prototypes, bank, query_pid, prototype_hard_k)
+
+    hard_negative_indices: Dict[str, List[int]] = {}
+    hard_negative_scores: Dict[str, torch.Tensor] = {}
+    reference_metadata: Dict[str, Any] = {}
+    for model_key, display, ctx in model_context_sequence(vanilla_ctx, host_ctx, iapr_ctx):
+        if model_key == "iapr":
+            reference = image_translated_centroid
+            reference_name = "image-translated centroid"
+        else:
+            reference = ctx.projected.text_features[int(query_index)]
+            reference_name = "model query-side text representation"
+        indices, scores = select_hard_negative_text_indices(ctx.projected.text_features, ctx.projected.query_pids, query_pid, reference, top_hard_negative)
+        hard_negative_indices[model_key] = indices
+        hard_negative_scores[model_key] = scores
+        reference_metadata[model_key] = {
+            "display_label": display,
+            "reference": reference_name,
+            "selection_rule": "rank all text samples in this model text space by cosine similarity to the reference; exclude query_pid positives; take top_hard_neg",
+            "selected_indices": [int(index) for index in indices],
+            "selected_pids": [int(ctx.projected.query_pids[int(index)].item()) for index in indices],
+            "selected_scores": [float(scores[int(index)].item()) for index in indices],
         }
 
-    metadata = {
-        "layout": "2x3",
-        "plot_bank_source": bank.source_path,
-        "diagnostic_anchor_space": {
-            "projectors": "IAPR projection heads for Vanilla, Host, and IAPR projected features",
-            "prototype_bank": "IAPR prototype bank for every plotted prototype anchor",
-            "text_to_visual_translation": "IAPR text_to_image translated prototypes",
-            "visual_to_text_translation": "IAPR image_to_text translated prototypes",
-        },
-        "query_t2v_anchor_source": "each model projected text query is assigned to IAPR text_prototypes and rendered through IAPR text_to_image",
-        "image_mode_anchor_source": "each model projected image evidence is assigned to IAPR image_prototypes and rendered through IAPR image_to_text",
-        "model_states": model_metadata,
-        "visual_image_samples": visual_image_samples,
-        "retrieval_metrics": {
-            str(key): dict(value) for key, value in (retrieval_metrics_by_model or {}).items()
-        },
-        "plotted_prototype_slots": {
-            str(pid): [
-                {"local_slot": int(local_slot), "global_index": int(global_idx)}
-                for local_slot, global_idx in slots
-            ]
-            for pid, slots in selected_slots.items()
-        },
-        "stateful_point_labels": {
-            "visual": [
-                "visual_vanilla_query_anchor",
-                "visual_vanilla_positive_centroid",
-                "visual_vanilla_hard_negative_centroid",
-                "visual_host_query_anchor",
-                "visual_host_positive_centroid",
-                "visual_host_hard_negative_centroid",
-                "visual_iapr_query_anchor",
-                "visual_iapr_positive_centroid",
-                "visual_iapr_hard_negative_centroid",
+    centroids: Dict[str, Dict[str, torch.Tensor]] = {}
+    sample_records: Dict[str, Any] = {}
+    for model_key, _display, ctx in model_context_sequence(vanilla_ctx, host_ctx, iapr_ctx):
+        centroids[model_key] = {
+            "positive": feature_centroid(ctx.projected.text_features, positive_text_indices),
+            "hard_negative": feature_centroid(ctx.projected.text_features, hard_negative_indices[model_key]),
+        }
+        sample_records[model_key] = {
+            "positive": [
+                {"text_index": int(index), "pid": int(ctx.projected.query_pids[int(index)].item())}
+                for index in positive_text_indices
             ],
-            "visual_image_sample_labels": visual_image_sample_labels,
-            "text": [
-                "text_vanilla_query",
-                "text_vanilla_positive_image_anchor_centroid",
-                "text_vanilla_hard_negative_image_anchor_centroid",
-                "text_host_query",
-                "text_host_positive_image_anchor_centroid",
-                "text_host_hard_negative_image_anchor_centroid",
-                "text_iapr_query",
-                "text_iapr_positive_image_anchor_centroid",
-                "text_iapr_hard_negative_image_anchor_centroid",
+            "hard_negative": [
+                {"text_index": int(index), "pid": int(ctx.projected.query_pids[int(index)].item()), "score": float(hard_negative_scores[model_key][int(index)].item())}
+                for index in hard_negative_indices[model_key]
             ],
-        },
-    }
-    return visual_panels, text_panels, metadata
+        }
 
+    def model_points(model_key: str, ctx: RowContext) -> List[PointSpec]:
+        points: List[PointSpec] = []
+        for rank, text_index in enumerate(positive_text_indices, start=1):
+            points.append(
+                sample_point(
+                    ctx.projected.text_features[int(text_index)],
+                    "text",
+                    model_key,
+                    "positive",
+                    int(text_index),
+                    int(ctx.projected.query_pids[int(text_index)].item()),
+                    rank,
+                )
+            )
+        for rank, text_index in enumerate(hard_negative_indices[model_key], start=1):
+            points.append(
+                sample_point(
+                    ctx.projected.text_features[int(text_index)],
+                    "text",
+                    model_key,
+                    "hard_negative",
+                    int(text_index),
+                    int(ctx.projected.query_pids[int(text_index)].item()),
+                    rank,
+                )
+            )
+        return points
+
+    semantic_iapr_points: List[PointSpec] = [translated_centroid_point(image_translated_centroid, "text")]
+    for idx, record in enumerate(positive_proto_records):
+        semantic_iapr_points.append(prototype_point(bank.text_prototypes[int(record["global_index"])], "text", True, record, annotate="P+" if idx == 0 else ""))
+    for idx, record in enumerate(negative_proto_records):
+        semantic_iapr_points.append(prototype_point(bank.text_prototypes[int(record["global_index"])], "text", False, record, annotate="P-" if idx == 0 else ""))
+
+    vanilla_points = model_points("vanilla", vanilla_ctx) + [
+        motion_centroid_point(centroids["vanilla"]["positive"], "text", "vanilla", "positive"),
+        motion_centroid_point(centroids["vanilla"]["hard_negative"], "text", "vanilla", "hard_negative"),
+    ]
+    host_points = model_points("host", host_ctx) + [
+        motion_centroid_point(centroids["vanilla"]["positive"], "text", "vanilla", "positive", ghost=True),
+        motion_centroid_point(centroids["vanilla"]["hard_negative"], "text", "vanilla", "hard_negative", ghost=True),
+        motion_centroid_point(centroids["host"]["positive"], "text", "host", "positive"),
+        motion_centroid_point(centroids["host"]["hard_negative"], "text", "host", "hard_negative"),
+    ]
+    iapr_points = model_points("iapr", iapr_ctx) + [
+        motion_centroid_point(centroids["vanilla"]["positive"], "text", "vanilla", "positive", ghost=True),
+        motion_centroid_point(centroids["vanilla"]["hard_negative"], "text", "vanilla", "hard_negative", ghost=True),
+        motion_centroid_point(centroids["iapr"]["positive"], "text", "iapr", "positive"),
+        motion_centroid_point(centroids["iapr"]["hard_negative"], "text", "iapr", "hard_negative"),
+    ] + semantic_iapr_points
+
+    panels = [
+        PanelSpec("Vanilla CLIP", vanilla_points),
+        PanelSpec("Host", host_points, arrows=motion_arrows("text", "host")),
+        PanelSpec("IAPR", iapr_points, arrows=motion_arrows("text", "iapr")),
+    ]
+    metadata = {
+        "space": "text",
+        "layout": "1x3",
+        "positive_samples": {
+            "rule": "all text/caption samples whose pid == query_pid",
+            "indices": [int(index) for index in positive_text_indices],
+            "count": int(len(positive_text_indices)),
+        },
+        "hard_negative_samples": {
+            "rule": "panel-specific symmetric text-space diagnostic ranking; positives are excluded before taking top_hard_neg",
+            "shared_across_models": False,
+            "top_hard_neg": int(top_hard_negative),
+            "by_model": reference_metadata,
+            "note": "Vanilla/Host use the model query-side text representation; IAPR uses the image-translated centroid.",
+        },
+        "translated_centroid": {
+            "name": "image-translated centroid",
+            "plotted_in": "IAPR text panel only",
+            "construction": "all positive image samples -> IAPR image projector -> assign within query pid image_prototypes -> image_to_text -> mean -> L2 normalize",
+            "positive_image_indices": [int(index) for index in positive_image_indices],
+            "assignments_by_image_index": image_assignments,
+        },
+        "prototypes": {
+            "positive_text_prototypes": positive_proto_records,
+            "negative_text_prototypes": negative_proto_records,
+            "negative_ranking": "top prototype_hard_k non-query text_prototypes by cosine similarity to the image-translated centroid",
+        },
+        "panel_semantics": {
+            "vanilla": "positive text samples + panel-specific hard negative text samples; centroid markers are motion annotations only",
+            "host": "positive text samples + panel-specific hard negative text samples; centroid markers/arrows are motion annotations only",
+            "iapr": "positive text samples + panel-specific hard negative text samples + image-translated centroid + text prototypes",
+        },
+        "samples_by_model": sample_records,
+        "group_motion": motion_metadata("text", panels),
+        "conceptual_guardrail": "No raw image embedding is plotted directly in text space; translated image evidence is represented through IAPR image_to_text only.",
+    }
+    return panels, metadata
 
 def image_record(
     index: int,
@@ -1965,96 +1953,12 @@ def image_record(
     return record
 
 
-def thumbnail_record(
-    role: str,
-    index: int,
-    split_data: SplitData,
-    gallery_pids: torch.Tensor,
-    sim_host: torch.Tensor,
-    sim_iapr: torch.Tensor,
-    query_index: int,
-    sim_vanilla: Optional[torch.Tensor] = None,
-) -> Dict[str, Any]:
-    record = image_record(index, split_data, gallery_pids, sim_host, sim_iapr, query_index, sim_vanilla=sim_vanilla)
-    record["role"] = role
-    record["loaded"] = False
-    record["load_error"] = None
-    return record
-
-
-def draw_thumbnail_axis(ax: Any, record: MutableMapping[str, Any], title: str) -> None:
-    ax.set_xticks([])
-    ax.set_yticks([])
-    for spine in ax.spines.values():
-        spine.set_linewidth(0.45)
-        spine.set_edgecolor("#CCCCCC")
-    path = str(record.get("path", ""))
-    try:
-        import matplotlib.image as mpimg
-
-        image = mpimg.imread(path)
-        ax.imshow(image)
-        record["loaded"] = True
-    except Exception as exc:  # keep the figure even when a local thumbnail cannot be opened
-        record["loaded"] = False
-        record["load_error"] = str(exc)
-        ax.text(0.5, 0.5, "thumbnail\nunavailable", ha="center", va="center", fontsize=5.4, color="#777777")
-    ax.set_title(title, fontsize=5.7, pad=1.2)
-
-
-def draw_thumbnail_strip(
-    fig: Any,
-    thumb_grid: Any,
-    candidate: Mapping[str, Any],
-    split_data: SplitData,
-    gallery_pids: torch.Tensor,
-    sim_host: torch.Tensor,
-    sim_iapr: torch.Tensor,
-    sim_vanilla: Optional[torch.Tensor] = None,
-) -> Dict[str, Any]:
-    query_index = int(candidate["query_index"])
-    query_pid = int(candidate["query_pid"])
-    hard_negative_pid = int(candidate["hard_negative_pid"])
-    status = "fully repaired" if bool(candidate.get("fully_repaired")) else "improved, not fully repaired"
-    query_text = textwrap.fill(truncate_text(str(candidate["query_text"]), chars=82), width=45, break_long_words=False)
-
-    ax_text = fig.add_subplot(thumb_grid[0, 0])
-    ax_text.axis("off")
-    ax_text.text(
-        0.0,
-        0.96,
-        f"q={query_index}  pid={query_pid}  hpid={hard_negative_pid}\n{status}\n{query_text}",
-        ha="left",
-        va="top",
-        fontsize=6.2,
-        linespacing=1.05,
-    )
-
-    items: List[Tuple[str, int, str]] = []
-    for rank, index in enumerate([int(x) for x in candidate.get("selected_positive", [])][:2], start=1):
-        items.append(("positive", index, f"Pos {rank}\npid={int(gallery_pids[index].item())}"))
-    for rank, index in enumerate([int(x) for x in candidate.get("selected_negative", [])][:2], start=1):
-        items.append(("host_hard_negative", index, f"HOST HN {rank}\npid={int(gallery_pids[index].item())}"))
-    for rank, index in enumerate([int(x) for x in candidate.get("iapr_top_retrieved", [])][:2], start=1):
-        items.append(("iapr_top_retrieved", index, f"IAPR Top {rank}\npid={int(gallery_pids[index].item())}"))
-
-    thumbnail_records: List[Dict[str, Any]] = []
-    for col in range(1, 7):
-        ax = fig.add_subplot(thumb_grid[0, col])
-        if col - 1 >= len(items):
-            ax.axis("off")
-            continue
-        role, image_index, title = items[col - 1]
-        record = thumbnail_record(role, image_index, split_data, gallery_pids, sim_host, sim_iapr, query_index, sim_vanilla=sim_vanilla)
-        draw_thumbnail_axis(ax, record, title)
-        thumbnail_records.append(dict(record))
-
+def text_record(index: int, split_data: SplitData, text_pids: torch.Tensor) -> Dict[str, Any]:
     return {
-        "query_text_truncated": truncate_text(str(candidate["query_text"]), chars=82),
-        "status_text": status,
-        "items": thumbnail_records,
+        "text_index": int(index),
+        "pid": int(text_pids[int(index)].item()),
+        "caption": str(split_data.captions[int(index)]),
     }
-
 
 
 def passes_prototype_pid_filter(bank: PrototypeBankData, query_pid: int, gallery_pids: torch.Tensor, indices: Sequence[int]) -> bool:
@@ -2163,6 +2067,79 @@ def select_candidates(
     return candidates, dict(counters)
 
 
+def render_space_figure(
+    case_id: int,
+    space_key: str,
+    panels: Sequence[PanelSpec],
+    candidate: Mapping[str, Any],
+    retrieval_metrics_by_model: Mapping[str, Mapping[str, Any]],
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> Dict[str, Any]:
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+
+    scope = (
+        f"{space_key} space: one shared 2D projection fit over Vanilla CLIP, Host, and IAPR "
+        "panel points for within-space comparability"
+    )
+    projection = fit_shared_projection(panel_points(panels), args.projection, scope)
+
+    fig = plt.figure(figsize=(13.3, 5.7), constrained_layout=False)
+    outer = GridSpec(
+        3,
+        1,
+        figure=fig,
+        height_ratios=[4.7, 0.46, 0.72],
+        hspace=0.075,
+        top=0.835,
+        bottom=0.055,
+        left=0.035,
+        right=0.990,
+    )
+    panel_grid = outer[0].subgridspec(1, 3, wspace=0.045)
+    metric_grid = outer[1].subgridspec(1, 3, wspace=0.06)
+
+    projection_meta: Dict[str, Any] = dict(projection.metadata)
+    projection_meta["panels"] = []
+    for col, panel in enumerate(panels):
+        ax = fig.add_subplot(panel_grid[0, col])
+        projection_meta["panels"].append(draw_panel_with_shared_projection(ax, panel, projection))
+
+    footer_metric_lines = draw_footer_metrics(fig, metric_grid, retrieval_metrics_by_model)
+    draw_footer_legend(fig, outer[2])
+
+    query_index = int(candidate["query_index"])
+    query_pid = int(candidate["query_pid"])
+    status = "fully repaired" if bool(candidate.get("fully_repaired")) else "improved, not fully repaired"
+    vanilla_margin = float(retrieval_metrics_by_model["vanilla"]["margin"])
+    host_margin = float(retrieval_metrics_by_model["host"]["margin"])
+    iapr_margin = float(retrieval_metrics_by_model["iapr"]["margin"])
+    delta_iapr_host = iapr_margin - host_margin
+    title_space = "Visual Space" if space_key == "visual" else "Text Space"
+    fig.suptitle(
+        f"{title_space}: Vanilla CLIP / Host / IAPR | q={query_index}, pid={query_pid} | "
+        f"m V={vanilla_margin:+.3f}, H={host_margin:+.3f}, I={iapr_margin:+.3f}, dIH={delta_iapr_host:+.3f} | {status}\n"
+        f"{truncate_text(str(candidate['query_text']), chars=150)}",
+        fontsize=9.1,
+        fontweight="bold",
+        y=0.970,
+    )
+
+    pdf_path = output_dir / f"case_{case_id:03d}_{space_key}_space.pdf"
+    png_path = output_dir / f"case_{case_id:03d}_{space_key}_space.png"
+    fig.savefig(pdf_path, bbox_inches="tight")
+    fig.savefig(png_path, dpi=int(args.dpi), bbox_inches="tight")
+    plt.close(fig)
+
+    return {
+        "output_pdf": str(pdf_path),
+        "output_png": str(png_path),
+        "footer_metric_lines": footer_metric_lines,
+        "projection": projection_meta,
+    }
+
+
 def render_case(
     case_id: int,
     candidate: Mapping[str, Any],
@@ -2177,21 +2154,32 @@ def render_case(
     args: argparse.Namespace,
     output_dir: Path,
 ) -> Dict[str, Any]:
-    """Render the 2x3 Vanilla/Host/IAPR dual-space diagnostic figure."""
+    """Render separate 1x3 visual-space and text-space diagnostic figures."""
     try:
         import matplotlib
 
         matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.gridspec import GridSpec
     except ImportError as exc:
-        raise RuntimeError("matplotlib is required to draw the dual-space repair figure.") from exc
+        raise RuntimeError("matplotlib is required to draw the local repair figures.") from exc
 
     query_index = int(candidate["query_index"])
     query_pid = int(candidate["query_pid"])
-    hard_negative_pid = int(candidate["hard_negative_pid"])
-    selected_positive = [int(x) for x in candidate["selected_positive"]]
-    selected_negative = [int(x) for x in candidate["selected_negative"]]
+
+    positive_image_indices = collect_positive_image_indices(gallery_pids, query_pid)
+    positive_text_indices = collect_positive_text_indices(iapr_ctx.projected.query_pids, query_pid)
+    hard_negative_image_indices = select_hard_negative_image_indices(
+        query_index,
+        query_pid,
+        gallery_pids,
+        sim_host,
+        int(args.top_hard_neg),
+    )
+    if not positive_image_indices:
+        raise ValueError(f"no positive gallery images found for query_pid={query_pid}")
+    if not positive_text_indices:
+        raise ValueError(f"no positive text samples found for query_pid={query_pid}")
+    if not hard_negative_image_indices:
+        raise ValueError(f"no hard negative gallery images found for query_pid={query_pid}")
 
     retrieval_metrics_by_model = {
         "vanilla": retrieval_metrics_for_query(sim_vanilla, query_index, query_pid, gallery_pids),
@@ -2199,90 +2187,51 @@ def render_case(
         "iapr": retrieval_metrics_for_query(sim_iapr, query_index, query_pid, gallery_pids),
     }
 
-    visual_panels, text_panels, repair_meta = build_repair_panels(
+    visual_panels, visual_meta = build_visual_space_panels(
         vanilla_ctx=vanilla_ctx,
         host_ctx=host_ctx,
         iapr_ctx=iapr_ctx,
         query_index=query_index,
         query_pid=query_pid,
-        hard_negative_pid=hard_negative_pid,
-        selected_positive=selected_positive,
-        selected_negative=selected_negative,
+        positive_image_indices=positive_image_indices,
+        hard_negative_image_indices=hard_negative_image_indices,
+        positive_text_indices=positive_text_indices,
         gallery_pids=gallery_pids,
-        max_prototypes_per_id=args.prototype_per_id,
-        retrieval_metrics_by_model=retrieval_metrics_by_model,
+        max_prototypes_per_id=int(args.prototype_per_id),
+        prototype_hard_k=int(args.prototype_hard_k),
+    )
+    text_panels, text_meta = build_text_space_panels(
+        vanilla_ctx=vanilla_ctx,
+        host_ctx=host_ctx,
+        iapr_ctx=iapr_ctx,
+        query_index=query_index,
+        query_pid=query_pid,
+        positive_text_indices=positive_text_indices,
+        positive_image_indices=positive_image_indices,
+        max_prototypes_per_id=int(args.prototype_per_id),
+        prototype_hard_k=int(args.prototype_hard_k),
+        top_hard_negative=int(args.top_hard_neg),
     )
 
-    visual_projection = fit_shared_projection(
-        panel_points(visual_panels),
-        args.projection,
-        "visual row: Vanilla + Host + IAPR visual-space state points and fixed IAPR visual prototypes",
-    )
-    text_projection = fit_shared_projection(
-        panel_points(text_panels),
-        args.projection,
-        "text row: Vanilla + Host + IAPR text-space state points and fixed IAPR text prototypes",
-    )
+    visual_render_meta = render_space_figure(case_id, "visual", visual_panels, candidate, retrieval_metrics_by_model, args, output_dir)
+    text_render_meta = render_space_figure(case_id, "text", text_panels, candidate, retrieval_metrics_by_model, args, output_dir)
 
-    fig = plt.figure(figsize=(11.3, 7.8), constrained_layout=False)
-    outer = GridSpec(
-        4,
-        1,
-        figure=fig,
-        height_ratios=[0.42, 6.05, 0.38, 0.22],
-        hspace=0.055,
-        top=0.915,
-        bottom=0.045,
-        left=0.042,
-        right=0.990,
-    )
-    thumb_grid = outer[0].subgridspec(1, 7, width_ratios=[2.10, 1, 1, 1, 1, 1, 1], wspace=0.12)
-    panel_grid = outer[1].subgridspec(2, 3, wspace=0.045, hspace=0.115)
-    metric_grid = outer[2].subgridspec(1, 3, wspace=0.06)
-
-    thumbnail_meta = draw_thumbnail_strip(fig, thumb_grid, candidate, split_data, gallery_pids, sim_host, sim_iapr, sim_vanilla=sim_vanilla)
-
-    panel_projection_meta: Dict[str, Any] = {
-        "visual_row": dict(visual_projection.metadata),
-        "text_row": dict(text_projection.metadata),
-    }
-    panel_projection_meta["visual_row"]["panels"] = []
-    panel_projection_meta["text_row"]["panels"] = []
-    for col, panel in enumerate(visual_panels):
-        ax = fig.add_subplot(panel_grid[0, col])
-        panel_projection_meta["visual_row"]["panels"].append(draw_panel_with_shared_projection(ax, panel, visual_projection))
-    for col, panel in enumerate(text_panels):
-        ax = fig.add_subplot(panel_grid[1, col])
-        panel_projection_meta["text_row"]["panels"].append(draw_panel_with_shared_projection(ax, panel, text_projection))
-
-    footer_metric_lines = draw_footer_metrics(fig, metric_grid, retrieval_metrics_by_model)
-    draw_footer_legend(fig, outer[3])
-
-    status = "fully repaired" if bool(candidate.get("fully_repaired")) else "improved, not fully repaired"
     vanilla_margin = float(retrieval_metrics_by_model["vanilla"]["margin"])
     host_margin = float(retrieval_metrics_by_model["host"]["margin"])
     iapr_margin = float(retrieval_metrics_by_model["iapr"]["margin"])
     delta_iapr_host = iapr_margin - host_margin
-    fig.suptitle(
-        f"Dual-Space Local Repair: Vanilla / Host / IAPR | q={query_index}, pid={query_pid}, hn={hard_negative_pid} | "
-        f"m V={vanilla_margin:+.3f}, H={host_margin:+.3f}, I={iapr_margin:+.3f}, dIH={delta_iapr_host:+.3f} | {status}",
-        fontsize=9.1,
-        fontweight="bold",
-        y=0.982,
-    )
+    status = "fully repaired" if bool(candidate.get("fully_repaired")) else "improved, not fully repaired"
 
-    pdf_path = output_dir / f"case_{case_id:03d}_dual_space_repair.pdf"
-    png_path = output_dir / f"case_{case_id:03d}_dual_space_repair.png"
-    fig.savefig(pdf_path, bbox_inches="tight")
-    fig.savefig(png_path, dpi=int(args.dpi), bbox_inches="tight")
-    plt.close(fig)
+    hard_negative_text_records_by_model = {
+        key: [text_record(int(index), split_data, iapr_ctx.projected.query_pids) for index in value.get("selected_indices", [])]
+        for key, value in text_meta["hard_negative_samples"]["by_model"].items()
+    }
 
     metadata = {
         "query_index": query_index,
         "query_text": str(candidate["query_text"]),
         "query_pid": query_pid,
-        "hard_negative_pid": hard_negative_pid,
-        "rendering_layout": "2x3",
+        "rendering_layout": "separate_1x3_visual_and_text_figures",
         "repair_status": str(candidate.get("repair_status", status.replace(" ", "_"))),
         "fully_repaired": bool(candidate.get("fully_repaired")),
         "preferred_repair_case": bool(candidate.get("preferred_repair_case")),
@@ -2298,18 +2247,28 @@ def render_case(
         "iapr_positive_score": float(retrieval_metrics_by_model["iapr"]["positive_score"]),
         "iapr_hard_negative_score": float(retrieval_metrics_by_model["iapr"]["hard_negative_score"]),
         "retrieval_metrics": retrieval_metrics_by_model,
-        "footer_metric_lines": footer_metric_lines,
-        "selected_positive_images": [image_record(idx, split_data, gallery_pids, sim_host, sim_iapr, query_index, sim_vanilla=sim_vanilla) for idx in selected_positive],
-        "selected_hard_negative_images": [image_record(idx, split_data, gallery_pids, sim_host, sim_iapr, query_index, sim_vanilla=sim_vanilla) for idx in selected_negative],
-        "iapr_top_retrieved_images": [
-            image_record(int(idx), split_data, gallery_pids, sim_host, sim_iapr, query_index, sim_vanilla=sim_vanilla)
-            for idx in [int(x) for x in candidate.get("iapr_top_retrieved", [])]
-        ],
-        "thumbnail_strip": thumbnail_meta,
-        "hard_negative_pids": [int(gallery_pids[idx].item()) for idx in selected_negative],
-        "selected_prototype_slots": repair_meta.get("plotted_prototype_slots", {}),
-        "repair_panel_metadata": repair_meta,
-        "diagnostic_anchor_space": repair_meta.get("diagnostic_anchor_space", {}),
+        "plot_controls": {
+            "top_hard_neg_samples": int(args.top_hard_neg),
+            "prototype_per_id": int(args.prototype_per_id),
+            "prototype_hard_k": int(args.prototype_hard_k),
+            "top_pos_case_selection_only": int(args.top_pos),
+        },
+        "plotted_samples": {
+            "positive_images": [image_record(idx, split_data, gallery_pids, sim_host, sim_iapr, query_index, sim_vanilla=sim_vanilla) for idx in positive_image_indices],
+            "hard_negative_images": [image_record(idx, split_data, gallery_pids, sim_host, sim_iapr, query_index, sim_vanilla=sim_vanilla) for idx in hard_negative_image_indices],
+            "positive_texts": [text_record(idx, split_data, iapr_ctx.projected.query_pids) for idx in positive_text_indices],
+            "hard_negative_texts_by_model": hard_negative_text_records_by_model,
+        },
+        "candidate_selection": {
+            "note": "Case selection is preserved from the earlier Host-vs-IAPR margin diagnostic; plotted positive samples are no longer limited by top_pos.",
+            "host_case_hard_negative_pid": int(candidate["hard_negative_pid"]),
+            "case_selection_positive_indices": [int(x) for x in candidate.get("selected_positive", [])],
+            "case_selection_negative_indices": [int(x) for x in candidate.get("selected_negative", [])],
+            "iapr_top_retrieved_images": [
+                image_record(int(idx), split_data, gallery_pids, sim_host, sim_iapr, query_index, sim_vanilla=sim_vanilla)
+                for idx in [int(x) for x in candidate.get("iapr_top_retrieved", [])]
+            ],
+        },
         "similarities_used_for_ranking": {
             "margin_formula": "max_positive_similarity - max_hard_negative_similarity",
             "vanilla_best_positive_index": int(retrieval_metrics_by_model["vanilla"]["best_positive_index"]),
@@ -2319,23 +2278,41 @@ def render_case(
             "iapr_best_positive_index": int(candidate["iapr_best_pos_index"]),
             "iapr_hard_negative_index": int(candidate["iapr_hard_neg_index"]),
         },
+        "visual_space": {
+            **visual_meta,
+            **visual_render_meta,
+        },
+        "text_space": {
+            **text_meta,
+            **text_render_meta,
+        },
+        "output_files": {
+            "visual_space": {"pdf": visual_render_meta["output_pdf"], "png": visual_render_meta["output_png"]},
+            "text_space": {"pdf": text_render_meta["output_pdf"], "png": text_render_meta["output_png"]},
+        },
         "projection": {
             "method": args.projection,
-            "layout": "2x3",
+            "layout": "separate 1x3 figures",
             "fit_scope": {
-                "visual_row": "one shared fit over Vanilla + Host + IAPR visual-space points, including fixed IAPR visual prototypes",
-                "text_row": "one shared fit over Vanilla + Host + IAPR text-space points, including fixed IAPR text prototypes",
+                "visual_space": "one shared fit over Vanilla + Host + IAPR visual-space points only",
+                "text_space": "one shared fit over Vanilla + Host + IAPR text-space points only",
             },
-            "rows": panel_projection_meta,
         },
-        "output_pdf": str(pdf_path),
-        "output_png": str(png_path),
+        "diagnostic_anchor_space": {
+            "projectors": "IAPR projection heads are used for Vanilla, Host, and IAPR projected bundles",
+            "prototype_bank": "IAPR prototype bank is used for IAPR-panel prototypes and translated-centroid construction",
+            "visual_space_translation": "positive text evidence is translated to visual space only through text_to_image",
+            "text_space_translation": "positive image evidence is translated to text space only through image_to_text",
+        },
+        "conceptual_guardrail": (
+            "Raw cross-modal embeddings are not directly mixed. The visual-space translated centroid is built through text_to_image, "
+            "and the text-space translated centroid is built through image_to_text."
+        ),
     }
     metadata_path = output_dir / f"case_{case_id:03d}_metadata.json"
     save_json(metadata, metadata_path)
     metadata["metadata_path"] = str(metadata_path)
     return metadata
-
 
 def print_load_report(label: str, report: CheckpointLoadReport) -> None:
     print(
@@ -2362,6 +2339,8 @@ def main() -> None:
         raise ValueError("--top_hard_neg must be positive.")
     if args.prototype_per_id <= 0:
         raise ValueError("--prototype_per_id must be positive.")
+    if args.prototype_hard_k < 0:
+        raise ValueError("--prototype_hard_k must be non-negative.")
     if not (0.0 <= float(args.retrieval_alpha) <= 1.0):
         raise ValueError("--retrieval_alpha must be in [0, 1].")
 
@@ -2623,10 +2602,21 @@ def main() -> None:
         "iapr_ckpt": str(iapr_ckpt),
         "prototype_ckpt": str(prototype_path),
         "prototype_projector_ckpt": str(prototype_projector_path),
-        "rendering_layout": "2x3",
+        "rendering_layout": "separate_1x3_visual_and_text_figures",
         "num_cases_requested": int(args.num_cases),
         "num_cases_rendered": int(len(selected_cases)),
         "skipped_render_cases": int(skipped_render),
+        "plot_controls": {
+            "top_pos_case_selection_only": int(args.top_pos),
+            "top_hard_neg_samples": int(args.top_hard_neg),
+            "prototype_per_id": int(args.prototype_per_id),
+            "prototype_hard_k": int(args.prototype_hard_k),
+        },
+        "output_naming": {
+            "visual_space": "case_XXX_visual_space.{pdf,png}",
+            "text_space": "case_XXX_text_space.{pdf,png}",
+            "metadata": "case_XXX_metadata.json",
+        },
         "retrieval_scoring": {
             "mode": host_retrieval_mode,
             "vanilla_mode": vanilla_retrieval_mode,
@@ -2648,12 +2638,14 @@ def main() -> None:
         "shared_iapr_prototype_anchors_for_diagnostic": bool(shared_iapr_anchors),
         "diagnostic_anchor_space": {
             "projectors": "IAPR projection heads are used for Vanilla, Host, and IAPR projected bundles",
-            "prototype_bank": "IAPR prototype bank is used for every plotted prototype anchor",
+            "prototype_bank": "IAPR prototype bank is used for IAPR-panel prototypes and translated-centroid construction",
             "projection_decision": diagnostic_projection_decision,
             "projection_fit_scope": {
-                "visual_row": "one shared 2D fit over Vanilla + Host + IAPR visual-space points",
-                "text_row": "one shared 2D fit over Vanilla + Host + IAPR text-space points",
+                "visual_space": "one shared 2D fit over Vanilla + Host + IAPR visual-space points only",
+                "text_space": "one shared 2D fit over Vanilla + Host + IAPR text-space points only",
             },
+            "visual_space_translation": "positive text evidence is translated to visual space only through text_to_image",
+            "text_space_translation": "positive image evidence is translated to text space only through image_to_text",
         },
         "host_projection_decision": "Host features projected by IAPR projection heads for shared diagnostic comparability",
         "host_own_bank_available_but_unused": bool(host_own_bank_available),
@@ -2678,9 +2670,8 @@ def main() -> None:
         "selection_counters": selection_counters,
         "cases": selected_cases,
         "conceptual_guardrail": (
-            "Raw cross-modal embeddings are not directly mixed. In the visual-side panel, text evidence is represented "
-            "through text-to-visual translated prototypes. In the text-side panel, image evidence is represented "
-            "through visual-to-text translated prototypes."
+            "Raw cross-modal embeddings are not directly mixed. The visual-space translated centroid is built through text_to_image, "
+            "and the text-space translated centroid is built through image_to_text."
         ),
         "key_mapping_notes": {
             "raw_visual_prototypes": "image_prototypes",
