@@ -286,6 +286,12 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="Number of hard negative prototypes to plot in the IAPR panels.",
     )
+    parser.add_argument(
+        "--prototype_feature",
+        default="auto",
+        choices=["auto", "global", "local"],
+        help="Prototype feature source for the diagnostic model. auto uses local when --itself is enabled, otherwise global.",
+    )
     parser.add_argument("--projection", default="pca", choices=["pca", "mds", "umap"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
@@ -699,8 +705,14 @@ def config_model_args(cli: argparse.Namespace, bank: PrototypeBankData) -> Simpl
         cfg["prototype_projector"] = str(bank.config.get("projector_mode"))
     use_itself_retrieval = bool(getattr(cli, "itself", False) or getattr(cli, "retrieval_branch", "auto") == "itself")
     wants_local_retrieval = bool(use_itself_retrieval or getattr(cli, "retrieval_branch", "auto") in {"grab", "global+grab"})
+    requested_prototype_feature = str(getattr(cli, "prototype_feature", "auto"))
+    if requested_prototype_feature == "auto":
+        cfg["prototype_feature"] = "local" if use_itself_retrieval else "global"
+    else:
+        cfg["prototype_feature"] = requested_prototype_feature
     cfg["only_global"] = not wants_local_retrieval
-    cfg["prototype_feature"] = "global"
+    if cfg["prototype_feature"] == "local" and cfg["only_global"]:
+        cfg["only_global"] = False
     cfg["return_all"] = bool(use_itself_retrieval)
     cfg["modify_k"] = bool(use_itself_retrieval)
     cfg["topk_type"] = "custom" if use_itself_retrieval else "mean"
@@ -2281,6 +2293,7 @@ def render_case(
             "top_hard_neg_samples": int(args.top_hard_neg),
             "prototype_per_id": int(args.prototype_per_id),
             "prototype_hard_k": int(args.prototype_hard_k),
+            "prototype_feature_cli": str(args.prototype_feature),
             "top_pos_case_selection_only": int(args.top_pos),
             "itself_enabled_for_host_iapr": bool(args.itself or args.retrieval_branch == "itself"),
             "itself_lambda": float(args.itself_lambda),
@@ -2663,6 +2676,7 @@ def main() -> None:
             "top_hard_neg_samples": int(args.top_hard_neg),
             "prototype_per_id": int(args.prototype_per_id),
             "prototype_hard_k": int(args.prototype_hard_k),
+            "prototype_feature_cli": str(args.prototype_feature),
             "itself_enabled_for_host_iapr": bool(use_itself_scoring),
             "itself_lambda": float(args.itself_lambda),
         },
@@ -2695,7 +2709,7 @@ def main() -> None:
             "topk_type": str(model_args.topk_type),
             "modify_k": bool(model_args.modify_k),
             "note": (
-                "Prototype-space diagnostic projections remain global; when ITSELF retrieval is enabled the model is built with only_global=False, return_all=True, topk_type=custom, and modify_k=True."
+                "When --prototype_feature auto is used, ITSELF retrieval builds the diagnostic model with prototype_feature=local, only_global=False, return_all=True, topk_type=custom, and modify_k=True."
             ),
         },
         "shared_iapr_prototype_anchors_for_diagnostic": bool(shared_iapr_anchors),
