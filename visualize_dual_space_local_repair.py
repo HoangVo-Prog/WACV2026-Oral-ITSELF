@@ -184,6 +184,12 @@ class RetrievalBundle:
             return self.alpha * (self.text_global @ self.image_global.t()) + (1.0 - self.alpha) * (
                 self.text_grab @ self.image_grab.t()
             )
+        if self.mode == "itself":
+            assert self.text_global is not None and self.image_global is not None
+            assert self.text_grab is not None and self.image_grab is not None
+            s_global = self.text_global @ self.image_global.t()
+            s_grab = self.text_grab @ self.image_grab.t()
+            return self.alpha * s_grab + (1.0 - self.alpha) * s_global
         raise ValueError(f"Unknown retrieval mode: {self.mode}")
 
 
@@ -285,8 +291,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--retrieval_branch", default="auto", choices=["auto", "global", "grab", "global+grab"])
-    parser.add_argument("--retrieval_alpha", type=float, default=0.68)
+    parser.add_argument("--retrieval_branch", default="auto", choices=["auto", "global", "grab", "global+grab", "itself"])
+    parser.add_argument(
+        "--retrieval_alpha",
+        type=float,
+        default=0.68,
+        help="Legacy global+grab weight: alpha*s_global + (1-alpha)*s_grab when --retrieval_branch global+grab is used.",
+    )
+    parser.add_argument(
+        "--itself",
+        action="store_true",
+        help="Use ITSELF retrieval/inference scoring for Host/IAPR: lambda*s_grab + (1-lambda)*s_global.",
+    )
+    parser.add_argument(
+        "--itself_lambda",
+        "--lambda",
+        dest="itself_lambda",
+        type=float,
+        default=0.68,
+        help="ITSELF retrieval weight lambda for s_grab in lambda*s_grab + (1-lambda)*s_global.",
+    )
     parser.add_argument("--host_margin_max", type=float, default=0.0)
     parser.add_argument("--min_delta_margin", type=float, default=0.0)
     parser.add_argument("--min_iapr_margin", type=float, default=0.0)
@@ -673,11 +697,13 @@ def config_model_args(cli: argparse.Namespace, bank: PrototypeBankData) -> Simpl
     cfg["prototype_momentum"] = float(bank.config.get("momentum", cfg.get("prototype_momentum", 0.2)))
     if bank.config.get("projector_mode") is not None:
         cfg["prototype_projector"] = str(bank.config.get("projector_mode"))
-    cfg["only_global"] = True
+    use_itself_retrieval = bool(getattr(cli, "itself", False) or getattr(cli, "retrieval_branch", "auto") == "itself")
+    wants_local_retrieval = bool(use_itself_retrieval or getattr(cli, "retrieval_branch", "auto") in {"grab", "global+grab"})
+    cfg["only_global"] = not wants_local_retrieval
     cfg["prototype_feature"] = "global"
-    cfg["return_all"] = False
-    cfg["modify_k"] = False
-    cfg["topk_type"] = "mean"
+    cfg["return_all"] = bool(use_itself_retrieval)
+    cfg["modify_k"] = bool(use_itself_retrieval)
+    cfg["topk_type"] = "custom" if use_itself_retrieval else "mean"
     cfg["average_attn_weights"] = True
     cfg["loss_names"] = "tal+cid"
     cfg["track_train_diagnostics"] = False
@@ -746,17 +772,21 @@ def require_local_layers(model: torch.nn.Module, label: str) -> None:
 
 
 def resolve_retrieval_mode(cli: argparse.Namespace, model: torch.nn.Module, model_args: SimpleNamespace) -> str:
-    if bool(getattr(model_args, "only_global", False)):
-        if cli.retrieval_branch not in ("auto", "global"):
-            print(f"[Retrieval] overriding --retrieval_branch={cli.retrieval_branch} to global because only_global=True")
-        return "global"
-    if cli.retrieval_branch != "auto":
+    if bool(getattr(cli, "itself", False)):
+        if cli.retrieval_branch not in ("auto", "itself"):
+            print(f"[Retrieval] overriding --retrieval_branch={cli.retrieval_branch} to itself because --itself was set")
+        mode = "itself"
+    elif cli.retrieval_branch != "auto":
         mode = cli.retrieval_branch
     elif bool(getattr(model_args, "only_global", False)) or not has_local_layers(model):
         mode = "global"
     else:
         mode = "global+grab"
-    if mode in ("grab", "global+grab"):
+
+    if bool(getattr(model_args, "only_global", False)) and mode != "global":
+        print(f"[Retrieval] overriding mode={mode} to global because only_global=True")
+        return "global"
+    if mode in ("grab", "global+grab", "itself"):
         require_local_layers(model, "Retrieval scoring")
     return mode
 
@@ -845,10 +875,10 @@ def extract_retrieval_bundle(
     gallery_pids: Optional[torch.Tensor] = None
     img_size = parse_img_size(model_args.img_size)
     text_length = int(model_args.text_length)
-    if mode in ("global", "global+grab"):
+    if mode in ("global", "global+grab", "itself"):
         text_global, query_pids = extract_text_kind(model, split_data, text_length, batch_size, num_workers, device, "global", f"{label} text global")
         image_global, gallery_pids = extract_image_kind(model, split_data, img_size, batch_size, num_workers, device, "global", f"{label} image global")
-    if mode in ("grab", "global+grab"):
+    if mode in ("grab", "global+grab", "itself"):
         text_grab, query_pids_grab = extract_text_kind(model, split_data, text_length, batch_size, num_workers, device, "grab", f"{label} text GRAB")
         image_grab, gallery_pids_grab = extract_image_kind(model, split_data, img_size, batch_size, num_workers, device, "grab", f"{label} image GRAB")
         if query_pids is None:
@@ -2252,6 +2282,8 @@ def render_case(
             "prototype_per_id": int(args.prototype_per_id),
             "prototype_hard_k": int(args.prototype_hard_k),
             "top_pos_case_selection_only": int(args.top_pos),
+            "itself_enabled_for_host_iapr": bool(args.itself or args.retrieval_branch == "itself"),
+            "itself_lambda": float(args.itself_lambda),
         },
         "plotted_samples": {
             "positive_images": [image_record(idx, split_data, gallery_pids, sim_host, sim_iapr, query_index, sim_vanilla=sim_vanilla) for idx in positive_image_indices],
@@ -2343,6 +2375,9 @@ def main() -> None:
         raise ValueError("--prototype_hard_k must be non-negative.")
     if not (0.0 <= float(args.retrieval_alpha) <= 1.0):
         raise ValueError("--retrieval_alpha must be in [0, 1].")
+    if not (0.0 <= float(args.itself_lambda) <= 1.0):
+        raise ValueError("--itself_lambda/--lambda must be in [0, 1].")
+    use_itself_scoring = bool(args.itself or args.retrieval_branch == "itself")
 
     set_seed(int(args.seed))
     output_dir = resolve_path(args.output_dir)
@@ -2392,6 +2427,7 @@ def main() -> None:
     num_classes = int(iapr_bank.num_classes)
     print(
         f"[Model] num_classes={num_classes} only_global={model_args.only_global} prototype_feature={model_args.prototype_feature} "
+        f"return_all={model_args.return_all} topk_type={model_args.topk_type} modify_k={model_args.modify_k} "
         f"prototype_dim={model_args.prototype_dim} prototype_per_id={model_args.prototype_per_id}"
     )
 
@@ -2444,22 +2480,38 @@ def main() -> None:
 
     host_retrieval_mode = resolve_retrieval_mode(args, host_model, model_args)
     iapr_retrieval_mode = resolve_retrieval_mode(args, iapr_model, model_args)
-    vanilla_retrieval_mode = resolve_retrieval_mode(args, vanilla_model, model_args)
-    if host_retrieval_mode != iapr_retrieval_mode or host_retrieval_mode != vanilla_retrieval_mode:
+    if use_itself_scoring:
+        vanilla_retrieval_mode = "global"
+        print("[Retrieval] Vanilla CLIP remains global-only; --itself is applied to Host/IAPR checkpoints.")
+    else:
+        vanilla_retrieval_mode = resolve_retrieval_mode(args, vanilla_model, model_args)
+    if host_retrieval_mode != iapr_retrieval_mode:
+        raise RuntimeError(
+            "Host and IAPR retrieval modes differ: "
+            f"Host={host_retrieval_mode}, IAPR={iapr_retrieval_mode}"
+        )
+    if not use_itself_scoring and host_retrieval_mode != vanilla_retrieval_mode:
         raise RuntimeError(
             "Retrieval modes differ: "
             f"Vanilla={vanilla_retrieval_mode}, Host={host_retrieval_mode}, IAPR={iapr_retrieval_mode}"
         )
-    print(f"[Retrieval] mode={host_retrieval_mode} alpha={args.retrieval_alpha}")
+    retrieval_score_weight = float(args.itself_lambda) if host_retrieval_mode == "itself" else float(args.retrieval_alpha)
+    if host_retrieval_mode == "itself":
+        print(
+            f"[Retrieval] Vanilla={vanilla_retrieval_mode} Host/IAPR=itself "
+            f"lambda={retrieval_score_weight:.3f}; score=lambda*s_grab+(1-lambda)*s_global"
+        )
+    else:
+        print(f"[Retrieval] mode={host_retrieval_mode} alpha={retrieval_score_weight:.3f}")
 
     vanilla_retrieval = extract_retrieval_bundle(
-        "Vanilla", vanilla_model, split_data, model_args, vanilla_retrieval_mode, args.retrieval_alpha, args.batch_size, args.num_workers, device
+        "Vanilla", vanilla_model, split_data, model_args, vanilla_retrieval_mode, retrieval_score_weight, args.batch_size, args.num_workers, device
     )
     host_retrieval = extract_retrieval_bundle(
-        "Host", host_model, split_data, model_args, host_retrieval_mode, args.retrieval_alpha, args.batch_size, args.num_workers, device
+        "Host", host_model, split_data, model_args, host_retrieval_mode, retrieval_score_weight, args.batch_size, args.num_workers, device
     )
     iapr_retrieval = extract_retrieval_bundle(
-        "IAPR", iapr_model, split_data, model_args, iapr_retrieval_mode, args.retrieval_alpha, args.batch_size, args.num_workers, device
+        "IAPR", iapr_model, split_data, model_args, iapr_retrieval_mode, retrieval_score_weight, args.batch_size, args.num_workers, device
     )
     if not torch.equal(vanilla_retrieval.query_pids, host_retrieval.query_pids):
         raise RuntimeError("Vanilla and Host query pids differ.")
@@ -2611,6 +2663,8 @@ def main() -> None:
             "top_hard_neg_samples": int(args.top_hard_neg),
             "prototype_per_id": int(args.prototype_per_id),
             "prototype_hard_k": int(args.prototype_hard_k),
+            "itself_enabled_for_host_iapr": bool(use_itself_scoring),
+            "itself_lambda": float(args.itself_lambda),
         },
         "output_naming": {
             "visual_space": "case_XXX_visual_space.{pdf,png}",
@@ -2622,18 +2676,27 @@ def main() -> None:
             "vanilla_mode": vanilla_retrieval_mode,
             "host_mode": host_retrieval_mode,
             "iapr_mode": iapr_retrieval_mode,
-            "alpha": float(args.retrieval_alpha),
+            "itself_enabled_for_host_iapr": bool(use_itself_scoring),
+            "itself_lambda": float(args.itself_lambda),
+            "itself_formula": "lambda*s_grab + (1-lambda)*s_global",
+            "legacy_global_grab_alpha": float(args.retrieval_alpha),
+            "score_weight_used": float(retrieval_score_weight),
             "host_margin_max": float(args.host_margin_max),
             "min_delta_margin": float(args.min_delta_margin),
             "min_iapr_margin": float(args.min_iapr_margin),
             "margin_formula": "max_positive_similarity - max_hard_negative_similarity",
-            "note": "This follows the repository margin diagnostic convention.",
+            "note": "When --itself is set, Host/IAPR retrieval uses the ITSELF score and Vanilla CLIP remains global-only.",
         },
         "rank1_before_plotting": rank1_before_plotting,
         "model_architecture": {
             "only_global": bool(model_args.only_global),
             "prototype_feature": str(model_args.prototype_feature),
-            "note": "Backbone/prototype-space feature extraction is forced to global-only in this diagnostic.",
+            "return_all": bool(model_args.return_all),
+            "topk_type": str(model_args.topk_type),
+            "modify_k": bool(model_args.modify_k),
+            "note": (
+                "Prototype-space diagnostic projections remain global; when ITSELF retrieval is enabled the model is built with only_global=False, return_all=True, topk_type=custom, and modify_k=True."
+            ),
         },
         "shared_iapr_prototype_anchors_for_diagnostic": bool(shared_iapr_anchors),
         "diagnostic_anchor_space": {
