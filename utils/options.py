@@ -1,5 +1,5 @@
 import argparse
-def get_args():
+def get_args(argv=None):
     parser = argparse.ArgumentParser(description="ITSELF Args")
     parser.add_argument("--tau", default=0.015, type=float)
     parser.add_argument("--select_ratio", default=0.4, type=float)
@@ -58,6 +58,12 @@ def get_args():
     parser.add_argument("--use_loss_id", default=False, action='store_true')
     parser.add_argument("--no_pbt", default=False, action='store_true',
                         help="disable use of PBT translated prototype banks and use raw cross-modal prototypes for identity loss")
+    parser.add_argument("--no_ira", default=False, action='store_true',
+                        help="disable identity-restricted prototype assignment and allow prototypes to be shared across identities")
+    parser.add_argument("--no_ira_mode", type=str, default="hard", choices=["hard", "soft"],
+                        help="assignment mode used with --no_ira: hard uses global argmax, soft uses full-bank soft assignment")
+    parser.add_argument("--no_iopm", default=False, action='store_true',
+                        help="disable identity-owned prototype memory initialization and use global k-means over all prototypes")
     parser.add_argument("--prototype_feature", type=str, default="auto", choices=["auto", "local", "global"])
     parser.add_argument("--prototype_projector", type=str, default="default",
                         choices=[
@@ -136,5 +142,5 @@ def get_args():
     parser.add_argument("--average_attn_weights", type=bool, default=True)
     parser.add_argument("--modify_k", action='store_true')
     
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     return args

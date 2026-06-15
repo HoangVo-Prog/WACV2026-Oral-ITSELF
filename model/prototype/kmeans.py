@@ -48,16 +48,29 @@ def torch_kmeans(features, num_clusters, num_iters=20, chunk_size=4096, generato
     return centroids
 
 
+def _make_generator(device, seed):
+    if seed is None:
+        return None
+    generator = torch.Generator() if device.type == "cpu" else torch.Generator(device=device.type)
+    generator.manual_seed(int(seed))
+    return generator
+
+
+@torch.no_grad()
+def global_kmeans(features, num_clusters, num_iters=20, seed=None):
+    """Build a shared prototype bank without identity-owned slots."""
+    features = F.normalize(features.float(), p=2, dim=1)
+    generator = _make_generator(features.device, seed)
+    return torch_kmeans(features, num_clusters, num_iters=num_iters, generator=generator)
+
+
 @torch.no_grad()
 def identity_kmeans(features, pids, num_classes, prototypes_per_id, num_iters=20, seed=None):
     """Build fixed-count prototypes for each identity."""
     features = F.normalize(features.float(), p=2, dim=1)
     pids = pids.long()
     dim = features.shape[1]
-    generator = None
-    if seed is not None:
-        generator = torch.Generator() if features.device.type == "cpu" else torch.Generator(device=features.device.type)
-        generator.manual_seed(int(seed))
+    generator = _make_generator(features.device, seed)
     global_fallback = F.normalize(features.mean(dim=0, keepdim=True), p=2, dim=1)
     banks = []
 

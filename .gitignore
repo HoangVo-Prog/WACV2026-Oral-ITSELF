@@ -218,7 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-tests/*
 logs/*
 docs/*
 wait_pid_then_train.sh

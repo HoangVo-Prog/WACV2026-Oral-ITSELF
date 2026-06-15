@@ -96,7 +96,13 @@ def maybe_initialize_prototypes(model, train_loader, args, device, logger):
     if branch is None or branch.is_ready():
         return
 
-    logger.info("Initializing identity-aware PBT prototypes from train embeddings")
+    init_mode = "global k-means" if getattr(branch, "no_iopm", False) else "identity-owned k-means"
+    assignment_mode = getattr(branch, "assignment_mode", "identity_hard")
+    logger.info(
+        "Initializing PBT prototypes from train embeddings (init=%s, assignment=%s)",
+        init_mode,
+        assignment_mode,
+    )
     was_training = model_without_ddp.training
 
     prototype_loader = _build_prototype_init_loader(train_loader, args)
@@ -241,6 +247,9 @@ def _train_wandb_metrics(meters, loss_components, optimizer, epoch, current_step
         "negative_proto_margin_rate",
         "dead_slot_rate",
         "effective_slots_per_id",
+        "effective_prototypes",
+        "soft_assignment_entropy",
+        "soft_assignment_peak",
         "slot_redundancy",
         "assignment_flip_rate",
         "hard_negative_overlap",

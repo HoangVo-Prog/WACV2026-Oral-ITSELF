@@ -203,9 +203,69 @@ def _identity_proxy_banks(memory, use_pbt=True):
     return memory.text_prototypes, memory.image_prototypes
 
 
+def _assignment_flip_rate(image_assign, text_assign, indices, state):
+    flip_rate = None
+    if indices is None:
+        return flip_rate
+
+    indices = indices.detach().cpu().long()
+    assignments = state.setdefault("assignments", {})
+    flips = 0
+    seen = 0
+    for index, img_slot, txt_slot in zip(indices.tolist(), image_assign.tolist(), text_assign.tolist()):
+        prev = assignments.get(index)
+        if prev is not None:
+            seen += 2
+            flips += int(prev[0] != img_slot)
+            flips += int(prev[1] != txt_slot)
+        assignments[index] = (img_slot, txt_slot)
+    if seen > 0:
+        flip_rate = flips / seen
+    return flip_rate
+
+
 def _assignment_metrics(memory, image_features, text_features, pids, indices, state):
-    image_assign = memory.assign_identity(image_features, pids, memory.image_prototypes).detach().cpu()
-    text_assign = memory.assign_identity(text_features, pids, memory.text_prototypes).detach().cpu()
+    if hasattr(memory, "assign_hard_for_mode"):
+        image_assign = memory.assign_hard_for_mode(image_features, pids, memory.image_prototypes).detach().cpu()
+        text_assign = memory.assign_hard_for_mode(text_features, pids, memory.text_prototypes).detach().cpu()
+    else:
+        image_assign = memory.assign_identity(image_features, pids, memory.image_prototypes).detach().cpu()
+        text_assign = memory.assign_identity(text_features, pids, memory.text_prototypes).detach().cpu()
+
+    assignment_mode = getattr(memory, "assignment_mode", "identity_hard")
+    flip_rate = _assignment_flip_rate(image_assign, text_assign, indices, state)
+
+    if assignment_mode != "identity_hard":
+        total_prototypes = int(getattr(memory, "total_prototypes", memory.num_classes * memory.prototypes_per_id))
+        dead_slots = 0
+        total_slots = 0
+        effective_prototypes = []
+        for assignments in (image_assign, text_assign):
+            counts = torch.bincount(assignments.clamp(0, total_prototypes - 1), minlength=total_prototypes).float()
+            total = counts.sum()
+            if total <= 0:
+                continue
+            probs = counts / total
+            entropy = -(probs[probs > 0] * probs[probs > 0].log()).sum()
+            effective_prototypes.append(entropy.exp())
+            dead_slots += counts.eq(0).sum().item()
+            total_slots += total_prototypes
+
+        metrics = {
+            "dead_slot_rate": (dead_slots / total_slots) if total_slots > 0 else None,
+            "effective_prototypes": _mean(torch.stack(effective_prototypes).cpu()) if effective_prototypes else None,
+            "assignment_flip_rate": flip_rate,
+        }
+        if getattr(memory, "uses_soft_assignment", False):
+            image_weights = memory.assign_soft_global(image_features, memory.image_prototypes).detach().cpu()
+            text_weights = memory.assign_soft_global(text_features, memory.text_prototypes).detach().cpu()
+            weights = torch.cat([image_weights, text_weights], dim=0)
+            entropy = -(weights.clamp_min(1e-12) * weights.clamp_min(1e-12).log()).sum(dim=1)
+            denom = math.log(total_prototypes) if total_prototypes > 1 else 1.0
+            metrics["soft_assignment_entropy"] = _mean((entropy / denom).cpu())
+            metrics["soft_assignment_peak"] = _mean(weights.max(dim=1).values.cpu())
+        return metrics
+
     pids_cpu = pids.detach().cpu().long()
     k = int(memory.prototypes_per_id)
     present = pids_cpu.unique(sorted=True)
@@ -227,21 +287,6 @@ def _assignment_metrics(memory, image_features, text_features, pids, indices, st
             effective_slots.append(entropy.exp())
             dead_slots += counts.eq(0).sum().item()
             total_slots += k
-
-    flip_rate = None
-    if indices is not None:
-        indices = indices.detach().cpu().long()
-        flips = 0
-        seen = 0
-        for index, img_slot, txt_slot in zip(indices.tolist(), image_assign.tolist(), text_assign.tolist()):
-            prev = state["assignments"].get(index)
-            if prev is not None:
-                seen += 2
-                flips += int(prev[0] != img_slot)
-                flips += int(prev[1] != txt_slot)
-            state["assignments"][index] = (img_slot, txt_slot)
-        if seen > 0:
-            flip_rate = flips / seen
 
     return {
         "dead_slot_rate": (dead_slots / total_slots) if total_slots > 0 else None,
@@ -320,14 +365,16 @@ def compute_train_diagnostics(model, ret, args, state):
         hard_ids = set(img_hard_pids[row].tolist()) | set(txt_hard_pids[row].tolist())
         overlap.append(float(host_pid in hard_ids))
 
-    metrics.update({
+    proto_metrics = {
         "proto_margin_img_mean": _mean(img_margin),
         "proto_margin_txt_mean": _mean(txt_margin),
         "negative_proto_margin_rate": _mean(negative_proto),
         "hard_negative_overlap": _mean(torch.tensor(overlap)) if overlap else None,
         "proto_to_host_margin_corr": _corrcoef(proto_margin, host_extra["host_margin"]),
-        "slot_redundancy": _slot_redundancy(memory),
-    })
+    }
+    if getattr(memory, "assignment_mode", "identity_hard") == "identity_hard":
+        proto_metrics["slot_redundancy"] = _slot_redundancy(memory)
+    metrics.update(proto_metrics)
     metrics.update(_assignment_metrics(
         memory,
         proto_image,

@@ -91,6 +91,14 @@ class PrototypeBranch(nn.Module):
         self.feature_dim = feature_dim
         self.prototype_dim = getattr(args, "prototype_dim", 512)
         self.projector_mode = getattr(args, "prototype_projector", "default")
+        self.no_ira = bool(getattr(args, "no_ira", False))
+        self.no_ira_mode = getattr(args, "no_ira_mode", "hard")
+        if self.no_ira_mode not in ("hard", "soft"):
+            raise ValueError(f"Unknown --no_ira_mode: {self.no_ira_mode}")
+        self.assignment_mode = "identity_hard"
+        if self.no_ira:
+            self.assignment_mode = "global_soft" if self.no_ira_mode == "soft" else "global_hard"
+        self.no_iopm = bool(getattr(args, "no_iopm", False))
         self._pca_initialized = False
         prototype_feature = getattr(args, "prototype_feature", "auto")
         self.use_local = prototype_feature == "auto" and not args.only_global
@@ -102,6 +110,9 @@ class PrototypeBranch(nn.Module):
             prototypes_per_id=getattr(args, "prototype_per_id", 2),
             dim=self.prototype_dim,
             momentum=getattr(args, "prototype_momentum", 0.2),
+            assignment_mode=self.assignment_mode,
+            assignment_tau=getattr(args, "prototype_tau", 0.05),
+            identity_owned_init=not self.no_iopm,
         )
 
     def _require_matching_dims(self):
