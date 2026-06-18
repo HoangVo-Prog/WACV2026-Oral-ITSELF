@@ -22,3 +22,15 @@ def test_finetune_itself_preset_sets_itself_flags():
 def test_finetune_itself_rejects_only_global_conflict():
     with pytest.raises(SystemExit):
         get_args(["--finetune_itself", "--only_global"])
+
+
+def test_eval_after_epoch_defaults_to_zero():
+    args = get_args([])
+
+    assert args.eval_after_epoch == 0
+
+
+def test_eval_after_epoch_parses_custom_value():
+    args = get_args(["--eval_after_epoch", "5"])
+
+    assert args.eval_after_epoch == 5

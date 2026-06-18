@@ -19,6 +19,8 @@ def get_args(argv=None):
                         help="enable deterministic training settings for reproducible runs")
     parser.add_argument("--log_period", default=20, type=int)
     parser.add_argument("--eval_period", default=1, type=int)
+    parser.add_argument("--eval_after_epoch", default=0, type=int,
+                        help="skip evaluation until this epoch is completed; 0 preserves immediate evaluation")
     parser.add_argument("--val_dataset", default="test") # use val set when evaluate, if test use test set
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')

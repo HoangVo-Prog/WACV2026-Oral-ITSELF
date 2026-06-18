@@ -269,6 +269,14 @@ def _train_console_metrics(meters, loss_components):
     return keys
 
 
+def _should_run_initial_eval(start_epoch, eval_after_epoch):
+    return (start_epoch - 1) >= eval_after_epoch
+
+
+def _should_run_epoch_eval(epoch, eval_period, eval_after_epoch):
+    return epoch >= eval_after_epoch and epoch % eval_period == 0
+
+
 def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
              scheduler, checkpointer):
 
@@ -291,15 +299,17 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     tb_writer = SummaryWriter(log_dir=args.output_dir)
 
     best_top1 = 0.0
-    initial_eval = evaluator.eval(model.eval(), return_metrics=(get_rank() == 0))
-    if get_rank() == 0 and isinstance(initial_eval, tuple):
-        initial_top1, _, initial_best_metrics = initial_eval
-        wandb_metrics = {
-            "val/epoch": 0,
-            "val/top1": initial_top1,
-        }
-        wandb_metrics.update(_best_val_wandb_metrics(initial_best_metrics))
-        wandb_log(wandb_metrics, step=0)
+    eval_after_epoch = max(int(getattr(args, "eval_after_epoch", 0)), 0)
+    if _should_run_initial_eval(start_epoch, eval_after_epoch):
+        initial_eval = evaluator.eval(model.eval(), return_metrics=(get_rank() == 0))
+        if get_rank() == 0 and isinstance(initial_eval, tuple):
+            initial_top1, _, initial_best_metrics = initial_eval
+            wandb_metrics = {
+                "val/epoch": start_epoch - 1,
+                "val/top1": initial_top1,
+            }
+            wandb_metrics.update(_best_val_wandb_metrics(initial_best_metrics))
+            wandb_log(wandb_metrics, step=0)
     # train
     now_top1 = 0
     current_epoch = 0
@@ -374,7 +384,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 "Epoch {} done. Time per batch: {:.3f}[s] Speed: {:.1f}[samples/s]"
                 .format(epoch, time_per_batch,
                         train_loader.batch_size / time_per_batch))
-        if epoch % eval_period == 0: 
+        if _should_run_epoch_eval(epoch, eval_period, eval_after_epoch):
         # if epoch % eval_period == 0 and epoch >= 61:
             if get_rank() == 0:
                 logger.info("Validation Results - Epoch: {}".format(epoch))
