@@ -27,7 +27,6 @@ python scripts/plot_ambiguity_rate_compare.py \
 --output_dir outputs/ambiguity_rate/rstpreid \
 --thresholds 0,0.01,0.05 \
 --model_type itself \
---lambda_global 0.68 \
 --batch_size 128 \
 --device cuda
 """
@@ -214,7 +213,7 @@ def parse_args() -> argparse.Namespace:
         "--model_type",
         default="itself",
         choices=["clip", "itself"],
-        help="Default inference/model mode for both checkpoints. 'clip' uses global CLIP features only; 'itself' enables GRAB ablation and lambda fusion.",
+        help="Default inference/model mode for both checkpoints. 'clip' uses global CLIP features only; 'itself' evaluates GRAB ablations and uses the best test-set combo for ambiguity inference.",
     )
     parser.add_argument(
         "--baseline_model_type",
@@ -227,24 +226,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         choices=["clip", "itself"],
         help="Optional model mode override for the ours checkpoint.",
-    )
-    parser.add_argument(
-        "--lambda_global",
-        type=float,
-        default=0.68,
-        help="ITSELF inference fusion weight: lambda_global * s_global + (1 - lambda_global) * s_grab.",
-    )
-    parser.add_argument(
-        "--baseline_lambda_global",
-        type=float,
-        default=None,
-        help="Optional ITSELF fusion weight override for the baseline checkpoint.",
-    )
-    parser.add_argument(
-        "--ours_lambda_global",
-        type=float,
-        default=None,
-        help="Optional ITSELF fusion weight override for the ours checkpoint.",
     )
     parser.add_argument("--plot_type", default="bar", choices=["bar", "curve"], help="Plot style.")
     parser.add_argument("--dpi", type=int, default=300, help="PNG output DPI.")
@@ -392,26 +373,14 @@ def default_model_args() -> Dict[str, Any]:
     }
 
 
-def validate_lambda_global(value: float, label: str = "lambda_global") -> float:
-    value = float(value)
-    if not math.isfinite(value) or value < 0.0 or value > 1.0:
-        raise ValueError(f"--{label} must be a finite value in [0, 1], got {value!r}.")
-    return value
-
-
 def build_model_args(
     cli_args: argparse.Namespace,
     model_type: Optional[str] = None,
-    lambda_global: Optional[float] = None,
 ) -> SimpleNamespace:
     cfg = default_model_args()
     model_type = model_type or cli_args.model_type
     if model_type not in {"clip", "itself"}:
         raise ValueError(f"Unsupported model_type: {model_type!r}")
-    lambda_global = validate_lambda_global(
-        cli_args.lambda_global if lambda_global is None else lambda_global,
-        "lambda_global",
-    )
     cfg["dataset_name"] = cli_args.dataset_name
     cfg["root_dir"] = str(resolve_path(cli_args.dataset_root))
     cfg["training"] = False
@@ -422,8 +391,8 @@ def build_model_args(
     cfg["text_length"] = int(cli_args.text_length)
     cfg["pretrain_choice"] = cli_args.pretrain_choice
     cfg["model_type"] = model_type
-    cfg["lambda_global"] = lambda_global
     cfg["only_global"] = model_type == "clip"
+    cfg["selected_inference"] = None
     return SimpleNamespace(**cfg)
 
 
@@ -914,6 +883,171 @@ def ensure_same_pids(left: torch.Tensor, right: torch.Tensor, label: str) -> Non
         raise RuntimeError(f"{label} identity order changed between global and GRAB feature extraction.")
 
 
+ITSELF_ABLATION_CANDIDATES: List[Tuple[str, float]] = [
+    ("global", 1.0),
+    ("grab", 0.0),
+    ("global+grab(0.1)", 0.1),
+    ("global+grab(0.2)", 0.2),
+    ("global+grab(0.3)", 0.3),
+    ("global+grab(0.4)", 0.4),
+    ("global+grab(0.5)", 0.5),
+    ("global+grab(0.6)", 0.6),
+    ("global+grab(0.7)", 0.7),
+    ("global+grab(0.8)", 0.8),
+    ("global+grab(0.9)", 0.9),
+    ("global+grab(0.68)", 0.68),
+    ("global+grab(0.32)", 0.32),
+]
+
+
+def clip_inference_metadata() -> Dict[str, Any]:
+    return {
+        "model_type": "clip",
+        "inference_mode": "clip_global",
+        "ablation_task": "global-t2i",
+        "global_weight": 1.0,
+        "grab_weight": 0.0,
+        "selection_source": "clip_global",
+    }
+
+
+def normalize_ablation_task(task: str) -> str:
+    task = str(task).strip()
+    for suffix in ("-t2i", "-i2t"):
+        if task.endswith(suffix):
+            return task[: -len(suffix)]
+    return task
+
+
+def itself_inference_metadata(
+    ablation_name: str,
+    global_weight: float,
+    selection_source: str,
+    selected_metrics: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    grab_weight = 1.0 - float(global_weight)
+    metadata: Dict[str, Any] = {
+        "model_type": "itself",
+        "inference_mode": "itself_best_ablation",
+        "ablation_task": f"{ablation_name}-t2i",
+        "global_weight": float(global_weight),
+        "grab_weight": float(grab_weight),
+        "formula": "global_weight * s_global + grab_weight * s_grab",
+        "selection_source": selection_source,
+    }
+    if selected_metrics:
+        metadata["selected_metrics"] = {
+            str(key): float(value)
+            for key, value in selected_metrics.items()
+            if isinstance(value, (int, float, np.integer, np.floating))
+        }
+    return metadata
+
+
+def itself_inference_metadata_from_task(
+    task: str,
+    selection_source: str,
+    selected_metrics: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    ablation_name = normalize_ablation_task(task)
+    for candidate_name, global_weight in ITSELF_ABLATION_CANDIDATES:
+        if ablation_name == candidate_name:
+            return itself_inference_metadata(
+                candidate_name,
+                global_weight,
+                selection_source=selection_source,
+                selected_metrics=selected_metrics,
+            )
+    valid = ", ".join(f"{name}-t2i" for name, _ in ITSELF_ABLATION_CANDIDATES)
+    raise RuntimeError(
+        f"ITSELF evaluator selected unsupported ablation task {task!r}. "
+        f"Expected one of: {valid}."
+    )
+
+
+def selected_inference_from_standard_eval(
+    model_args: SimpleNamespace,
+    best_metrics: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    model_type = getattr(model_args, "model_type", "itself")
+    if model_type == "clip":
+        return clip_inference_metadata()
+    if model_type != "itself":
+        raise ValueError(f"Unsupported model_type: {model_type!r}")
+
+    task = best_metrics.get("task") if best_metrics else None
+    if task:
+        return itself_inference_metadata_from_task(
+            str(task),
+            selection_source="standard_test_eval_best_r1",
+            selected_metrics=best_metrics,
+        )
+    return None
+
+
+def selected_itself_inference_from_args(model_args: SimpleNamespace) -> Optional[Dict[str, Any]]:
+    selection = getattr(model_args, "selected_inference", None)
+    if not selection:
+        return None
+    if not isinstance(selection, Mapping):
+        raise RuntimeError(f"selected_inference must be a mapping, got {type(selection)!r}.")
+
+    task = selection.get("ablation_task") or selection.get("task")
+    if task:
+        metadata = itself_inference_metadata_from_task(
+            str(task),
+            selection_source=str(selection.get("selection_source", "stored_selection")),
+            selected_metrics=selection.get("selected_metrics") if isinstance(selection.get("selected_metrics"), Mapping) else None,
+        )
+    elif "global_weight" in selection:
+        global_weight = float(selection["global_weight"])
+        if not math.isfinite(global_weight) or global_weight < 0.0 or global_weight > 1.0:
+            raise RuntimeError(f"Stored ITSELF global_weight must be in [0, 1], got {global_weight!r}.")
+        metadata = itself_inference_metadata(
+            f"global+grab({global_weight:g})",
+            global_weight,
+            selection_source=str(selection.get("selection_source", "stored_selection")),
+            selected_metrics=selection.get("selected_metrics") if isinstance(selection.get("selected_metrics"), Mapping) else None,
+        )
+    else:
+        raise RuntimeError(
+            "ITSELF selected_inference is missing an ablation_task or global_weight. "
+            "Run the test-set verification step before ambiguity inference."
+        )
+
+    return metadata
+
+
+def combine_itself_similarity(sim_global: torch.Tensor, sim_grab: torch.Tensor, global_weight: float) -> torch.Tensor:
+    grab_weight = 1.0 - float(global_weight)
+    return float(global_weight) * sim_global + grab_weight * sim_grab
+
+
+def select_best_itself_ablation_from_sims(
+    sim_global: torch.Tensor,
+    sim_grab: torch.Tensor,
+    query_pids: torch.Tensor,
+    gallery_pids: torch.Tensor,
+) -> Dict[str, Any]:
+    best_metadata: Optional[Dict[str, Any]] = None
+    best_r1 = float("-inf")
+    for ablation_name, global_weight in ITSELF_ABLATION_CANDIDATES:
+        candidate_sim = combine_itself_similarity(sim_global, sim_grab, global_weight)
+        metrics = retrieval_metrics_from_similarity(candidate_sim, query_pids, gallery_pids)
+        if metrics["R1"] >= best_r1:
+            best_metadata = itself_inference_metadata(
+                ablation_name,
+                global_weight,
+                selection_source="local_similarity_sweep_best_r1",
+                selected_metrics=metrics,
+            )
+            best_r1 = metrics["R1"]
+
+    if best_metadata is None:
+        raise RuntimeError("Could not select an ITSELF ablation combo from similarity matrices.")
+    return best_metadata
+
+
 def compute_inference_similarity(
     model: torch.nn.Module,
     split_data: SplitData,
@@ -942,12 +1076,7 @@ def compute_inference_similarity(
 
     model_type = getattr(model_args, "model_type", "itself")
     if model_type == "clip":
-        metadata = {
-            "model_type": "clip",
-            "inference_mode": "clip_global",
-            "lambda_global": None,
-        }
-        return sim_global, query_pids, gallery_pids, metadata
+        return sim_global, query_pids, gallery_pids, clip_inference_metadata()
 
     if model_type != "itself":
         raise ValueError(f"Unsupported model_type: {model_type!r}")
@@ -977,15 +1106,20 @@ def compute_inference_similarity(
     ensure_same_pids(query_pids, grab_query_pids, "Query")
     ensure_same_pids(gallery_pids, grab_gallery_pids, "Gallery")
 
-    lambda_global = validate_lambda_global(getattr(model_args, "lambda_global", 0.68))
     sim_grab = text_grab_features @ image_grab_features.t()
-    sim = lambda_global * sim_global + (1.0 - lambda_global) * sim_grab
-    metadata = {
-        "model_type": "itself",
-        "inference_mode": "itself_lambda_fusion",
-        "lambda_global": float(lambda_global),
-        "formula": "lambda_global * s_global + (1 - lambda_global) * s_grab",
-    }
+    metadata = selected_itself_inference_from_args(model_args)
+    if metadata is None:
+        print(
+            "Warning: no ITSELF ablation selection was attached; "
+            "selecting the best combo from the current split."
+        )
+        metadata = select_best_itself_ablation_from_sims(
+            sim_global,
+            sim_grab,
+            query_pids,
+            gallery_pids,
+        )
+    sim = combine_itself_similarity(sim_global, sim_grab, float(metadata["global_weight"]))
     return sim, query_pids, gallery_pids, metadata
 
 
@@ -1047,7 +1181,10 @@ def retrieval_metrics_from_similarity(
 def print_selected_inference_metrics(label: str, metrics: Mapping[str, float], inference: Mapping[str, Any]) -> None:
     mode = inference.get("inference_mode", "selected")
     if inference.get("model_type") == "itself":
-        mode = f"{mode} (lambda_global={float(inference.get('lambda_global', 0.0)):.4g})"
+        task = inference.get("ablation_task", "best-t2i")
+        global_weight = float(inference.get("global_weight", 0.0))
+        grab_weight = float(inference.get("grab_weight", 0.0))
+        mode = f"{mode} ({task}, global={global_weight:.4g}, grab={grab_weight:.4g})"
     parts = [
         f"R@1={metrics['R1']:.2f}",
         f"R@5={metrics['R5']:.2f}",
@@ -1336,6 +1473,9 @@ def evaluate_checkpoint_on_test_split(
         evaluator = build_standard_evaluator(image_loader, text_loader, run_args)
         metrics, best_metrics = run_standard_retrieval_eval(evaluator, model)
         print_retrieval_metrics(label, metrics, best_metrics)
+        selected_inference = selected_inference_from_standard_eval(run_args, best_metrics)
+        if selected_inference is not None:
+            run_args.selected_inference = selected_inference
         selected_sim, selected_query_pids, selected_gallery_pids, inference = compute_inference_similarity(
             model,
             test_split_data,
@@ -1680,14 +1820,6 @@ def main() -> None:
 
     baseline_model_type = args.baseline_model_type or args.model_type
     ours_model_type = args.ours_model_type or args.model_type
-    baseline_lambda_global = validate_lambda_global(
-        args.lambda_global if args.baseline_lambda_global is None else args.baseline_lambda_global,
-        "baseline_lambda_global" if args.baseline_lambda_global is not None else "lambda_global",
-    )
-    ours_lambda_global = validate_lambda_global(
-        args.lambda_global if args.ours_lambda_global is None else args.ours_lambda_global,
-        "ours_lambda_global" if args.ours_lambda_global is not None else "lambda_global",
-    )
     thresholds = parse_thresholds(args.thresholds)
     dataset_root = resolve_path(args.dataset_root)
     baseline_checkpoint = resolve_path(args.baseline_checkpoint)
@@ -1700,16 +1832,8 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = resolve_device(args.device)
-    baseline_model_args = build_model_args(
-        args,
-        model_type=baseline_model_type,
-        lambda_global=baseline_lambda_global,
-    )
-    ours_model_args = build_model_args(
-        args,
-        model_type=ours_model_type,
-        lambda_global=ours_lambda_global,
-    )
+    baseline_model_args = build_model_args(args, model_type=baseline_model_type)
+    ours_model_args = build_model_args(args, model_type=ours_model_type)
     test_split_data = load_split_data(args.dataset_name, dataset_root, "test")
     validate_split_data(test_split_data, "test")
 
@@ -1720,7 +1844,7 @@ def main() -> None:
     )
     print(
         f"[Baseline] Verifying {baseline_checkpoint} "
-        f"(model_type={baseline_model_type}, lambda_global={baseline_lambda_global:.4g})"
+        f"(model_type={baseline_model_type})"
     )
     baseline_eval_meta = evaluate_checkpoint_on_test_split(
         "Baseline",
@@ -1733,7 +1857,7 @@ def main() -> None:
     )
     print(
         f"[Ours] Verifying {ours_checkpoint} "
-        f"(model_type={ours_model_type}, lambda_global={ours_lambda_global:.4g})"
+        f"(model_type={ours_model_type})"
     )
     ours_eval_meta = evaluate_checkpoint_on_test_split(
         "Ours",
@@ -1744,6 +1868,8 @@ def main() -> None:
         args.batch_size,
         args.num_workers,
     )
+    baseline_model_args.selected_inference = baseline_eval_meta.get("selected_inference")
+    ours_model_args.selected_inference = ours_eval_meta.get("selected_inference")
 
     split_data = test_split_data if args.split == "test" else load_split_data(args.dataset_name, dataset_root, args.split)
     split_data = limit_queries(split_data, args.max_queries)
@@ -1790,8 +1916,8 @@ def main() -> None:
         "ours_name": args.ours_name,
         "baseline_model_type": baseline_model_type,
         "ours_model_type": ours_model_type,
-        "baseline_lambda_global": float(baseline_lambda_global) if baseline_model_type == "itself" else None,
-        "ours_lambda_global": float(ours_lambda_global) if ours_model_type == "itself" else None,
+        "baseline_selected_inference": baseline_model_args.selected_inference,
+        "ours_selected_inference": ours_model_args.selected_inference,
         "num_queries_total": int(len(split_data.captions)),
         "num_queries_used": int(len(merged_rows)),
         "thresholds": [float(threshold) for threshold in thresholds],
