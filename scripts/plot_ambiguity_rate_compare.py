@@ -26,6 +26,8 @@ python scripts/plot_ambiguity_rate_compare.py \
 --ours_name "Host + IAPR" \
 --output_dir outputs/ambiguity_rate/rstpreid \
 --thresholds 0,0.01,0.05 \
+--model_type itself \
+--lambda_global 0.68 \
 --batch_size 128 \
 --device cuda
 """
@@ -208,6 +210,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img_size", default="384,128", help='Input image size as "height,width".')
     parser.add_argument("--text_length", type=int, default=77, help="Tokenized text length.")
     parser.add_argument("--pretrain_choice", default="ViT-B/16", help="CLIP backbone choice used by build_model(...).")
+    parser.add_argument(
+        "--model_type",
+        default="itself",
+        choices=["clip", "itself"],
+        help="Default inference/model mode for both checkpoints. 'clip' uses global CLIP features only; 'itself' enables GRAB ablation and lambda fusion.",
+    )
+    parser.add_argument(
+        "--baseline_model_type",
+        default=None,
+        choices=["clip", "itself"],
+        help="Optional model mode override for the baseline checkpoint.",
+    )
+    parser.add_argument(
+        "--ours_model_type",
+        default=None,
+        choices=["clip", "itself"],
+        help="Optional model mode override for the ours checkpoint.",
+    )
+    parser.add_argument(
+        "--lambda_global",
+        type=float,
+        default=0.68,
+        help="ITSELF inference fusion weight: lambda_global * s_global + (1 - lambda_global) * s_grab.",
+    )
+    parser.add_argument(
+        "--baseline_lambda_global",
+        type=float,
+        default=None,
+        help="Optional ITSELF fusion weight override for the baseline checkpoint.",
+    )
+    parser.add_argument(
+        "--ours_lambda_global",
+        type=float,
+        default=None,
+        help="Optional ITSELF fusion weight override for the ours checkpoint.",
+    )
     parser.add_argument("--plot_type", default="bar", choices=["bar", "curve"], help="Plot style.")
     parser.add_argument("--dpi", type=int, default=300, help="PNG output DPI.")
     return parser.parse_args()
@@ -354,8 +392,26 @@ def default_model_args() -> Dict[str, Any]:
     }
 
 
-def build_model_args(cli_args: argparse.Namespace) -> SimpleNamespace:
+def validate_lambda_global(value: float, label: str = "lambda_global") -> float:
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0 or value > 1.0:
+        raise ValueError(f"--{label} must be a finite value in [0, 1], got {value!r}.")
+    return value
+
+
+def build_model_args(
+    cli_args: argparse.Namespace,
+    model_type: Optional[str] = None,
+    lambda_global: Optional[float] = None,
+) -> SimpleNamespace:
     cfg = default_model_args()
+    model_type = model_type or cli_args.model_type
+    if model_type not in {"clip", "itself"}:
+        raise ValueError(f"Unsupported model_type: {model_type!r}")
+    lambda_global = validate_lambda_global(
+        cli_args.lambda_global if lambda_global is None else lambda_global,
+        "lambda_global",
+    )
     cfg["dataset_name"] = cli_args.dataset_name
     cfg["root_dir"] = str(resolve_path(cli_args.dataset_root))
     cfg["training"] = False
@@ -365,6 +421,9 @@ def build_model_args(cli_args: argparse.Namespace) -> SimpleNamespace:
     cfg["img_size"] = parse_img_size(cli_args.img_size)
     cfg["text_length"] = int(cli_args.text_length)
     cfg["pretrain_choice"] = cli_args.pretrain_choice
+    cfg["model_type"] = model_type
+    cfg["lambda_global"] = lambda_global
+    cfg["only_global"] = model_type == "clip"
     return SimpleNamespace(**cfg)
 
 
@@ -726,14 +785,20 @@ def call_model_encoder(encoder: Any, tensor: torch.Tensor, kind: str) -> torch.T
 
 
 @torch.inference_mode()
-def extract_text_features(
+def extract_text_features_from_encoder(
     model: torch.nn.Module,
     split_data: SplitData,
     text_length: int,
     batch_size: int,
     num_workers: int,
     device: torch.device,
+    encoder_name: str,
+    desc: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    encoder = getattr(model, encoder_name, None)
+    if encoder is None:
+        raise RuntimeError(f"Model does not provide {encoder_name}; choose --model_type clip for global-only checkpoints.")
+
     TextDataset = text_dataset_class()
     text_set = TextDataset(split_data.caption_pids, split_data.captions, text_length=text_length)
     loader = DataLoader(
@@ -747,14 +812,14 @@ def extract_text_features(
     pids: List[torch.Tensor] = []
 
     model.eval()
-    for pid, tokens in tqdm(loader, desc="Extracting text features"):
+    for pid, tokens in tqdm(loader, desc=desc):
         tokens = tokens.to(device, non_blocking=True)
-        feats = call_model_encoder(model.encode_text, tokens, "text").float()
+        feats = call_model_encoder(encoder, tokens, encoder_name).float()
         features.append(feats.cpu())
         pids.append(pid.view(-1).cpu().long())
 
     if not features:
-        raise RuntimeError("No text features were extracted.")
+        raise RuntimeError(f"No text features were extracted from {encoder_name}.")
 
     text_features = F.normalize(torch.cat(features, dim=0), p=2, dim=1)
     text_pids = torch.cat(pids, dim=0).long()
@@ -762,14 +827,20 @@ def extract_text_features(
 
 
 @torch.inference_mode()
-def extract_image_features(
+def extract_image_features_from_encoder(
     model: torch.nn.Module,
     split_data: SplitData,
     img_size: Tuple[int, int],
     batch_size: int,
     num_workers: int,
     device: torch.device,
+    encoder_name: str,
+    desc: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    encoder = getattr(model, encoder_name, None)
+    if encoder is None:
+        raise RuntimeError(f"Model does not provide {encoder_name}; choose --model_type clip for global-only checkpoints.")
+
     ImageDataset = image_dataset_class()
     transform = build_eval_transforms(img_size)
     image_set = ImageDataset(split_data.image_pids, split_data.img_paths, transform=transform)
@@ -784,18 +855,208 @@ def extract_image_features(
     pids: List[torch.Tensor] = []
 
     model.eval()
-    for pid, images in tqdm(loader, desc="Extracting image features"):
+    for pid, images in tqdm(loader, desc=desc):
         images = images.to(device, non_blocking=True)
-        feats = call_model_encoder(model.encode_image, images, "image").float()
+        feats = call_model_encoder(encoder, images, encoder_name).float()
         features.append(feats.cpu())
         pids.append(pid.view(-1).cpu().long())
 
     if not features:
-        raise RuntimeError("No image features were extracted.")
+        raise RuntimeError(f"No image features were extracted from {encoder_name}.")
 
     image_features = F.normalize(torch.cat(features, dim=0), p=2, dim=1)
     image_pids = torch.cat(pids, dim=0).long()
     return image_features, image_pids
+
+
+def extract_text_features(
+    model: torch.nn.Module,
+    split_data: SplitData,
+    text_length: int,
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return extract_text_features_from_encoder(
+        model,
+        split_data,
+        text_length=text_length,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device=device,
+        encoder_name="encode_text",
+        desc="Extracting text features",
+    )
+
+
+def extract_image_features(
+    model: torch.nn.Module,
+    split_data: SplitData,
+    img_size: Tuple[int, int],
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return extract_image_features_from_encoder(
+        model,
+        split_data,
+        img_size=img_size,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device=device,
+        encoder_name="encode_image",
+        desc="Extracting image features",
+    )
+
+
+def ensure_same_pids(left: torch.Tensor, right: torch.Tensor, label: str) -> None:
+    if left.shape != right.shape or not torch.equal(left, right):
+        raise RuntimeError(f"{label} identity order changed between global and GRAB feature extraction.")
+
+
+def compute_inference_similarity(
+    model: torch.nn.Module,
+    split_data: SplitData,
+    model_args: SimpleNamespace,
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    text_features, query_pids = extract_text_features(
+        model,
+        split_data,
+        text_length=int(model_args.text_length),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device=device,
+    )
+    image_features, gallery_pids = extract_image_features(
+        model,
+        split_data,
+        img_size=parse_img_size(model_args.img_size),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device=device,
+    )
+    sim_global = text_features @ image_features.t()
+
+    model_type = getattr(model_args, "model_type", "itself")
+    if model_type == "clip":
+        metadata = {
+            "model_type": "clip",
+            "inference_mode": "clip_global",
+            "lambda_global": None,
+        }
+        return sim_global, query_pids, gallery_pids, metadata
+
+    if model_type != "itself":
+        raise ValueError(f"Unsupported model_type: {model_type!r}")
+    if not hasattr(model, "encode_text_grab") or not hasattr(model, "encode_image_grab"):
+        raise RuntimeError("ITSELF inference requires encode_text_grab/encode_image_grab; use --model_type clip for CLIP-only checkpoints.")
+
+    text_grab_features, grab_query_pids = extract_text_features_from_encoder(
+        model,
+        split_data,
+        text_length=int(model_args.text_length),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device=device,
+        encoder_name="encode_text_grab",
+        desc="Extracting GRAB text features",
+    )
+    image_grab_features, grab_gallery_pids = extract_image_features_from_encoder(
+        model,
+        split_data,
+        img_size=parse_img_size(model_args.img_size),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device=device,
+        encoder_name="encode_image_grab",
+        desc="Extracting GRAB image features",
+    )
+    ensure_same_pids(query_pids, grab_query_pids, "Query")
+    ensure_same_pids(gallery_pids, grab_gallery_pids, "Gallery")
+
+    lambda_global = validate_lambda_global(getattr(model_args, "lambda_global", 0.68))
+    sim_grab = text_grab_features @ image_grab_features.t()
+    sim = lambda_global * sim_global + (1.0 - lambda_global) * sim_grab
+    metadata = {
+        "model_type": "itself",
+        "inference_mode": "itself_lambda_fusion",
+        "lambda_global": float(lambda_global),
+        "formula": "lambda_global * s_global + (1 - lambda_global) * s_grab",
+    }
+    return sim, query_pids, gallery_pids, metadata
+
+
+def retrieval_metrics_from_similarity(
+    sim: torch.Tensor,
+    query_pids: torch.Tensor,
+    gallery_pids: torch.Tensor,
+) -> Dict[str, float]:
+    if sim.ndim != 2:
+        raise ValueError(f"Expected a 2D similarity matrix, got shape {tuple(sim.shape)}.")
+    if sim.shape[0] != query_pids.numel() or sim.shape[1] != gallery_pids.numel():
+        raise ValueError("Similarity shape does not match query/gallery pid counts.")
+
+    indices = torch.argsort(sim, dim=1, descending=True)
+    pred_labels = gallery_pids[indices.cpu()]
+    matches = pred_labels.eq(query_pids.view(-1, 1))
+    num_rel = matches.sum(1)
+    valid = num_rel > 0
+    if not bool(valid.any()):
+        raise RuntimeError("No query has a positive gallery match; cannot compute retrieval metrics.")
+
+    matches = matches[valid]
+    num_rel = num_rel[valid]
+    max_rank = min(10, matches.shape[1])
+    cmc = matches[:, :max_rank].cumsum(1)
+    cmc[cmc > 1] = 1
+    cmc = cmc.float().mean(0) * 100.0
+
+    cumulative = matches.cumsum(1)
+    ranks = torch.arange(1, matches.shape[1] + 1, dtype=torch.float32).view(1, -1)
+    precision_at_rank = cumulative.float() / ranks
+    ap = (precision_at_rank * matches.float()).sum(1) / num_rel.float()
+    positive_positions = [int(row.nonzero(as_tuple=False)[-1].item()) for row in matches]
+    minp_values = [
+        cumulative[row_idx, pos] / (pos + 1.0)
+        for row_idx, pos in enumerate(positive_positions)
+    ]
+    mINP = torch.stack(minp_values).float().mean() * 100.0
+    mAP = ap.mean() * 100.0
+
+    def recall_at(rank: int) -> float:
+        index = min(rank - 1, max_rank - 1)
+        return float(cmc[index].item())
+
+    r1 = recall_at(1)
+    r5 = recall_at(5)
+    r10 = recall_at(10)
+    return {
+        "R1": r1,
+        "R5": r5,
+        "R10": r10,
+        "mAP": float(mAP.item()),
+        "mINP": float(mINP.item()),
+        "rSum": r1 + r5 + r10,
+        "num_queries_used": int(valid.sum().item()),
+    }
+
+
+def print_selected_inference_metrics(label: str, metrics: Mapping[str, float], inference: Mapping[str, Any]) -> None:
+    mode = inference.get("inference_mode", "selected")
+    if inference.get("model_type") == "itself":
+        mode = f"{mode} (lambda_global={float(inference.get('lambda_global', 0.0)):.4g})"
+    parts = [
+        f"R@1={metrics['R1']:.2f}",
+        f"R@5={metrics['R5']:.2f}",
+        f"R@10={metrics['R10']:.2f}",
+        f"mAP={metrics['mAP']:.2f}",
+        f"mINP={metrics['mINP']:.2f}",
+        f"rSum={metrics['rSum']:.2f}",
+    ]
+    print(f"[{label}] Selected inference metrics for ambiguity ({mode}): " + ", ".join(parts))
 
 
 def compute_margin_rows(
@@ -895,6 +1156,7 @@ def compute_margins_for_checkpoint(
     query_pids: Optional[torch.Tensor] = None
     gallery_pids: Optional[torch.Tensor] = None
     sim: Optional[torch.Tensor] = None
+    inference_metadata: Dict[str, Any] = {}
 
     try:
         model, run_args, load_stats, checkpoint = load_model_for_checkpoint(
@@ -903,30 +1165,22 @@ def compute_margins_for_checkpoint(
             split_data,
             device,
         )
-        text_features, query_pids = extract_text_features(
+        sim, query_pids, gallery_pids, inference_metadata = compute_inference_similarity(
             model,
             split_data,
-            text_length=int(run_args.text_length),
-            batch_size=batch_size,
-            num_workers=num_workers,
-            device=device,
-        )
-        image_features, gallery_pids = extract_image_features(
-            model,
-            split_data,
-            img_size=parse_img_size(run_args.img_size),
+            run_args,
             batch_size=batch_size,
             num_workers=num_workers,
             device=device,
         )
 
-        sim = text_features @ image_features.t()
         rows, skipped = compute_margin_rows(sim, query_pids, gallery_pids)
         margin_summary = summarize_margins(rows, total_queries=len(query_pids), skipped=skipped)
         metadata: Dict[str, Any] = {
             "checkpoint": str(checkpoint),
             "load_stats": load_stats,
             "margin_summary": margin_summary,
+            "inference": inference_metadata,
         }
         return rows, metadata
     finally:
@@ -1082,11 +1336,27 @@ def evaluate_checkpoint_on_test_split(
         evaluator = build_standard_evaluator(image_loader, text_loader, run_args)
         metrics, best_metrics = run_standard_retrieval_eval(evaluator, model)
         print_retrieval_metrics(label, metrics, best_metrics)
+        selected_sim, selected_query_pids, selected_gallery_pids, inference = compute_inference_similarity(
+            model,
+            test_split_data,
+            run_args,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            device=device,
+        )
+        selected_metrics = retrieval_metrics_from_similarity(
+            selected_sim,
+            selected_query_pids,
+            selected_gallery_pids,
+        )
+        print_selected_inference_metrics(label, selected_metrics, inference)
         return {
             "checkpoint": str(checkpoint),
             "load_stats": load_stats,
             "retrieval_metrics": metrics,
             "best_retrieval_metrics": dict(best_metrics),
+            "selected_inference": inference,
+            "selected_retrieval_metrics": selected_metrics,
         }
     finally:
         model = None
@@ -1408,6 +1678,16 @@ def main() -> None:
     if args.dpi <= 0:
         raise ValueError("--dpi must be positive.")
 
+    baseline_model_type = args.baseline_model_type or args.model_type
+    ours_model_type = args.ours_model_type or args.model_type
+    baseline_lambda_global = validate_lambda_global(
+        args.lambda_global if args.baseline_lambda_global is None else args.baseline_lambda_global,
+        "baseline_lambda_global" if args.baseline_lambda_global is not None else "lambda_global",
+    )
+    ours_lambda_global = validate_lambda_global(
+        args.lambda_global if args.ours_lambda_global is None else args.ours_lambda_global,
+        "ours_lambda_global" if args.ours_lambda_global is not None else "lambda_global",
+    )
     thresholds = parse_thresholds(args.thresholds)
     dataset_root = resolve_path(args.dataset_root)
     baseline_checkpoint = resolve_path(args.baseline_checkpoint)
@@ -1420,7 +1700,16 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = resolve_device(args.device)
-    model_args = build_model_args(args)
+    baseline_model_args = build_model_args(
+        args,
+        model_type=baseline_model_type,
+        lambda_global=baseline_lambda_global,
+    )
+    ours_model_args = build_model_args(
+        args,
+        model_type=ours_model_type,
+        lambda_global=ours_lambda_global,
+    )
     test_split_data = load_split_data(args.dataset_name, dataset_root, "test")
     validate_split_data(test_split_data, "test")
 
@@ -1429,21 +1718,27 @@ def main() -> None:
         f"for {args.dataset_name}: queries={len(test_split_data.captions)} "
         f"gallery={len(test_split_data.img_paths)}"
     )
-    print(f"[Baseline] Verifying {baseline_checkpoint}")
+    print(
+        f"[Baseline] Verifying {baseline_checkpoint} "
+        f"(model_type={baseline_model_type}, lambda_global={baseline_lambda_global:.4g})"
+    )
     baseline_eval_meta = evaluate_checkpoint_on_test_split(
         "Baseline",
         baseline_checkpoint,
-        model_args,
+        baseline_model_args,
         test_split_data,
         device,
         args.batch_size,
         args.num_workers,
     )
-    print(f"[Ours] Verifying {ours_checkpoint}")
+    print(
+        f"[Ours] Verifying {ours_checkpoint} "
+        f"(model_type={ours_model_type}, lambda_global={ours_lambda_global:.4g})"
+    )
     ours_eval_meta = evaluate_checkpoint_on_test_split(
         "Ours",
         ours_checkpoint,
-        model_args,
+        ours_model_args,
         test_split_data,
         device,
         args.batch_size,
@@ -1461,7 +1756,7 @@ def main() -> None:
     print(f"[Baseline] Computing ambiguity margins from {baseline_checkpoint}")
     baseline_rows, baseline_meta = compute_margins_for_checkpoint(
         baseline_checkpoint,
-        model_args,
+        baseline_model_args,
         split_data,
         device,
         args.batch_size,
@@ -1472,7 +1767,7 @@ def main() -> None:
     print(f"[Ours] Computing ambiguity margins from {ours_checkpoint}")
     ours_rows, ours_meta = compute_margins_for_checkpoint(
         ours_checkpoint,
-        model_args,
+        ours_model_args,
         split_data,
         device,
         args.batch_size,
@@ -1493,6 +1788,10 @@ def main() -> None:
         "ours_checkpoint": str(ours_checkpoint),
         "baseline_name": args.baseline_name,
         "ours_name": args.ours_name,
+        "baseline_model_type": baseline_model_type,
+        "ours_model_type": ours_model_type,
+        "baseline_lambda_global": float(baseline_lambda_global) if baseline_model_type == "itself" else None,
+        "ours_lambda_global": float(ours_lambda_global) if ours_model_type == "itself" else None,
         "num_queries_total": int(len(split_data.captions)),
         "num_queries_used": int(len(merged_rows)),
         "thresholds": [float(threshold) for threshold in thresholds],
@@ -1502,6 +1801,8 @@ def main() -> None:
         "paired_delta_summary": delta_summary,
         "baseline_load_stats": baseline_meta.get("load_stats", {}),
         "ours_load_stats": ours_meta.get("load_stats", {}),
+        "baseline_inference": baseline_meta.get("inference", {}),
+        "ours_inference": ours_meta.get("inference", {}),
         "test_retrieval_verification": {
             "baseline": baseline_eval_meta,
             "ours": ours_eval_meta,
