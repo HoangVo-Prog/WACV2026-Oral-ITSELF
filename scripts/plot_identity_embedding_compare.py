@@ -9,9 +9,6 @@ Example:
 
 python scripts/plot_identity_embedding_compare.py \
 --dataset_name RSTPReid \
---dataset_root /path/to/data \
---baseline_config /path/to/baseline/configs.yaml \
---iapr_config /path/to/iapr/configs.yaml \
 --baseline_checkpoint /path/to/baseline/best.pth \
 --iapr_checkpoint /path/to/iapr/best.pth \
 --output_dir outputs/identity_embedding_compare/rstpreid \
@@ -80,6 +77,8 @@ DEFAULT_IMAGE_DIRS = ["imgs", "images", "image", ""]
 DEFAULT_PATH_KEYS = ["img_path", "file_path", "image_path", "path", "filename", "image"]
 DEFAULT_PID_KEYS = ["id", "pid", "person_id", "identity", "identity_id", "label"]
 DEFAULT_CAPTION_KEYS = ["captions", "caption", "text", "description"]
+CONFIG_FILE_NAMES = ("configs.yaml", "config.yaml", "config.yml", "args.yaml", "args.yml")
+CHECKPOINT_CONFIG_KEYS = ("args", "config", "cfg", "model_args", "train_args", "training_args")
 
 GROUP_SCORE_COLUMNS = [
     "group_rank",
@@ -223,9 +222,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Dataset folder or parent folder. If omitted, root_dir is read from the configs.",
     )
-    parser.add_argument("--split", default="test", choices=["train", "val", "test"], help="Dataset split to visualize.")
-    parser.add_argument("--baseline_config", default=None, help="Optional baseline configs.yaml.")
-    parser.add_argument("--iapr_config", default=None, help="Optional IAPR configs.yaml.")
+    parser.add_argument("--split", default="test", choices=["test"], help="Dataset split to visualize. Test only.")
+    parser.add_argument("--baseline_config", default=None, help="Optional baseline configs.yaml override.")
+    parser.add_argument("--iapr_config", default=None, help="Optional IAPR configs.yaml override.")
     parser.add_argument("--baseline_checkpoint", "--baseline_ckpt", dest="baseline_checkpoint", required=True)
     parser.add_argument("--iapr_checkpoint", "--ours_checkpoint", "--iapr_ckpt", dest="iapr_checkpoint", required=True)
     parser.add_argument("--baseline_name", default="Baseline", help="Left subplot title.")
@@ -271,7 +270,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size for feature extraction.")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers.")
     parser.add_argument("--device", default="cuda", help='Device, e.g. "cuda" or "cpu".')
-    parser.add_argument("--skip_test_eval", action="store_true", help="Skip standard test retrieval verification.")
     parser.add_argument("--img_size", default=None, help='Override input image size as "height,width".')
     parser.add_argument("--text_length", type=int, default=None, help="Override tokenized text length.")
     parser.add_argument("--pretrain_choice", default=None, help="Override CLIP backbone choice.")
@@ -318,6 +316,77 @@ def config_to_dict(config: Any) -> Dict[str, Any]:
     if hasattr(config, "__dict__"):
         return dict(vars(config))
     return {key: getattr(config, key) for key in dir(config) if not key.startswith("_")}
+
+
+def json_default(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if torch.is_tensor(value):
+        return value.detach().cpu().tolist()
+    return str(value)
+
+
+def checkpoint_config_dict(checkpoint_path: Path) -> Dict[str, Any]:
+    try:
+        checkpoint = torch_load_checkpoint(checkpoint_path)
+    except Exception as exc:
+        print(f"[Config] Warning: could not inspect checkpoint metadata for {checkpoint_path}: {exc}")
+        return {}
+    if not isinstance(checkpoint, Mapping):
+        return {}
+    for key in CHECKPOINT_CONFIG_KEYS:
+        value = checkpoint.get(key)
+        if value is None:
+            continue
+        cfg = config_to_dict(value)
+        if cfg:
+            return cfg
+    return {}
+
+
+def infer_config_path_from_checkpoint(checkpoint_path: Path) -> Optional[Path]:
+    search_dirs: List[Path] = []
+    for parent in [checkpoint_path.parent] + list(checkpoint_path.parents):
+        if parent in search_dirs:
+            continue
+        search_dirs.append(parent)
+        if parent == REPO_ROOT or len(search_dirs) >= 8:
+            break
+
+    for directory in search_dirs:
+        for filename in CONFIG_FILE_NAMES:
+            candidate = directory / filename
+            if candidate.is_file():
+                return candidate.resolve()
+    return None
+
+
+def resolve_config_for_checkpoint(
+    label: str,
+    explicit_config: Optional[str],
+    checkpoint_path: Path,
+) -> Tuple[Dict[str, Any], Optional[Path], str]:
+    if explicit_config:
+        config_path = resolve_path(explicit_config)
+        if not config_path.is_file():
+            raise FileNotFoundError(f"{label} config file not found: {config_path}")
+        return load_train_config(config_path), config_path, "manual"
+
+    inferred_path = infer_config_path_from_checkpoint(checkpoint_path)
+    if inferred_path is not None:
+        return load_train_config(inferred_path), inferred_path, "checkpoint_nearby_configs.yaml"
+
+    checkpoint_cfg = checkpoint_config_dict(checkpoint_path)
+    if checkpoint_cfg:
+        return checkpoint_cfg, None, "checkpoint_metadata"
+
+    return {}, None, "defaults_cli"
 
 
 def default_model_args() -> Dict[str, Any]:
@@ -414,16 +483,11 @@ def default_model_args() -> Dict[str, Any]:
 
 def build_model_args(
     cli_args: argparse.Namespace,
-    config_path: Optional[str],
+    loaded_config: Mapping[str, Any],
     model_type: str,
-) -> Tuple[SimpleNamespace, Optional[Path]]:
+) -> SimpleNamespace:
     cfg = default_model_args()
-    resolved_config: Optional[Path] = None
-    if config_path:
-        resolved_config = resolve_path(config_path)
-        if not resolved_config.is_file():
-            raise FileNotFoundError(f"Config file not found: {resolved_config}")
-        cfg.update(load_train_config(resolved_config))
+    cfg.update(config_to_dict(loaded_config))
 
     cfg["dataset_name"] = cli_args.dataset_name
     if cli_args.dataset_root:
@@ -455,7 +519,7 @@ def build_model_args(
     cfg.setdefault("no_ira_mode", "hard")
     cfg.setdefault("no_iopm", False)
     cfg.setdefault("prototype_lr", None)
-    return SimpleNamespace(**cfg), resolved_config
+    return SimpleNamespace(**cfg)
 
 
 def dataset_root_for_repo_class(factory: type, dataset_root: Path) -> Path:
@@ -2170,6 +2234,79 @@ def save_csv(rows: Sequence[Mapping[str, Any]], path: Path, columns: Sequence[st
         writer.writerows(rows)
 
 
+def save_json(data: Any, path: Path) -> None:
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(data, file, indent=2, default=json_default)
+        file.write("\n")
+
+
+def evaluation_summary_row(
+    label: str,
+    config_path: Optional[Path],
+    config_source: str,
+    metadata: Mapping[str, Any],
+) -> Dict[str, Any]:
+    best = metadata.get("best_retrieval_metrics", {})
+    selected = metadata.get("selected_retrieval_metrics", {})
+    inference = metadata.get("selected_inference", {})
+    return {
+        "label": label,
+        "checkpoint": metadata.get("checkpoint", ""),
+        "config": str(config_path) if config_path is not None else "",
+        "config_source": config_source,
+        "best_task": best.get("task", ""),
+        "best_R1": best.get("R1", ""),
+        "best_R5": best.get("R5", ""),
+        "best_R10": best.get("R10", ""),
+        "best_mAP": best.get("mAP", ""),
+        "best_mINP": best.get("mINP", ""),
+        "best_rSum": best.get("rSum", ""),
+        "selected_task": inference.get("ablation_task", ""),
+        "selected_global_weight": inference.get("global_weight", ""),
+        "selected_grab_weight": inference.get("grab_weight", ""),
+        "selected_R1": selected.get("R1", ""),
+        "selected_R5": selected.get("R5", ""),
+        "selected_R10": selected.get("R10", ""),
+        "selected_mAP": selected.get("mAP", ""),
+        "selected_mINP": selected.get("mINP", ""),
+        "selected_rSum": selected.get("rSum", ""),
+        "loaded_tensors": metadata.get("load_stats", {}).get("loaded", ""),
+        "skipped_missing": metadata.get("load_stats", {}).get("skipped_missing", ""),
+        "skipped_shape": metadata.get("load_stats", {}).get("skipped_shape", ""),
+        "skipped_non_tensor": metadata.get("load_stats", {}).get("skipped_non_tensor", ""),
+    }
+
+
+def save_test_evaluation_outputs(
+    output_dir: Path,
+    dataset_name: str,
+    baseline_meta: Mapping[str, Any],
+    iapr_meta: Mapping[str, Any],
+    baseline_config: Optional[Path],
+    iapr_config: Optional[Path],
+    baseline_config_source: str,
+    iapr_config_source: str,
+) -> Tuple[Path, Path]:
+    rows = [
+        evaluation_summary_row("Baseline", baseline_config, baseline_config_source, baseline_meta),
+        evaluation_summary_row("IAPR", iapr_config, iapr_config_source, iapr_meta),
+    ]
+    csv_path = output_dir / f"{dataset_name}_identity_vis_test_eval_summary.csv"
+    json_path = output_dir / f"{dataset_name}_identity_vis_test_eval_summary.json"
+    save_csv(rows, csv_path, list(rows[0].keys()))
+    save_json(
+        {
+            "dataset_name": dataset_name,
+            "split": "test",
+            "baseline": baseline_meta,
+            "iapr": iapr_meta,
+            "summary_rows": rows,
+        },
+        json_path,
+    )
+    return csv_path, json_path
+
+
 def print_load_stats(label: str, metadata: Mapping[str, Any]) -> None:
     stats = metadata.get("load_stats", {})
     print(
@@ -2190,6 +2327,8 @@ def set_seed(seed: int) -> None:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.split != "test":
+        raise ValueError("Identity embedding visualization is intentionally test-only; use --split test.")
     if args.batch_size <= 0:
         raise ValueError("--batch_size must be positive.")
     if args.num_workers < 0:
@@ -2220,11 +2359,24 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{weight_name} must be finite.")
 
 
-def shared_dataset_root(args: argparse.Namespace, baseline_args: SimpleNamespace, iapr_args: SimpleNamespace) -> Path:
+def shared_dataset_root(
+    args: argparse.Namespace,
+    baseline_args: SimpleNamespace,
+    iapr_args: SimpleNamespace,
+    baseline_config_source: str,
+    iapr_config_source: str,
+) -> Path:
     if args.dataset_root:
         root = resolve_path(args.dataset_root)
     else:
-        root = resolve_path(getattr(baseline_args, "root_dir", None) or getattr(iapr_args, "root_dir", None))
+        baseline_root_value = getattr(baseline_args, "root_dir", None)
+        iapr_root_value = getattr(iapr_args, "root_dir", None)
+        if baseline_config_source != "defaults_cli" and baseline_root_value:
+            root = resolve_path(baseline_root_value)
+        elif iapr_config_source != "defaults_cli" and iapr_root_value:
+            root = resolve_path(iapr_root_value)
+        else:
+            root = resolve_path(baseline_root_value or iapr_root_value)
     baseline_root = resolve_path(getattr(baseline_args, "root_dir", root))
     iapr_root = resolve_path(getattr(iapr_args, "root_dir", root))
     if baseline_root != iapr_root:
@@ -2232,6 +2384,29 @@ def shared_dataset_root(args: argparse.Namespace, baseline_args: SimpleNamespace
     baseline_args.root_dir = str(root)
     iapr_args.root_dir = str(root)
     return root
+
+
+def harmonize_eval_settings(baseline_args: SimpleNamespace, iapr_args: SimpleNamespace) -> None:
+    shared_keys = ("dataset_name", "root_dir", "img_size", "text_length", "batch_size", "test_batch_size", "num_workers")
+    for key in shared_keys:
+        baseline_value = getattr(baseline_args, key, None)
+        iapr_value = getattr(iapr_args, key, None)
+        if baseline_value != iapr_value:
+            print(
+                f"[Config] Warning: baseline {key}={baseline_value!r} differs from "
+                f"IAPR {key}={iapr_value!r}; using baseline value for both."
+            )
+        setattr(iapr_args, key, baseline_value)
+
+    baseline_model_type = getattr(baseline_args, "model_type", "itself")
+    iapr_model_type = getattr(iapr_args, "model_type", "itself")
+    if baseline_model_type != iapr_model_type:
+        raise ValueError(
+            "Baseline and IAPR must use the same model_type/inference path for a fair comparison. "
+            f"Got baseline={baseline_model_type!r}, IAPR={iapr_model_type!r}."
+        )
+    baseline_args.only_global = baseline_model_type == "clip"
+    iapr_args.only_global = iapr_model_type == "clip"
 
 
 def print_selected_group(row: Mapping[str, Any]) -> None:
@@ -2250,12 +2425,6 @@ def main() -> None:
     validate_args(args)
     set_seed(int(args.seed))
 
-    baseline_model_type = args.baseline_model_type or args.model_type
-    iapr_model_type = args.iapr_model_type or args.model_type
-    baseline_args, baseline_config = build_model_args(args, args.baseline_config, baseline_model_type)
-    iapr_args, iapr_config = build_model_args(args, args.iapr_config, iapr_model_type)
-    dataset_root = shared_dataset_root(args, baseline_args, iapr_args)
-
     baseline_checkpoint = resolve_path(args.baseline_checkpoint)
     iapr_checkpoint = resolve_path(args.iapr_checkpoint)
     if not baseline_checkpoint.is_file():
@@ -2265,48 +2434,87 @@ def main() -> None:
 
     output_dir = resolve_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    baseline_cfg, baseline_config, baseline_config_source = resolve_config_for_checkpoint(
+        "Baseline",
+        args.baseline_config,
+        baseline_checkpoint,
+    )
+    iapr_cfg, iapr_config, iapr_config_source = resolve_config_for_checkpoint(
+        "IAPR",
+        args.iapr_config,
+        iapr_checkpoint,
+    )
+
+    baseline_model_type = args.baseline_model_type or args.model_type
+    iapr_model_type = args.iapr_model_type or args.model_type
+    baseline_args = build_model_args(args, baseline_cfg, baseline_model_type)
+    iapr_args = build_model_args(args, iapr_cfg, iapr_model_type)
+    dataset_root = shared_dataset_root(
+        args,
+        baseline_args,
+        iapr_args,
+        baseline_config_source,
+        iapr_config_source,
+    )
+    harmonize_eval_settings(baseline_args, iapr_args)
     device = resolve_device(args.device)
 
-    print(f"[Config] Baseline config: {baseline_config if baseline_config is not None else 'defaults + CLI'}")
-    print(f"[Config] IAPR config: {iapr_config if iapr_config is not None else 'defaults + CLI'}")
-    print(f"[Dataset] Loading {args.dataset_name} split={args.split} from {dataset_root}")
+    print(
+        f"[Config] Baseline config: "
+        f"{baseline_config if baseline_config is not None else 'defaults + CLI'} "
+        f"(source={baseline_config_source})"
+    )
+    print(
+        f"[Config] IAPR config: "
+        f"{iapr_config if iapr_config is not None else 'defaults + CLI'} "
+        f"(source={iapr_config_source})"
+    )
+    print(f"[Dataset] Loading {args.dataset_name} split=test from {dataset_root}")
     print(f"[Checkpoint] Baseline: {baseline_checkpoint}")
     print(f"[Checkpoint] IAPR: {iapr_checkpoint}")
 
-    if args.skip_test_eval:
-        print("[Verification] Skipping standard retrieval evaluation because --skip_test_eval was set.")
-        split_data = load_split_data(args.dataset_name, dataset_root, args.split)
-    else:
-        test_split_data = load_split_data(args.dataset_name, dataset_root, "test")
-        print(
-            f"[Verification] Running standard retrieval evaluation on test split: "
-            f"queries={len(test_split_data.captions)} gallery={len(test_split_data.img_paths)}"
-        )
-        baseline_eval_meta = evaluate_checkpoint_on_test_split(
-            "Baseline",
-            baseline_checkpoint,
-            baseline_args,
-            test_split_data,
-            device,
-            args.batch_size,
-            args.num_workers,
-        )
-        iapr_eval_meta = evaluate_checkpoint_on_test_split(
-            "IAPR",
-            iapr_checkpoint,
-            iapr_args,
-            test_split_data,
-            device,
-            args.batch_size,
-            args.num_workers,
-        )
-        baseline_args.selected_inference = baseline_eval_meta.get("selected_inference")
-        iapr_args.selected_inference = iapr_eval_meta.get("selected_inference")
-        split_data = test_split_data if args.split == "test" else load_split_data(args.dataset_name, dataset_root, args.split)
-
-    validate_split_data(split_data, args.split)
+    split_data = load_split_data(args.dataset_name, dataset_root, "test")
     print(
-        f"[Dataset] {args.dataset_name} split={args.split} "
+        f"[Verification] Running mandatory standard retrieval evaluation on test split: "
+        f"queries={len(split_data.captions)} gallery={len(split_data.img_paths)}"
+    )
+    baseline_eval_meta = evaluate_checkpoint_on_test_split(
+        "Baseline",
+        baseline_checkpoint,
+        baseline_args,
+        split_data,
+        device,
+        args.batch_size,
+        args.num_workers,
+    )
+    iapr_eval_meta = evaluate_checkpoint_on_test_split(
+        "IAPR",
+        iapr_checkpoint,
+        iapr_args,
+        split_data,
+        device,
+        args.batch_size,
+        args.num_workers,
+    )
+    baseline_args.selected_inference = baseline_eval_meta.get("selected_inference")
+    iapr_args.selected_inference = iapr_eval_meta.get("selected_inference")
+    eval_csv_path, eval_json_path = save_test_evaluation_outputs(
+        output_dir,
+        args.dataset_name,
+        baseline_eval_meta,
+        iapr_eval_meta,
+        baseline_config,
+        iapr_config,
+        baseline_config_source,
+        iapr_config_source,
+    )
+    print(f"[Output] saved test evaluation CSV: {eval_csv_path}")
+    print(f"[Output] saved test evaluation JSON: {eval_json_path}")
+
+    validate_split_data(split_data, "test")
+    print(
+        f"[Dataset] {args.dataset_name} split=test "
         f"images={len(split_data.img_paths)} captions={len(split_data.captions)} "
         f"train_ids={split_data.num_train_ids}"
     )
