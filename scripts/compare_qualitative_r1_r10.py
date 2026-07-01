@@ -13,7 +13,7 @@ python scripts/compare_qualitative_r1_r10.py \
   --output_dir ./qualitative_compare/cuhk \
   --num_figs 30 \
   --top_k 10 \
-  --sort_mode best_r1_baseline_not_r1 \
+  --sort_mode best_r1_green_gap \
   --device cuda
 """
 
@@ -50,6 +50,8 @@ from utils.options import get_args as get_project_default_args
 
 
 SORT_MODES = (
+    "best_r1_green_gap",
+    "strict_showcase",
     "best_r1_baseline_not_r1",
     "best_r1_baseline_not_r10",
     "rank_improvement",
@@ -84,12 +86,22 @@ CSV_FIELD_ORDER = [
     "best_top1_score",
     "baseline_r1_correct",
     "best_r1_correct",
+    "baseline_z_topK",
+    "best_z_topK",
+    "baseline_green_count@K",
+    "best_green_count@K",
+    "green_gap",
     "baseline_first_correct_rank",
     "best_first_correct_rank",
+    "rank_gain",
     "baseline_has_correct_top10",
     "best_has_correct_top10",
     "rank_improvement",
     "reciprocal_rank_improvement",
+    "baseline_discounted_green_score@K",
+    "best_discounted_green_score@K",
+    "early_green_gap",
+    "showcase_score",
     "baseline_top10_positive_count",
     "best_top10_positive_count",
     "baseline_top_indices",
@@ -140,7 +152,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_figs", type=int, default=20)
     parser.add_argument("--top_k", type=int, default=10)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--sort_mode", choices=SORT_MODES, default="best_r1_baseline_not_r1")
+    parser.add_argument("--sort_mode", choices=SORT_MODES, default="best_r1_green_gap")
+    parser.add_argument(
+        "--min_best_green",
+        type=int,
+        default=None,
+        help="Minimum best-model correct identity images in top-K for strict_showcase. Defaults to 3 when top_k<=5, else 5.",
+    )
+    parser.add_argument(
+        "--max_baseline_green",
+        type=int,
+        default=None,
+        help="Maximum baseline correct identity images in top-K for strict_showcase. Defaults to 2 when top_k<=5, else 3.",
+    )
     parser.add_argument("--save_csv", dest="save_csv", action="store_true", default=True)
     parser.add_argument("--no_save_csv", dest="save_csv", action="store_false")
     parser.add_argument(
@@ -714,6 +738,42 @@ def top_list_values(
     return top_indices, top_pids, top_scores, top_paths
 
 
+def green_vector_and_scores(matches: torch.Tensor, top_k: int) -> Tuple[List[int], int, float]:
+    top_matches = matches[: min(top_k, matches.numel())]
+    z_topk = [int(value) for value in top_matches.to(dtype=torch.int64).tolist()]
+    green_count = int(sum(z_topk))
+    discounted = 0.0
+    for rank, is_green in enumerate(z_topk, start=1):
+        if is_green:
+            discounted += 1.0 / math.log2(rank + 1.0)
+    return z_topk, green_count, float(discounted)
+
+
+def showcase_score_from_values(
+    best_r1_correct: bool,
+    baseline_r1_correct: bool,
+    best_green_count: int,
+    baseline_green_count: int,
+    best_first_correct_rank: int,
+    rank_gain: int,
+    early_green_gap: float,
+) -> float:
+    green_gap = best_green_count - baseline_green_count
+    baseline_r1_wrong_bonus = 1000.0 if best_r1_correct and not baseline_r1_correct else 0.0
+    best_r1_bonus = 100.0 if best_r1_correct else 0.0
+    early_rank_bonus = 10.0 / max(float(best_first_correct_rank), 1.0)
+    return float(
+        best_r1_bonus
+        + baseline_r1_wrong_bonus
+        + 120.0 * green_gap
+        + 35.0 * best_green_count
+        - 25.0 * baseline_green_count
+        + 30.0 * early_green_gap
+        + 2.0 * rank_gain
+        + early_rank_bonus
+    )
+
+
 def row_stats_for_model(
     scores: torch.Tensor,
     order: torch.Tensor,
@@ -735,6 +795,7 @@ def row_stats_for_model(
         order.cpu(), scores.cpu(), gallery_pids.cpu(), img_paths, display_k
     )
     top10 = matches[: min(recall_k, matches.numel())]
+    z_topk, green_count, discounted_green_score = green_vector_and_scores(matches, display_k)
     return {
         "top1_identity": int(gallery_pids[top1_index].item()),
         "top1_index": top1_index,
@@ -743,6 +804,9 @@ def row_stats_for_model(
         "first_correct_rank": first_correct_rank,
         "has_correct_top10": bool(top10.any().item()),
         "top10_positive_count": int(top10.sum().item()),
+        "z_topK": z_topk,
+        "green_count_at_k": green_count,
+        "discounted_green_score_at_k": discounted_green_score,
         "top_indices": top_indices,
         "top_pids": top_pids,
         "top_scores": top_scores,
@@ -806,6 +870,21 @@ def compute_query_rows(
         best_rank = int(best_stats["first_correct_rank"])
         rank_improvement = baseline_rank - best_rank
         rr_improvement = (1.0 / best_rank) - (1.0 / baseline_rank)
+        baseline_green_count = int(baseline_stats["green_count_at_k"])
+        best_green_count = int(best_stats["green_count_at_k"])
+        green_gap = best_green_count - baseline_green_count
+        baseline_discounted = float(baseline_stats["discounted_green_score_at_k"])
+        best_discounted = float(best_stats["discounted_green_score_at_k"])
+        early_green_gap = best_discounted - baseline_discounted
+        showcase_score = showcase_score_from_values(
+            best_r1_correct=bool(best_stats["r1_correct"]),
+            baseline_r1_correct=bool(baseline_stats["r1_correct"]),
+            best_green_count=best_green_count,
+            baseline_green_count=baseline_green_count,
+            best_first_correct_rank=best_rank,
+            rank_gain=rank_improvement,
+            early_green_gap=early_green_gap,
+        )
 
         row: Dict[str, Any] = {
             "query_index": int(query_index),
@@ -819,12 +898,22 @@ def compute_query_rows(
             "best_top1_score": best_stats["top1_score"],
             "baseline_r1_correct": bool(baseline_stats["r1_correct"]),
             "best_r1_correct": bool(best_stats["r1_correct"]),
+            "baseline_z_topK": baseline_stats["z_topK"],
+            "best_z_topK": best_stats["z_topK"],
+            "baseline_green_count@K": baseline_green_count,
+            "best_green_count@K": best_green_count,
+            "green_gap": int(green_gap),
             "baseline_first_correct_rank": baseline_rank,
             "best_first_correct_rank": best_rank,
+            "rank_gain": int(rank_improvement),
             "baseline_has_correct_top10": bool(baseline_stats["has_correct_top10"]),
             "best_has_correct_top10": bool(best_stats["has_correct_top10"]),
             "rank_improvement": int(rank_improvement),
             "reciprocal_rank_improvement": float(rr_improvement),
+            "baseline_discounted_green_score@K": baseline_discounted,
+            "best_discounted_green_score@K": best_discounted,
+            "early_green_gap": float(early_green_gap),
+            "showcase_score": showcase_score,
             "baseline_top10_positive_count": int(baseline_stats["top10_positive_count"]),
             "best_top10_positive_count": int(best_stats["top10_positive_count"]),
             "baseline_top_indices": baseline_stats["top_indices"],
@@ -841,7 +930,44 @@ def compute_query_rows(
     return rows, skipped
 
 
-def sort_query_rows(rows: Sequence[Mapping[str, Any]], sort_mode: str, top_k: int) -> List[Mapping[str, Any]]:
+def showcase_sort_key(row: Mapping[str, Any]) -> Tuple[float, int, int, int, int, float, int, int, int]:
+    return (
+        float(row["showcase_score"]),
+        int(bool(row["best_r1_correct"] and not row["baseline_r1_correct"])),
+        int(row["green_gap"]),
+        int(row["best_green_count@K"]),
+        -int(row["baseline_green_count@K"]),
+        float(row["early_green_gap"]),
+        int(row["rank_gain"]),
+        -int(row["best_first_correct_rank"]),
+        int(row["baseline_first_correct_rank"]),
+    )
+
+
+def sort_query_rows(
+    rows: Sequence[Mapping[str, Any]],
+    sort_mode: str,
+    top_k: int,
+    min_best_green: int,
+    max_baseline_green: int,
+) -> List[Mapping[str, Any]]:
+    if sort_mode == "best_r1_green_gap":
+        candidates = [
+            row
+            for row in rows
+            if row["best_r1_correct"] and int(row["best_green_count@K"]) > int(row["baseline_green_count@K"])
+        ]
+        return sorted(candidates, key=showcase_sort_key, reverse=True)
+    if sort_mode == "strict_showcase":
+        candidates = [
+            row
+            for row in rows
+            if row["best_r1_correct"]
+            and not row["baseline_r1_correct"]
+            and int(row["best_green_count@K"]) >= min_best_green
+            and int(row["baseline_green_count@K"]) <= max_baseline_green
+        ]
+        return sorted(candidates, key=showcase_sort_key, reverse=True)
     if sort_mode == "best_r1_baseline_not_r1":
         candidates = [row for row in rows if row["best_r1_correct"] and not row["baseline_r1_correct"]]
         return sorted(
@@ -917,6 +1043,8 @@ def build_summary(
     skipped: Sequence[Mapping[str, Any]],
     total_queries: int,
     sort_mode: str,
+    min_best_green: int,
+    max_baseline_green: int,
     saved_figures: int,
     retrieval_mode: str,
     global_weight: float,
@@ -964,6 +1092,14 @@ def build_summary(
         "num_queries_degraded": int(sum(1 for row in rows if row["rank_improvement"] < 0)),
         "mean_first_correct_rank_improvement": mean_or_none(rank_improvements),
         "selected_sort_mode": sort_mode,
+        "min_best_green": int(min_best_green),
+        "max_baseline_green": int(max_baseline_green),
+        "showcase_score_definition": (
+            "100*best_r1 + 1000*(best_r1 and not baseline_r1) + 120*green_gap "
+            "+ 35*best_green_count@K - 25*baseline_green_count@K + 30*early_green_gap "
+            "+ 2*rank_gain + 10/best_first_correct_rank"
+        ),
+        "discounted_green_score_definition": "sum_{rank=1..K} z[rank] / log2(rank + 1)",
         "number_of_saved_figures": int(saved_figures),
         "img_size": list(parse_img_size(model_args.img_size)),
         "text_length": int(model_args.text_length),
@@ -1168,7 +1304,7 @@ def render_query_figure(
         width - 2 * left,
     )
     caption_lines = caption_lines[:4]
-    top_h = 92 + len(caption_lines) * 24
+    top_h = 116 + len(caption_lines) * 24
     row_h = thumb_h + 70
     height = top_h + 2 * row_h + 36
 
@@ -1177,18 +1313,23 @@ def render_query_figure(
     title = (
         f"Baseline rank {row['baseline_first_correct_rank']} | "
         f"Best rank {row['best_first_correct_rank']} | "
-        f"improvement {row['rank_improvement']} | {sort_mode}"
+        f"gain {row['rank_gain']}"
+    )
+    score_line = (
+        f"green {row['baseline_green_count@K']}->{row['best_green_count@K']} "
+        f"(gap {row['green_gap']}) | score {float(row.get('showcase_score', 0.0)):.1f} | {sort_mode}"
     )
     draw_text(draw, (left, 18), title, title_font, (17, 24, 39))
+    draw_text(draw, (left, 50), score_line, meta_font, (55, 65, 81))
     draw_text(
         draw,
-        (left, 50),
+        (left, 74),
         f"Query index {row['query_index']} | query pid {row['query_pid']}",
         meta_font,
         (75, 85, 99),
     )
 
-    y_text = 76
+    y_text = 100
     for line in caption_lines:
         draw_text(draw, (left, y_text), line, caption_font, (31, 41, 55))
         y_text += 24
@@ -1263,13 +1404,28 @@ def validate_cli_args(args: argparse.Namespace) -> None:
         raise ValueError("--num_figs must be non-negative.")
     if args.top_k <= 0:
         raise ValueError("--top_k must be positive.")
+    if args.min_best_green is not None and args.min_best_green < 0:
+        raise ValueError("--min_best_green must be non-negative.")
+    if args.max_baseline_green is not None and args.max_baseline_green < 0:
+        raise ValueError("--max_baseline_green must be non-negative.")
     if args.dpi <= 0:
         raise ValueError("--dpi must be positive.")
+
+
+def resolve_showcase_thresholds(args: argparse.Namespace) -> Tuple[int, int]:
+    default_min_best_green = 3 if args.top_k <= 5 else 5
+    default_max_baseline_green = 2 if args.top_k <= 5 else 3
+    min_best_green = default_min_best_green if args.min_best_green is None else int(args.min_best_green)
+    max_baseline_green = (
+        default_max_baseline_green if args.max_baseline_green is None else int(args.max_baseline_green)
+    )
+    return min_best_green, max_baseline_green
 
 
 def main() -> None:
     args = parse_args()
     validate_cli_args(args)
+    min_best_green, max_baseline_green = resolve_showcase_thresholds(args)
 
     baseline_ckpt = resolve_path(args.baseline_ckpt)
     best_ckpt = resolve_path(args.best_ckpt)
@@ -1348,11 +1504,12 @@ def main() -> None:
     if skipped:
         print(f"Warning: skipped {len(skipped)} queries with no same-identity gallery image.")
 
-    sorted_rows = sort_query_rows(rows, args.sort_mode, args.top_k)
+    sorted_rows = sort_query_rows(rows, args.sort_mode, args.top_k, min_best_green, max_baseline_green)
     selected_rows = list(sorted_rows[: args.num_figs])
     print(
         f"[Selection] sort_mode={args.sort_mode} candidates={len(sorted_rows)} "
-        f"saved_figures={len(selected_rows)}"
+        f"saved_figures={len(selected_rows)} min_best_green={min_best_green} "
+        f"max_baseline_green={max_baseline_green}"
     )
 
     ranking_csv = output_dir / "ranking_results.csv"
@@ -1386,6 +1543,8 @@ def main() -> None:
         skipped,
         total_queries=len(split_meta.captions),
         sort_mode=args.sort_mode,
+        min_best_green=min_best_green,
+        max_baseline_green=max_baseline_green,
         saved_figures=saved_figures,
         retrieval_mode=retrieval_mode,
         global_weight=global_weight,
