@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import inspect
 import json
 import math
 import sys
@@ -113,6 +114,14 @@ def build_repo_model(args: SimpleNamespace, num_classes: int) -> torch.nn.Module
     except ModuleNotFoundError as exc:
         raise runtime_dependency_error("building the model", exc)
     return build_model(args, num_classes=num_classes)
+
+
+def evaluator_class() -> type:
+    try:
+        from utils.metrics import Evaluator
+    except ModuleNotFoundError as exc:
+        raise runtime_dependency_error("loading the standard retrieval evaluator", exc)
+    return Evaluator
 
 GENERIC_DATASET_CONFIGS = {
     "CUHK-PEDES": {
@@ -710,6 +719,12 @@ def feature_tensor(output: Any, kind: str) -> torch.Tensor:
     return output
 
 
+def call_model_encoder(encoder: Any, tensor: torch.Tensor, kind: str) -> torch.Tensor:
+    params = inspect.signature(encoder).parameters
+    output = encoder(tensor, 0) if len(params) >= 2 else encoder(tensor)
+    return feature_tensor(output, kind)
+
+
 @torch.inference_mode()
 def extract_text_features(
     model: torch.nn.Module,
@@ -734,7 +749,7 @@ def extract_text_features(
     model.eval()
     for pid, tokens in tqdm(loader, desc="Extracting text features"):
         tokens = tokens.to(device, non_blocking=True)
-        feats = feature_tensor(model.encode_text(tokens), "text").float()
+        feats = call_model_encoder(model.encode_text, tokens, "text").float()
         features.append(feats.cpu())
         pids.append(pid.view(-1).cpu().long())
 
@@ -771,7 +786,7 @@ def extract_image_features(
     model.eval()
     for pid, images in tqdm(loader, desc="Extracting image features"):
         images = images.to(device, non_blocking=True)
-        feats = feature_tensor(model.encode_image(images), "image").float()
+        feats = call_model_encoder(model.encode_image, images, "image").float()
         features.append(feats.cpu())
         pids.append(pid.view(-1).cpu().long())
 
@@ -844,6 +859,28 @@ def summarize_margins(rows: Sequence[Mapping[str, Any]], total_queries: int, ski
     }
 
 
+def load_model_for_checkpoint(
+    checkpoint_path: str | Path,
+    model_args: SimpleNamespace,
+    split_data: SplitData,
+    device: torch.device,
+) -> Tuple[torch.nn.Module, SimpleNamespace, Dict[str, int], Path]:
+    checkpoint = resolve_path(checkpoint_path)
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint}")
+
+    run_args = SimpleNamespace(**vars(model_args))
+    num_classes = max(int(split_data.num_train_ids), 1)
+    model = build_repo_model(run_args, num_classes=num_classes)
+    load_stats = load_checkpoint_for_inference(model, checkpoint)
+
+    model.to(device)
+    if device.type == "cpu":
+        model.float()
+    model.eval()
+    return model, run_args, load_stats, checkpoint
+
+
 def compute_margins_for_checkpoint(
     checkpoint_path: str | Path,
     model_args: SimpleNamespace,
@@ -852,10 +889,6 @@ def compute_margins_for_checkpoint(
     batch_size: int,
     num_workers: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    checkpoint = resolve_path(checkpoint_path)
-    if not checkpoint.is_file():
-        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint}")
-
     model: Optional[torch.nn.Module] = None
     text_features: Optional[torch.Tensor] = None
     image_features: Optional[torch.Tensor] = None
@@ -864,16 +897,12 @@ def compute_margins_for_checkpoint(
     sim: Optional[torch.Tensor] = None
 
     try:
-        run_args = SimpleNamespace(**vars(model_args))
-        num_classes = max(int(split_data.num_train_ids), 1)
-        model = build_repo_model(run_args, num_classes=num_classes)
-        load_stats = load_checkpoint_for_inference(model, checkpoint)
-
-        model.to(device)
-        if device.type == "cpu":
-            model.float()
-        model.eval()
-
+        model, run_args, load_stats, checkpoint = load_model_for_checkpoint(
+            checkpoint_path,
+            model_args,
+            split_data,
+            device,
+        )
         text_features, query_pids = extract_text_features(
             model,
             split_data,
@@ -907,6 +936,160 @@ def compute_margins_for_checkpoint(
         query_pids = None
         gallery_pids = None
         sim = None
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+
+def build_standard_eval_loaders(
+    split_data: SplitData,
+    model_args: SimpleNamespace,
+    batch_size: int,
+    num_workers: int,
+    device: torch.device,
+) -> Tuple[DataLoader, DataLoader]:
+    ImageDataset = image_dataset_class()
+    TextDataset = text_dataset_class()
+    transform = build_eval_transforms(parse_img_size(model_args.img_size))
+    image_set = ImageDataset(split_data.image_pids, split_data.img_paths, transform=transform)
+    text_set = TextDataset(split_data.caption_pids, split_data.captions, text_length=int(model_args.text_length))
+    image_loader = DataLoader(
+        image_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+    )
+    text_loader = DataLoader(
+        text_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+    )
+    return image_loader, text_loader
+
+
+def build_standard_evaluator(image_loader: DataLoader, text_loader: DataLoader, model_args: SimpleNamespace) -> Any:
+    Evaluator = evaluator_class()
+    params = inspect.signature(Evaluator).parameters
+    if "args" in params or len(params) >= 3:
+        return Evaluator(image_loader, text_loader, model_args)
+    return Evaluator(image_loader, text_loader)
+
+
+def numeric_mapping(mapping: Mapping[str, Any]) -> Dict[str, float]:
+    numeric: Dict[str, float] = {}
+    for key, value in mapping.items():
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            numeric[str(key)] = float(value)
+    return numeric
+
+
+def run_standard_retrieval_eval(evaluator: Any, model: torch.nn.Module) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    if hasattr(evaluator, "eval_metrics"):
+        metrics = evaluator.eval_metrics(model)
+        return numeric_mapping(metrics), {}
+
+    eval_params = inspect.signature(evaluator.eval).parameters
+    kwargs: Dict[str, Any] = {}
+    if "return_metrics" in eval_params:
+        kwargs["return_metrics"] = True
+    result = evaluator.eval(model, **kwargs)
+
+    if isinstance(result, tuple):
+        top1 = result[0]
+        metrics = result[1] if len(result) > 1 and isinstance(result[1], Mapping) else {"R1": top1}
+        best_metrics = result[2] if len(result) > 2 and isinstance(result[2], Mapping) else {}
+        return numeric_mapping(metrics), dict(best_metrics)
+
+    return {"R1": float(result)}, {}
+
+
+def split_metric_key(key: str) -> Tuple[str, str]:
+    tail = key.rsplit("/", 1)[-1]
+    if "_" in tail:
+        task, metric = key.rsplit("_", 1)
+        return task, metric
+    if "/" in key:
+        task, metric = key.rsplit("/", 1)
+        return task, metric
+    return "retrieval", key
+
+
+def grouped_retrieval_metrics(metrics: Mapping[str, float]) -> List[Tuple[str, Dict[str, float]]]:
+    wanted = {"R1", "R5", "R10", "mAP", "mINP", "rSum"}
+    groups: Dict[str, Dict[str, float]] = {}
+    order: List[str] = []
+    for key, value in metrics.items():
+        task, metric = split_metric_key(str(key))
+        if metric not in wanted:
+            continue
+        if task not in groups:
+            groups[task] = {}
+            order.append(task)
+        groups[task][metric] = float(value)
+    return [(task, groups[task]) for task in order]
+
+
+def print_retrieval_metrics(label: str, metrics: Mapping[str, float], best_metrics: Mapping[str, Any]) -> None:
+    print(f"[{label}] Standard test-set retrieval metrics:")
+    metric_order = [("R1", "R@1"), ("R5", "R@5"), ("R10", "R@10"), ("mAP", "mAP"), ("mINP", "mINP"), ("rSum", "rSum")]
+    if best_metrics:
+        best_parts = []
+        for key, display in metric_order:
+            if key in best_metrics:
+                best_parts.append(f"{display}={float(best_metrics[key]):.2f}")
+        task = best_metrics.get("task", "best")
+        if best_parts:
+            print(f"  best ({task}): " + ", ".join(best_parts))
+
+    groups = grouped_retrieval_metrics(metrics)
+    if not groups:
+        print(f"  No standard R@/mAP metrics were returned. Raw metric keys: {sorted(metrics)}")
+        return
+
+    for task, values in groups:
+        parts = [f"{display}={values[key]:.2f}" for key, display in metric_order if key in values]
+        print(f"  {task}: " + ", ".join(parts))
+
+
+def evaluate_checkpoint_on_test_split(
+    label: str,
+    checkpoint_path: str | Path,
+    model_args: SimpleNamespace,
+    test_split_data: SplitData,
+    device: torch.device,
+    batch_size: int,
+    num_workers: int,
+) -> Dict[str, Any]:
+    model: Optional[torch.nn.Module] = None
+    try:
+        model, run_args, load_stats, checkpoint = load_model_for_checkpoint(
+            checkpoint_path,
+            model_args,
+            test_split_data,
+            device,
+        )
+        print_load_stats(label, {"load_stats": load_stats})
+        image_loader, text_loader = build_standard_eval_loaders(
+            test_split_data,
+            run_args,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            device=device,
+        )
+        evaluator = build_standard_evaluator(image_loader, text_loader, run_args)
+        metrics, best_metrics = run_standard_retrieval_eval(evaluator, model)
+        print_retrieval_metrics(label, metrics, best_metrics)
+        return {
+            "checkpoint": str(checkpoint),
+            "load_stats": load_stats,
+            "retrieval_metrics": metrics,
+            "best_retrieval_metrics": dict(best_metrics),
+        }
+    finally:
+        model = None
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -1156,9 +1339,9 @@ def print_load_stats(label: str, metadata: Mapping[str, Any]) -> None:
     print(
         f"[{label}] Loaded checkpoint tensors: "
         f"{stats.get('loaded', 0)} loaded, "
-        f"{stats.get('skipped_missing', 0)} missing/extra, "
+        f"{stats.get('skipped_missing', 0)} missing/extra keys, "
         f"{stats.get('skipped_shape', 0)} shape-mismatch, "
-        f"{stats.get('skipped_non_tensor', 0)} non-tensor skipped."
+        f"{stats.get('skipped_non_tensor', 0)} non-tensor entries skipped."
     )
 
 
@@ -1238,15 +1421,44 @@ def main() -> None:
 
     device = resolve_device(args.device)
     model_args = build_model_args(args)
-    split_data = load_split_data(args.dataset_name, dataset_root, args.split)
+    test_split_data = load_split_data(args.dataset_name, dataset_root, "test")
+    validate_split_data(test_split_data, "test")
+
+    print(
+        f"[Verification] Running standard retrieval evaluation on test split "
+        f"for {args.dataset_name}: queries={len(test_split_data.captions)} "
+        f"gallery={len(test_split_data.img_paths)}"
+    )
+    print(f"[Baseline] Verifying {baseline_checkpoint}")
+    baseline_eval_meta = evaluate_checkpoint_on_test_split(
+        "Baseline",
+        baseline_checkpoint,
+        model_args,
+        test_split_data,
+        device,
+        args.batch_size,
+        args.num_workers,
+    )
+    print(f"[Ours] Verifying {ours_checkpoint}")
+    ours_eval_meta = evaluate_checkpoint_on_test_split(
+        "Ours",
+        ours_checkpoint,
+        model_args,
+        test_split_data,
+        device,
+        args.batch_size,
+        args.num_workers,
+    )
+
+    split_data = test_split_data if args.split == "test" else load_split_data(args.dataset_name, dataset_root, args.split)
     split_data = limit_queries(split_data, args.max_queries)
     validate_split_data(split_data, args.split)
 
     print(
-        f"[Dataset] {args.dataset_name} split={args.split} "
+        f"[Ambiguity] {args.dataset_name} split={args.split} "
         f"queries={len(split_data.captions)} gallery={len(split_data.img_paths)}"
     )
-    print(f"[Baseline] Evaluating {baseline_checkpoint}")
+    print(f"[Baseline] Computing ambiguity margins from {baseline_checkpoint}")
     baseline_rows, baseline_meta = compute_margins_for_checkpoint(
         baseline_checkpoint,
         model_args,
@@ -1257,7 +1469,7 @@ def main() -> None:
     )
     print_load_stats("Baseline", baseline_meta)
 
-    print(f"[Ours] Evaluating {ours_checkpoint}")
+    print(f"[Ours] Computing ambiguity margins from {ours_checkpoint}")
     ours_rows, ours_meta = compute_margins_for_checkpoint(
         ours_checkpoint,
         model_args,
@@ -1290,6 +1502,10 @@ def main() -> None:
         "paired_delta_summary": delta_summary,
         "baseline_load_stats": baseline_meta.get("load_stats", {}),
         "ours_load_stats": ours_meta.get("load_stats", {}),
+        "test_retrieval_verification": {
+            "baseline": baseline_eval_meta,
+            "ours": ours_eval_meta,
+        },
     }
 
     paths = {
