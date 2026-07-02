@@ -3,7 +3,9 @@
 
 The script follows the loading and inference conventions used by
 scripts/plot_ambiguity_rate_compare.py, then selects confusion-guided identity
-groups from the baseline prototype space and visualizes Baseline vs IAPR in 2D.
+groups from baseline image/caption prototype spaces. It visualizes Baseline vs
+IAPR separately in image space and caption space, exporting full,
+embeddings-only, and prototypes-only variants for each selected group.
 
 Example:
 
@@ -82,22 +84,37 @@ CHECKPOINT_CONFIG_KEYS = ("args", "config", "cfg", "model_args", "train_args", "
 
 GROUP_SCORE_COLUMNS = [
     "group_rank",
-    "score",
     "identity_ids",
     "num_identities",
-    "num_samples",
-    "C_baseline",
-    "C_iapr",
-    "delta_compactness",
-    "S_baseline",
-    "S_iapr",
-    "delta_separation",
-    "M_baseline",
-    "M_iapr",
-    "delta_margin",
-    "A_baseline",
-    "A_iapr",
-    "delta_ambiguity",
+    "num_image_samples",
+    "num_caption_samples",
+    "image_C_baseline",
+    "image_C_iapr",
+    "image_delta_compactness",
+    "image_S_baseline",
+    "image_S_iapr",
+    "image_delta_separation",
+    "image_M_baseline",
+    "image_M_iapr",
+    "image_delta_margin",
+    "image_A_baseline",
+    "image_A_iapr",
+    "image_delta_ambiguity",
+    "image_score",
+    "caption_C_baseline",
+    "caption_C_iapr",
+    "caption_delta_compactness",
+    "caption_S_baseline",
+    "caption_S_iapr",
+    "caption_delta_separation",
+    "caption_M_baseline",
+    "caption_M_iapr",
+    "caption_delta_margin",
+    "caption_A_baseline",
+    "caption_A_iapr",
+    "caption_delta_ambiguity",
+    "caption_score",
+    "total_score",
     "imbalance_penalty",
 ]
 
@@ -112,11 +129,17 @@ class SplitData:
 
 
 @dataclass
-class EmbeddingBundle:
+class SpaceEmbeddingBank:
+    space: str
     features: np.ndarray
     pids: np.ndarray
-    modalities: np.ndarray
     source_indices: np.ndarray
+
+
+@dataclass
+class CheckpointEmbeddingBundle:
+    image: SpaceEmbeddingBank
+    caption: SpaceEmbeddingBank
     checkpoint: str
     load_stats: Dict[str, Any]
     inference: Dict[str, Any]
@@ -252,7 +275,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--ambiguity_eps", type=float, default=0.01, help="Margin threshold for ambiguous samples.")
-    parser.add_argument("--plot_prototypes", action="store_true", help="Plot identity prototypes as star markers.")
+    parser.add_argument(
+        "--plot_prototypes",
+        action="store_true",
+        help="Legacy flag kept for compatibility; full/prototypes-only variants always include prototypes.",
+    )
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=4096,
+        help="Chunk size for sample-to-prototype metric computations.",
+    )
     parser.add_argument(
         "--save_csv",
         action="store_true",
@@ -1320,28 +1353,27 @@ def build_embedding_bundle(
     checkpoint: Path,
     load_stats: Mapping[str, Any],
     inference: Mapping[str, Any],
-) -> EmbeddingBundle:
+) -> CheckpointEmbeddingBundle:
     if image_features.ndim != 2 or text_features.ndim != 2:
         raise ValueError("Image and text feature tensors must both be 2D.")
-    if image_features.shape[1] != text_features.shape[1]:
-        raise RuntimeError(
-            "Image and text embeddings have different dimensions "
-            f"({image_features.shape[1]} vs {text_features.shape[1]}), so a shared identity prototype space cannot be built."
-        )
 
-    features = torch.cat([image_features, text_features], dim=0).cpu().numpy().astype(np.float32)
-    features = l2_normalize(features)
-    pids = np.concatenate([image_pids.cpu().numpy(), text_pids.cpu().numpy()]).astype(np.int64)
-    modalities = np.array(["image"] * int(image_pids.numel()) + ["text"] * int(text_pids.numel()))
-    source_indices = np.concatenate([
-        np.arange(int(image_pids.numel()), dtype=np.int64),
-        np.arange(int(text_pids.numel()), dtype=np.int64),
-    ])
-    return EmbeddingBundle(
-        features=features,
-        pids=pids,
-        modalities=modalities,
-        source_indices=source_indices,
+    image_array = l2_normalize(image_features.cpu().numpy().astype(np.float32, copy=False))
+    text_array = l2_normalize(text_features.cpu().numpy().astype(np.float32, copy=False))
+    image_count = int(image_pids.numel())
+    text_count = int(text_pids.numel())
+    return CheckpointEmbeddingBundle(
+        image=SpaceEmbeddingBank(
+            space="image",
+            features=image_array,
+            pids=image_pids.cpu().numpy().astype(np.int64, copy=False),
+            source_indices=np.arange(image_count, dtype=np.int64),
+        ),
+        caption=SpaceEmbeddingBank(
+            space="caption",
+            features=text_array,
+            pids=text_pids.cpu().numpy().astype(np.int64, copy=False),
+            source_indices=np.arange(text_count, dtype=np.int64),
+        ),
         checkpoint=str(checkpoint),
         load_stats=dict(load_stats),
         inference=dict(inference),
@@ -1357,7 +1389,7 @@ def extract_embedding_bundle(
     device: torch.device,
     checkpoint: Path,
     load_stats: Mapping[str, Any],
-) -> EmbeddingBundle:
+) -> CheckpointEmbeddingBundle:
     text_global, text_pids = extract_text_features(
         model,
         split_data,
@@ -1391,6 +1423,12 @@ def extract_embedding_bundle(
         raise ValueError(f"Unsupported model_type: {model_type!r}")
     if not hasattr(model, "encode_text_grab") or not hasattr(model, "encode_image_grab"):
         raise RuntimeError("ITSELF embedding extraction requires encode_text_grab/encode_image_grab.")
+    inference = selected_itself_inference_from_args(model_args)
+    if inference is None:
+        raise RuntimeError(
+            "ITSELF embedding extraction requires the selected best ablation row from mandatory test evaluation. "
+            "The script should not continue to visualization without successful test evaluation."
+        )
 
     text_grab, grab_text_pids = extract_text_features_from_encoder(
         model,
@@ -1415,18 +1453,10 @@ def extract_embedding_bundle(
     ensure_same_pids(text_pids, grab_text_pids, "Query")
     ensure_same_pids(image_pids, grab_image_pids, "Gallery")
 
-    sim_global = text_global @ image_global.t()
-    sim_grab = text_grab @ image_grab.t()
-    inference = selected_itself_inference_from_args(model_args)
-    if inference is None:
-        print(
-            "Warning: no ITSELF ablation selection was attached; "
-            "selecting the best combo from the current split."
-        )
-        inference = select_best_itself_ablation_from_sims(sim_global, sim_grab, text_pids, image_pids)
     global_weight = float(inference["global_weight"])
     text_features = combine_itself_embeddings(text_global, text_grab, global_weight)
     image_features = combine_itself_embeddings(image_global, image_grab, global_weight)
+    del text_global, image_global, text_grab, image_grab
     return build_embedding_bundle(
         image_features,
         image_pids,
@@ -1468,7 +1498,7 @@ def load_embeddings_for_checkpoint(
     device: torch.device,
     batch_size: int,
     num_workers: int,
-) -> EmbeddingBundle:
+) -> CheckpointEmbeddingBundle:
     model: Optional[torch.nn.Module] = None
     try:
         model, run_args, load_stats, checkpoint = load_model_for_checkpoint(
@@ -1707,13 +1737,16 @@ def compute_identity_prototypes(features: np.ndarray, pids: np.ndarray) -> Proto
     return PrototypeTable(identity_ids=identity_ids, prototypes=proto_array, counts=counts, id_to_index=id_to_index)
 
 
-def ensure_bundle_alignment(baseline: EmbeddingBundle, iapr: EmbeddingBundle) -> None:
+def ensure_space_alignment(space: str, baseline: SpaceEmbeddingBank, iapr: SpaceEmbeddingBank) -> None:
     if baseline.pids.shape != iapr.pids.shape or not np.array_equal(baseline.pids, iapr.pids):
-        raise RuntimeError("Baseline and IAPR bundles do not have the same identity-label order.")
-    if baseline.modalities.shape != iapr.modalities.shape or not np.array_equal(baseline.modalities, iapr.modalities):
-        raise RuntimeError("Baseline and IAPR bundles do not have the same modality order.")
+        raise RuntimeError(f"Baseline and IAPR {space} banks do not have the same identity-label order.")
     if not np.array_equal(baseline.source_indices, iapr.source_indices):
-        raise RuntimeError("Baseline and IAPR bundles do not have the same source-index order.")
+        raise RuntimeError(f"Baseline and IAPR {space} banks do not have the same source-index order.")
+
+
+def ensure_bundle_alignment(baseline: CheckpointEmbeddingBundle, iapr: CheckpointEmbeddingBundle) -> None:
+    ensure_space_alignment("image", baseline.image, iapr.image)
+    ensure_space_alignment("caption", baseline.caption, iapr.caption)
 
 
 def compute_margins_to_prototypes(
@@ -1746,68 +1779,121 @@ def compute_margins_to_prototypes(
 
 
 def identity_ambiguity_scores(
-    bundle: EmbeddingBundle,
+    bank: SpaceEmbeddingBank,
     table: PrototypeTable,
     valid_ids: Sequence[int],
     eps: float,
+    chunk_size: int,
 ) -> Dict[int, Dict[str, float]]:
     valid_ids = [int(identity_id) for identity_id in valid_ids]
+    valid_id_array = np.array(valid_ids, dtype=np.int64)
     table_indices = [table.id_to_index[identity_id] for identity_id in valid_ids]
     valid_prototypes = table.prototypes[table_indices]
-    mask = np.isin(bundle.pids, np.array(valid_ids, dtype=np.int64))
-    valid_features = bundle.features[mask]
-    valid_pids = bundle.pids[mask]
-    margins = compute_margins_to_prototypes(valid_features, valid_pids, valid_ids, valid_prototypes)
+    accum: Dict[int, Dict[str, float]] = {
+        identity_id: {"ambiguous": 0.0, "margin_sum": 0.0, "count": 0.0}
+        for identity_id in valid_ids
+    }
+
+    for start in range(0, bank.features.shape[0], chunk_size):
+        end = min(start + chunk_size, bank.features.shape[0])
+        chunk_pids = bank.pids[start:end]
+        chunk_mask = np.isin(chunk_pids, valid_id_array)
+        if not np.any(chunk_mask):
+            continue
+        chunk_features = bank.features[start:end][chunk_mask]
+        chunk_valid_pids = chunk_pids[chunk_mask]
+        margins = compute_margins_to_prototypes(
+            chunk_features,
+            chunk_valid_pids,
+            valid_ids,
+            valid_prototypes,
+            chunk_size=chunk_size,
+        )
+        for identity_id in valid_ids:
+            id_mask = chunk_valid_pids == identity_id
+            if not np.any(id_mask):
+                continue
+            id_margins = margins[id_mask]
+            accum[identity_id]["ambiguous"] += float(np.sum(id_margins < eps))
+            accum[identity_id]["margin_sum"] += float(np.sum(id_margins))
+            accum[identity_id]["count"] += float(id_margins.shape[0])
 
     scores: Dict[int, Dict[str, float]] = {}
     for identity_id in valid_ids:
-        id_mask = valid_pids == identity_id
-        id_margins = margins[id_mask]
+        count = max(accum[identity_id]["count"], 1.0)
         scores[identity_id] = {
-            "ambiguous_rate": float(np.mean(id_margins < eps) * 100.0),
-            "mean_margin": float(np.mean(id_margins)),
-            "count": float(np.sum(id_mask)),
+            "ambiguous_rate": float(accum[identity_id]["ambiguous"] / count * 100.0),
+            "mean_margin": float(accum[identity_id]["margin_sum"] / count),
+            "count": float(accum[identity_id]["count"]),
         }
     return scores
 
 
-def build_confusion_neighbors(
-    table: PrototypeTable,
-    valid_ids: Sequence[int],
-) -> Dict[int, List[int]]:
-    valid_ids = [int(identity_id) for identity_id in valid_ids]
-    table_indices = [table.id_to_index[identity_id] for identity_id in valid_ids]
-    prototypes = table.prototypes[table_indices]
-    sim = prototypes @ prototypes.T
-    np.fill_diagonal(sim, -np.inf)
-    neighbors: Dict[int, List[int]] = {}
-    for row, identity_id in enumerate(valid_ids):
-        order = np.argsort(-sim[row])
-        neighbors[identity_id] = [valid_ids[int(index)] for index in order if np.isfinite(sim[row, int(index)])]
-    return neighbors
+def valid_identity_ids_for_spaces(
+    image_table: PrototypeTable,
+    caption_table: PrototypeTable,
+    min_samples_per_id: int,
+) -> List[int]:
+    shared_ids = sorted(set(int(pid) for pid in image_table.identity_ids) & set(int(pid) for pid in caption_table.identity_ids))
+    return [
+        identity_id
+        for identity_id in shared_ids
+        if image_table.counts.get(identity_id, 0) > 0
+        and caption_table.counts.get(identity_id, 0) > 0
+        and image_table.counts.get(identity_id, 0) + caption_table.counts.get(identity_id, 0) >= min_samples_per_id
+    ]
 
 
 def generate_candidate_groups(
-    baseline_bundle: EmbeddingBundle,
-    baseline_table: PrototypeTable,
+    baseline_bundle: CheckpointEmbeddingBundle,
+    baseline_image_table: PrototypeTable,
+    baseline_caption_table: PrototypeTable,
     group_size: int,
     min_samples_per_id: int,
     num_candidate_groups: int,
     ambiguity_eps: float,
+    chunk_size: int,
 ) -> Tuple[List[Tuple[int, ...]], Dict[int, Dict[str, float]]]:
-    valid_ids = [
-        int(identity_id)
-        for identity_id in baseline_table.identity_ids
-        if baseline_table.counts[int(identity_id)] >= min_samples_per_id
-    ]
+    valid_ids = valid_identity_ids_for_spaces(
+        baseline_image_table,
+        baseline_caption_table,
+        min_samples_per_id,
+    )
     if len(valid_ids) < group_size:
         raise RuntimeError(
             f"Only {len(valid_ids)} identities have at least {min_samples_per_id} embeddings; "
             f"cannot build groups of size {group_size}."
         )
 
-    ambiguity = identity_ambiguity_scores(baseline_bundle, baseline_table, valid_ids, ambiguity_eps)
-    neighbors = build_confusion_neighbors(baseline_table, valid_ids)
+    image_ambiguity = identity_ambiguity_scores(
+        baseline_bundle.image,
+        baseline_image_table,
+        valid_ids,
+        ambiguity_eps,
+        chunk_size,
+    )
+    caption_ambiguity = identity_ambiguity_scores(
+        baseline_bundle.caption,
+        baseline_caption_table,
+        valid_ids,
+        ambiguity_eps,
+        chunk_size,
+    )
+    ambiguity: Dict[int, Dict[str, float]] = {}
+    for identity_id in valid_ids:
+        image_stats = image_ambiguity[identity_id]
+        caption_stats = caption_ambiguity[identity_id]
+        ambiguity[identity_id] = {
+            "ambiguous_rate": 0.5 * (image_stats["ambiguous_rate"] + caption_stats["ambiguous_rate"]),
+            "mean_margin": 0.5 * (image_stats["mean_margin"] + caption_stats["mean_margin"]),
+            "count": image_stats["count"] + caption_stats["count"],
+        }
+
+    image_indices = [baseline_image_table.id_to_index[identity_id] for identity_id in valid_ids]
+    caption_indices = [baseline_caption_table.id_to_index[identity_id] for identity_id in valid_ids]
+    image_prototypes = baseline_image_table.prototypes[image_indices]
+    caption_prototypes = baseline_caption_table.prototypes[caption_indices]
+    valid_index = {identity_id: index for index, identity_id in enumerate(valid_ids)}
     seed_order = sorted(
         valid_ids,
         key=lambda identity_id: (
@@ -1821,7 +1907,15 @@ def generate_candidate_groups(
     groups: List[Tuple[int, ...]] = []
     seen = set()
     for seed in seed_order:
-        group = [seed] + neighbors[seed][: group_size - 1]
+        seed_index = valid_index[seed]
+        sims = 0.5 * (
+            image_prototypes[seed_index] @ image_prototypes.T
+            + caption_prototypes[seed_index] @ caption_prototypes.T
+        )
+        sims[seed_index] = -np.inf
+        order = np.argsort(-sims)
+        neighbors = [valid_ids[int(index)] for index in order if np.isfinite(sims[int(index)])]
+        group = [seed] + neighbors[: group_size - 1]
         if len(group) != group_size:
             continue
         key = tuple(sorted(group))
@@ -1835,33 +1929,41 @@ def generate_candidate_groups(
 
 
 def compute_group_metrics(
-    bundle: EmbeddingBundle,
+    bank: SpaceEmbeddingBank,
     table: PrototypeTable,
     group_ids: Sequence[int],
     ambiguity_eps: float,
+    chunk_size: int,
 ) -> Dict[str, float]:
     group_ids = [int(identity_id) for identity_id in group_ids]
     if len(group_ids) < 2:
         raise ValueError("Group metrics require at least two identities.")
     proto_indices = [table.id_to_index[identity_id] for identity_id in group_ids]
     prototypes = table.prototypes[proto_indices]
-    mask = np.isin(bundle.pids, np.array(group_ids, dtype=np.int64))
-    features = bundle.features[mask]
-    pids = bundle.pids[mask]
+    mask = np.isin(bank.pids, np.array(group_ids, dtype=np.int64))
+    features = bank.features[mask]
+    pids = bank.pids[mask]
     if features.size == 0:
         raise RuntimeError("Group has no samples.")
 
     id_to_col = {identity_id: index for index, identity_id in enumerate(group_ids)}
     own_cols = np.array([id_to_col[int(pid)] for pid in pids], dtype=np.int64)
-    sims = features @ prototypes.T
-    rows = np.arange(features.shape[0])
-    own = sims[rows, own_cols]
-    sims_for_neg = sims.copy()
-    sims_for_neg[rows, own_cols] = -np.inf
-    hard_neg = np.max(sims_for_neg, axis=1)
-    margins = own - hard_neg
+    own_parts: List[np.ndarray] = []
+    margin_parts: List[np.ndarray] = []
+    for start in range(0, features.shape[0], chunk_size):
+        end = min(start + chunk_size, features.shape[0])
+        sims = features[start:end] @ prototypes.T
+        local_own_cols = own_cols[start:end]
+        rows = np.arange(end - start)
+        own = sims[rows, local_own_cols]
+        sims[rows, local_own_cols] = -np.inf
+        hard_neg = np.max(sims, axis=1)
+        own_parts.append(own.astype(np.float32, copy=False))
+        margin_parts.append((own - hard_neg).astype(np.float32, copy=False))
+    own_values = np.concatenate(own_parts, axis=0)
+    margins = np.concatenate(margin_parts, axis=0)
 
-    compactness = float(np.mean(1.0 - own))
+    compactness = float(np.mean(1.0 - own_values))
     proto_sim = prototypes @ prototypes.T
     distances = 1.0 - proto_sim
     np.fill_diagonal(distances, np.inf)
@@ -1881,58 +1983,120 @@ def compute_group_metrics(
     }
 
 
-def score_candidate_groups(
-    candidate_groups: Sequence[Sequence[int]],
-    baseline_bundle: EmbeddingBundle,
-    iapr_bundle: EmbeddingBundle,
+def score_candidate_group_space(
+    space: str,
+    group_ids: Sequence[int],
+    baseline_bank: SpaceEmbeddingBank,
+    iapr_bank: SpaceEmbeddingBank,
     baseline_table: PrototypeTable,
     iapr_table: PrototypeTable,
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    baseline = compute_group_metrics(
+        baseline_bank,
+        baseline_table,
+        group_ids,
+        args.ambiguity_eps,
+        args.chunk_size,
+    )
+    iapr = compute_group_metrics(
+        iapr_bank,
+        iapr_table,
+        group_ids,
+        args.ambiguity_eps,
+        args.chunk_size,
+    )
+    delta_compactness = baseline["compactness"] - iapr["compactness"]
+    delta_separation = iapr["separation"] - baseline["separation"]
+    delta_margin = iapr["margin"] - baseline["margin"]
+    delta_ambiguity = baseline["ambiguity"] - iapr["ambiguity"]
+    imbalance_penalty = baseline["imbalance_penalty"]
+    score = (
+        args.w_margin * delta_margin
+        + args.w_ambiguity * delta_ambiguity
+        + args.w_separation * delta_separation
+        + args.w_compactness * delta_compactness
+        + args.w_baseline_ambiguity * baseline["ambiguity"]
+        - args.w_imbalance * imbalance_penalty
+    )
+    return {
+        f"{space}_C_baseline": baseline["compactness"],
+        f"{space}_C_iapr": iapr["compactness"],
+        f"{space}_delta_compactness": delta_compactness,
+        f"{space}_S_baseline": baseline["separation"],
+        f"{space}_S_iapr": iapr["separation"],
+        f"{space}_delta_separation": delta_separation,
+        f"{space}_M_baseline": baseline["margin"],
+        f"{space}_M_iapr": iapr["margin"],
+        f"{space}_delta_margin": delta_margin,
+        f"{space}_A_baseline": baseline["ambiguity"],
+        f"{space}_A_iapr": iapr["ambiguity"],
+        f"{space}_delta_ambiguity": delta_ambiguity,
+        f"{space}_score": float(score),
+        f"{space}_imbalance_penalty": imbalance_penalty,
+        f"{space}_num_samples": int(baseline["num_samples"]),
+    }
+
+
+def score_candidate_groups(
+    candidate_groups: Sequence[Sequence[int]],
+    baseline_bundle: CheckpointEmbeddingBundle,
+    iapr_bundle: CheckpointEmbeddingBundle,
+    baseline_image_table: PrototypeTable,
+    baseline_caption_table: PrototypeTable,
+    iapr_image_table: PrototypeTable,
+    iapr_caption_table: PrototypeTable,
     args: argparse.Namespace,
 ) -> List[Dict[str, Any]]:
     scored: List[Dict[str, Any]] = []
     for group in tqdm(candidate_groups, desc="Scoring candidate groups"):
         group_ids = [int(identity_id) for identity_id in group]
-        if any(identity_id not in iapr_table.id_to_index for identity_id in group_ids):
+        if any(
+            identity_id not in iapr_image_table.id_to_index
+            or identity_id not in iapr_caption_table.id_to_index
+            for identity_id in group_ids
+        ):
             continue
-        baseline = compute_group_metrics(baseline_bundle, baseline_table, group_ids, args.ambiguity_eps)
-        iapr = compute_group_metrics(iapr_bundle, iapr_table, group_ids, args.ambiguity_eps)
-        delta_compactness = baseline["compactness"] - iapr["compactness"]
-        delta_separation = iapr["separation"] - baseline["separation"]
-        delta_margin = iapr["margin"] - baseline["margin"]
-        delta_ambiguity = baseline["ambiguity"] - iapr["ambiguity"]
-        imbalance_penalty = baseline["imbalance_penalty"]
-        score = (
-            args.w_margin * delta_margin
-            + args.w_ambiguity * delta_ambiguity
-            + args.w_separation * delta_separation
-            + args.w_compactness * delta_compactness
-            + args.w_baseline_ambiguity * baseline["ambiguity"]
-            - args.w_imbalance * imbalance_penalty
+        image_row = score_candidate_group_space(
+            "image",
+            group_ids,
+            baseline_bundle.image,
+            iapr_bundle.image,
+            baseline_image_table,
+            iapr_image_table,
+            args,
         )
+        caption_row = score_candidate_group_space(
+            "caption",
+            group_ids,
+            baseline_bundle.caption,
+            iapr_bundle.caption,
+            baseline_caption_table,
+            iapr_caption_table,
+            args,
+        )
+        total_score = float(image_row["image_score"] + caption_row["caption_score"])
+        imbalance_penalty = 0.5 * (
+            float(image_row.pop("image_imbalance_penalty"))
+            + float(caption_row.pop("caption_imbalance_penalty"))
+        )
+        num_image_samples = int(image_row.pop("image_num_samples"))
+        num_caption_samples = int(caption_row.pop("caption_num_samples"))
         scored.append(
             {
-                "score": float(score),
                 "identity_ids": "|".join(str(identity_id) for identity_id in group_ids),
                 "group_ids": tuple(group_ids),
                 "num_identities": int(len(group_ids)),
-                "num_samples": int(baseline["num_samples"]),
-                "C_baseline": baseline["compactness"],
-                "C_iapr": iapr["compactness"],
-                "delta_compactness": delta_compactness,
-                "S_baseline": baseline["separation"],
-                "S_iapr": iapr["separation"],
-                "delta_separation": delta_separation,
-                "M_baseline": baseline["margin"],
-                "M_iapr": iapr["margin"],
-                "delta_margin": delta_margin,
-                "A_baseline": baseline["ambiguity"],
-                "A_iapr": iapr["ambiguity"],
-                "delta_ambiguity": delta_ambiguity,
+                "num_image_samples": num_image_samples,
+                "num_caption_samples": num_caption_samples,
+                **image_row,
+                **caption_row,
+                "total_score": total_score,
                 "imbalance_penalty": imbalance_penalty,
             }
         )
 
-    scored.sort(key=lambda row: float(row["score"]), reverse=True)
+    scored.sort(key=lambda row: float(row["total_score"]), reverse=True)
     for rank, row in enumerate(scored, start=1):
         row["group_rank"] = rank
     return scored
@@ -1990,7 +2154,7 @@ def reduce_embeddings_2d(
 
 
 def select_visual_indices(
-    bundle: EmbeddingBundle,
+    bank: SpaceEmbeddingBank,
     group_ids: Sequence[int],
     max_samples_per_id: int,
     seed: int,
@@ -1998,52 +2162,47 @@ def select_visual_indices(
     rng = np.random.default_rng(seed)
     selected: List[int] = []
     for identity_id in group_ids:
-        id_indices = np.flatnonzero(bundle.pids == int(identity_id))
+        id_indices = np.flatnonzero(bank.pids == int(identity_id))
         if len(id_indices) <= max_samples_per_id:
             selected.extend(int(index) for index in id_indices)
             continue
 
-        image_indices = id_indices[bundle.modalities[id_indices] == "image"]
-        text_indices = id_indices[bundle.modalities[id_indices] == "text"]
-        image_take = min(len(image_indices), max_samples_per_id // 2)
-        text_take = min(len(text_indices), max_samples_per_id - image_take)
-        chosen: List[int] = []
-        if image_take > 0:
-            chosen.extend(int(index) for index in rng.choice(image_indices, size=image_take, replace=False))
-        if text_take > 0:
-            chosen.extend(int(index) for index in rng.choice(text_indices, size=text_take, replace=False))
-
-        remaining_budget = max_samples_per_id - len(chosen)
-        if remaining_budget > 0:
-            remaining = np.array([index for index in id_indices if int(index) not in set(chosen)], dtype=np.int64)
-            if len(remaining) > 0:
-                fill_take = min(len(remaining), remaining_budget)
-                chosen.extend(int(index) for index in rng.choice(remaining, size=fill_take, replace=False))
+        chosen = [int(index) for index in rng.choice(id_indices, size=max_samples_per_id, replace=False)]
         selected.extend(sorted(chosen))
     return np.array(selected, dtype=np.int64)
 
 
-def prepare_reduced_coordinates(
-    bundle: EmbeddingBundle,
+def prepare_space_plot_data(
+    bank: SpaceEmbeddingBank,
     table: PrototypeTable,
     group_ids: Sequence[int],
-    sample_indices: np.ndarray,
+    max_samples_per_id: int,
     reducer: str,
     seed: int,
     pca_before_tsne: bool,
-    plot_prototypes: bool,
-) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    sample_features = bundle.features[sample_indices]
-    proto_features = None
-    all_features = sample_features
-    if plot_prototypes:
-        proto_indices = [table.id_to_index[int(identity_id)] for identity_id in group_ids]
-        proto_features = table.prototypes[proto_indices]
-        all_features = np.vstack([sample_features, proto_features])
+) -> Dict[str, Any]:
+    sample_indices = select_visual_indices(
+        bank,
+        group_ids,
+        max_samples_per_id=max_samples_per_id,
+        seed=seed,
+    )
+    sample_features = bank.features[sample_indices]
+    proto_indices = [table.id_to_index[int(identity_id)] for identity_id in group_ids]
+    proto_features = table.prototypes[proto_indices]
+    all_features = np.vstack([sample_features, proto_features])
     coords = reduce_embeddings_2d(all_features, reducer, seed, pca_before_tsne)
     sample_coords = coords[: sample_features.shape[0]]
-    proto_coords = coords[sample_features.shape[0] :] if plot_prototypes else None
-    return sample_coords, proto_coords
+    proto_coords = coords[sample_features.shape[0] :]
+    return {
+        "sample_indices": sample_indices,
+        "sample_pids": bank.pids[sample_indices],
+        "sample_source_indices": bank.source_indices[sample_indices],
+        "sample_embeddings": sample_features,
+        "sample_xy": sample_coords,
+        "prototype_embeddings": proto_features,
+        "prototype_xy": proto_coords,
+    }
 
 
 def color_palette(num_colors: int) -> List[Any]:
@@ -2056,15 +2215,18 @@ def color_palette(num_colors: int) -> List[Any]:
     return [cmap(index / max(num_colors, 1)) for index in range(num_colors)]
 
 
-def plot_group_comparison(
-    baseline_bundle: EmbeddingBundle,
-    iapr_bundle: EmbeddingBundle,
-    baseline_table: PrototypeTable,
-    iapr_table: PrototypeTable,
+def plot_space_variant(
+    baseline_data: Mapping[str, Any],
+    iapr_data: Mapping[str, Any],
+    ordered_ids: Sequence[int],
+    anonymous_labels: Mapping[int, str],
+    color_map: Mapping[int, Any],
     group_row: Mapping[str, Any],
     args: argparse.Namespace,
     output_dir: Path,
-) -> Tuple[Path, Dict[str, Any]]:
+    space: str,
+    variant: str,
+) -> Path:
     try:
         import matplotlib
 
@@ -2074,70 +2236,39 @@ def plot_group_comparison(
     except ImportError as exc:
         raise RuntimeError("matplotlib is required for visualization.") from exc
 
-    group_ids = [int(identity_id) for identity_id in group_row["group_ids"]]
-    ordered_ids = sorted(group_ids)
-    sample_indices = select_visual_indices(
-        baseline_bundle,
-        ordered_ids,
-        max_samples_per_id=int(args.max_samples_per_id),
-        seed=int(args.seed) + int(group_row["group_rank"]),
-    )
-    anonymous_labels = {identity_id: f"ID-{index + 1:02d}" for index, identity_id in enumerate(ordered_ids)}
-
-    baseline_xy, baseline_proto_xy = prepare_reduced_coordinates(
-        baseline_bundle,
-        baseline_table,
-        ordered_ids,
-        sample_indices,
-        args.reducer,
-        int(args.seed),
-        bool(args.pca_before_tsne),
-        bool(args.plot_prototypes),
-    )
-    iapr_xy, iapr_proto_xy = prepare_reduced_coordinates(
-        iapr_bundle,
-        iapr_table,
-        ordered_ids,
-        sample_indices,
-        args.reducer,
-        int(args.seed),
-        bool(args.pca_before_tsne),
-        bool(args.plot_prototypes),
-    )
-
-    colors = color_palette(len(ordered_ids))
-    color_map = {identity_id: colors[index] for index, identity_id in enumerate(ordered_ids)}
-    selected_pids = baseline_bundle.pids[sample_indices]
-    selected_modalities = baseline_bundle.modalities[sample_indices]
+    show_embeddings = variant in {"full", "embeddings_only"}
+    show_prototypes = variant in {"full", "prototypes_only"}
+    marker = "o" if space == "image" else "^"
+    space_title = "Image Space" if space == "image" else "Caption Space"
+    variant_title = variant.replace("_", " ").title()
 
     fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.5), sharex=False, sharey=False)
     subplot_specs = [
-        (axes[0], args.baseline_name, baseline_xy, baseline_proto_xy, baseline_bundle),
-        (axes[1], args.iapr_name, iapr_xy, iapr_proto_xy, iapr_bundle),
+        (axes[0], args.baseline_name, baseline_data),
+        (axes[1], args.iapr_name, iapr_data),
     ]
-    marker_for_modality = {"image": "o", "text": "^"}
 
-    for ax, title, coords, proto_coords, _bundle in subplot_specs:
+    for ax, title, data in subplot_specs:
         for identity_id in ordered_ids:
-            for modality, marker in marker_for_modality.items():
-                mask = (selected_pids == identity_id) & (selected_modalities == modality)
+            if show_embeddings:
+                mask = data["sample_pids"] == identity_id
                 if not np.any(mask):
                     continue
                 ax.scatter(
-                    coords[mask, 0],
-                    coords[mask, 1],
-                    s=30 if modality == "image" else 36,
+                    data["sample_xy"][mask, 0],
+                    data["sample_xy"][mask, 1],
+                    s=32 if space == "image" else 36,
                     marker=marker,
                     color=color_map[identity_id],
                     alpha=0.78,
                     edgecolors="black",
                     linewidths=0.25,
                 )
-        if args.plot_prototypes and proto_coords is not None:
+        if show_prototypes:
             for index, identity_id in enumerate(ordered_ids):
                 ax.scatter(
-                    proto_coords[index, 0],
-                    proto_coords[index, 1],
+                    data["prototype_xy"][index, 0],
+                    data["prototype_xy"][index, 1],
                     s=150,
                     marker="*",
                     color=color_map[identity_id],
@@ -2164,65 +2295,119 @@ def plot_group_comparison(
         )
         for identity_id in ordered_ids
     ]
-    modality_handles = [
-        Line2D([0], [0], marker="o", color="black", label="Image", linestyle="None", markersize=7),
-        Line2D([0], [0], marker="^", color="black", label="Text", linestyle="None", markersize=7),
-    ]
-    if args.plot_prototypes:
-        modality_handles.append(Line2D([0], [0], marker="*", color="black", label="Prototype", linestyle="None", markersize=10))
+    content_handles = []
+    if show_embeddings:
+        content_handles.append(
+            Line2D([0], [0], marker=marker, color="black", label=f"{space_title} embeddings", linestyle="None", markersize=7)
+        )
+    if show_prototypes:
+        content_handles.append(Line2D([0], [0], marker="*", color="black", label="Prototypes", linestyle="None", markersize=10))
 
     fig.legend(
-        handles=identity_handles + modality_handles,
+        handles=identity_handles + content_handles,
         loc="center left",
         bbox_to_anchor=(0.88, 0.5),
         frameon=False,
         fontsize=8,
     )
     fig.suptitle(
-        f"{args.dataset_name} group {group_row['group_rank']} | score={float(group_row['score']):.4f}",
+        f"{args.dataset_name} group {group_row['group_rank']} | {space_title} {variant_title} | "
+        f"total={float(group_row['total_score']):.4f}",
         fontsize=12,
     )
     fig.tight_layout(rect=[0.0, 0.0, 0.86, 0.95])
-    output_path = output_dir / f"{args.dataset_name}_identity_vis_group{int(group_row['group_rank'])}_{args.reducer}.png"
+    output_path = output_dir / f"{args.dataset_name}_group{int(group_row['group_rank'])}_{space}_{variant}_{args.reducer}.png"
     fig.savefig(output_path, dpi=int(args.dpi), bbox_inches="tight")
     plt.close(fig)
+    return output_path
 
-    coord_payload = {
-        "sample_indices": sample_indices,
-        "baseline_xy": baseline_xy,
-        "iapr_xy": iapr_xy,
-        "baseline_proto_xy": baseline_proto_xy,
-        "iapr_proto_xy": iapr_proto_xy,
-        "ordered_ids": np.array(ordered_ids, dtype=np.int64),
+
+def plot_space_variants(
+    baseline_bundle: CheckpointEmbeddingBundle,
+    iapr_bundle: CheckpointEmbeddingBundle,
+    baseline_table: PrototypeTable,
+    iapr_table: PrototypeTable,
+    group_row: Mapping[str, Any],
+    args: argparse.Namespace,
+    output_dir: Path,
+    space: str,
+    ordered_ids: Sequence[int],
+    anonymous_labels: Mapping[int, str],
+    color_map: Mapping[int, Any],
+) -> Tuple[List[Path], Dict[str, Any]]:
+    baseline_bank = baseline_bundle.image if space == "image" else baseline_bundle.caption
+    iapr_bank = iapr_bundle.image if space == "image" else iapr_bundle.caption
+    seed = int(args.seed) + int(group_row["group_rank"]) * 100 + (0 if space == "image" else 1)
+    baseline_data = prepare_space_plot_data(
+        baseline_bank,
+        baseline_table,
+        ordered_ids,
+        max_samples_per_id=int(args.max_samples_per_id),
+        reducer=args.reducer,
+        seed=seed,
+        pca_before_tsne=bool(args.pca_before_tsne),
+    )
+    iapr_data = prepare_space_plot_data(
+        iapr_bank,
+        iapr_table,
+        ordered_ids,
+        max_samples_per_id=int(args.max_samples_per_id),
+        reducer=args.reducer,
+        seed=seed,
+        pca_before_tsne=bool(args.pca_before_tsne),
+    )
+
+    paths: List[Path] = []
+    for variant in ("full", "embeddings_only", "prototypes_only"):
+        path = plot_space_variant(
+            baseline_data,
+            iapr_data,
+            ordered_ids,
+            anonymous_labels,
+            color_map,
+            group_row,
+            args,
+            output_dir,
+            space,
+            variant,
+        )
+        paths.append(path)
+
+    payload = {
+        "space": space,
+        "baseline": baseline_data,
+        "iapr": iapr_data,
+        "ordered_ids": np.array(list(ordered_ids), dtype=np.int64),
         "anonymous_labels": np.array([anonymous_labels[identity_id] for identity_id in ordered_ids]),
     }
-    return output_path, coord_payload
+    return paths, payload
 
 
 def save_group_npz(
     path: Path,
-    baseline_bundle: EmbeddingBundle,
-    iapr_bundle: EmbeddingBundle,
     coord_payload: Mapping[str, Any],
     group_row: Mapping[str, Any],
 ) -> None:
-    sample_indices = np.asarray(coord_payload["sample_indices"], dtype=np.int64)
-    baseline_proto_xy = coord_payload["baseline_proto_xy"]
-    iapr_proto_xy = coord_payload["iapr_proto_xy"]
+    baseline_data = coord_payload["baseline"]
+    iapr_data = coord_payload["iapr"]
     np.savez_compressed(
         path,
         identity_ids=np.asarray(coord_payload["ordered_ids"], dtype=np.int64),
         anonymous_labels=np.asarray(coord_payload["anonymous_labels"]),
-        selected_indices=sample_indices,
-        labels=baseline_bundle.pids[sample_indices],
-        modalities=baseline_bundle.modalities[sample_indices],
-        source_indices=baseline_bundle.source_indices[sample_indices],
-        baseline_embeddings=baseline_bundle.features[sample_indices],
-        iapr_embeddings=iapr_bundle.features[sample_indices],
-        baseline_xy=np.asarray(coord_payload["baseline_xy"], dtype=np.float32),
-        iapr_xy=np.asarray(coord_payload["iapr_xy"], dtype=np.float32),
-        baseline_prototype_xy=np.asarray(baseline_proto_xy if baseline_proto_xy is not None else np.zeros((0, 2)), dtype=np.float32),
-        iapr_prototype_xy=np.asarray(iapr_proto_xy if iapr_proto_xy is not None else np.zeros((0, 2)), dtype=np.float32),
+        space=np.array(str(coord_payload["space"])),
+        baseline_selected_indices=np.asarray(baseline_data["sample_indices"], dtype=np.int64),
+        iapr_selected_indices=np.asarray(iapr_data["sample_indices"], dtype=np.int64),
+        labels=np.asarray(baseline_data["sample_pids"], dtype=np.int64),
+        baseline_source_indices=np.asarray(baseline_data["sample_source_indices"], dtype=np.int64),
+        iapr_source_indices=np.asarray(iapr_data["sample_source_indices"], dtype=np.int64),
+        baseline_embeddings=np.asarray(baseline_data["sample_embeddings"], dtype=np.float32),
+        iapr_embeddings=np.asarray(iapr_data["sample_embeddings"], dtype=np.float32),
+        baseline_xy=np.asarray(baseline_data["sample_xy"], dtype=np.float32),
+        iapr_xy=np.asarray(iapr_data["sample_xy"], dtype=np.float32),
+        baseline_prototypes=np.asarray(baseline_data["prototype_embeddings"], dtype=np.float32),
+        iapr_prototypes=np.asarray(iapr_data["prototype_embeddings"], dtype=np.float32),
+        baseline_prototype_xy=np.asarray(baseline_data["prototype_xy"], dtype=np.float32),
+        iapr_prototype_xy=np.asarray(iapr_data["prototype_xy"], dtype=np.float32),
         metrics_json=np.array(json.dumps({key: value for key, value in group_row.items() if key != "group_ids"}, default=str)),
     )
 
@@ -2343,6 +2528,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--num_candidate_groups must be positive.")
     if args.top_groups <= 0:
         raise ValueError("--top_groups must be positive.")
+    if args.chunk_size <= 0:
+        raise ValueError("--chunk_size must be positive.")
     if not math.isfinite(float(args.ambiguity_eps)):
         raise ValueError("--ambiguity_eps must be finite.")
     if args.dpi <= 0:
@@ -2411,12 +2598,12 @@ def harmonize_eval_settings(baseline_args: SimpleNamespace, iapr_args: SimpleNam
 
 def print_selected_group(row: Mapping[str, Any]) -> None:
     print(
-        f"[Selected group {row['group_rank']}] score={float(row['score']):.6f}, "
-        f"ids={row['identity_ids']}, samples={row['num_samples']}, "
-        f"delta_margin={float(row['delta_margin']):.6f}, "
-        f"delta_ambiguity={float(row['delta_ambiguity']):.2f}, "
-        f"delta_separation={float(row['delta_separation']):.6f}, "
-        f"delta_compactness={float(row['delta_compactness']):.6f}"
+        f"[Selected group {row['group_rank']}] total_score={float(row['total_score']):.6f}, "
+        f"image_score={float(row['image_score']):.6f}, "
+        f"caption_score={float(row['caption_score']):.6f}, "
+        f"ids={row['identity_ids']}, "
+        f"image_samples={row['num_image_samples']}, "
+        f"caption_samples={row['num_caption_samples']}"
     )
 
 
@@ -2511,6 +2698,9 @@ def main() -> None:
     )
     print(f"[Output] saved test evaluation CSV: {eval_csv_path}")
     print(f"[Output] saved test evaluation JSON: {eval_json_path}")
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     validate_split_data(split_data, "test")
     print(
@@ -2541,22 +2731,32 @@ def main() -> None:
     )
     ensure_bundle_alignment(baseline_bundle, iapr_bundle)
 
-    baseline_table = compute_identity_prototypes(baseline_bundle.features, baseline_bundle.pids)
-    iapr_table = compute_identity_prototypes(iapr_bundle.features, iapr_bundle.pids)
+    baseline_image_table = compute_identity_prototypes(baseline_bundle.image.features, baseline_bundle.image.pids)
+    baseline_caption_table = compute_identity_prototypes(baseline_bundle.caption.features, baseline_bundle.caption.pids)
+    iapr_image_table = compute_identity_prototypes(iapr_bundle.image.features, iapr_bundle.image.pids)
+    iapr_caption_table = compute_identity_prototypes(iapr_bundle.caption.features, iapr_bundle.caption.pids)
     print(
-        f"[Embeddings] baseline shape={baseline_bundle.features.shape}, "
-        f"IAPR shape={iapr_bundle.features.shape}, identities={len(baseline_table.identity_ids)}"
+        f"[Embeddings] baseline image={baseline_bundle.image.features.shape}, "
+        f"baseline caption={baseline_bundle.caption.features.shape}, "
+        f"IAPR image={iapr_bundle.image.features.shape}, "
+        f"IAPR caption={iapr_bundle.caption.features.shape}"
+    )
+    print(
+        f"[Identities] image={len(baseline_image_table.identity_ids)}, "
+        f"caption={len(baseline_caption_table.identity_ids)}"
     )
     print(f"[Inference] Baseline: {baseline_bundle.inference}")
     print(f"[Inference] IAPR: {iapr_bundle.inference}")
 
     candidate_groups, ambiguity = generate_candidate_groups(
         baseline_bundle,
-        baseline_table,
+        baseline_image_table,
+        baseline_caption_table,
         group_size=int(args.group_size),
         min_samples_per_id=int(args.min_samples_per_id),
         num_candidate_groups=int(args.num_candidate_groups),
         ambiguity_eps=float(args.ambiguity_eps),
+        chunk_size=int(args.chunk_size),
     )
     if not candidate_groups:
         raise RuntimeError("No candidate groups were generated from the baseline confusion graph.")
@@ -2565,17 +2765,22 @@ def main() -> None:
         f"[Candidates] generated={len(candidate_groups)} "
         f"from valid_identities={len(ambiguity)} average_baseline_ambiguity={avg_seed_ambiguity:.2f}%"
     )
+    del ambiguity
 
     scored_groups = score_candidate_groups(
         candidate_groups,
         baseline_bundle,
         iapr_bundle,
-        baseline_table,
-        iapr_table,
+        baseline_image_table,
+        baseline_caption_table,
+        iapr_image_table,
+        iapr_caption_table,
         args,
     )
     if not scored_groups:
         raise RuntimeError("No candidate groups could be scored.")
+    del candidate_groups
+    gc.collect()
     top_groups = scored_groups[: min(int(args.top_groups), len(scored_groups))]
 
     csv_path = output_dir / f"{args.dataset_name}_identity_vis_group_scores.csv"
@@ -2584,20 +2789,38 @@ def main() -> None:
 
     for row in top_groups:
         print_selected_group(row)
-        figure_path, coord_payload = plot_group_comparison(
-            baseline_bundle,
-            iapr_bundle,
-            baseline_table,
-            iapr_table,
-            row,
-            args,
-            output_dir,
-        )
-        print(f"[Output] saved figure: {figure_path}")
-        if args.save_npz:
-            npz_path = output_dir / f"{args.dataset_name}_identity_vis_group{int(row['group_rank'])}_{args.reducer}.npz"
-            save_group_npz(npz_path, baseline_bundle, iapr_bundle, coord_payload, row)
-            print(f"[Output] saved NPZ: {npz_path}")
+        ordered_ids = sorted(int(identity_id) for identity_id in row["group_ids"])
+        anonymous_labels = {identity_id: f"ID-{index + 1:02d}" for index, identity_id in enumerate(ordered_ids)}
+        colors = color_palette(len(ordered_ids))
+        color_map = {identity_id: colors[index] for index, identity_id in enumerate(ordered_ids)}
+
+        for space, baseline_table, iapr_table in (
+            ("image", baseline_image_table, iapr_image_table),
+            ("caption", baseline_caption_table, iapr_caption_table),
+        ):
+            figure_paths, coord_payload = plot_space_variants(
+                baseline_bundle,
+                iapr_bundle,
+                baseline_table,
+                iapr_table,
+                row,
+                args,
+                output_dir,
+                space,
+                ordered_ids,
+                anonymous_labels,
+                color_map,
+            )
+            for figure_path in figure_paths:
+                print(f"[Output] saved figure: {figure_path}")
+            if args.save_npz:
+                npz_path = output_dir / f"{args.dataset_name}_group{int(row['group_rank'])}_{space}_{args.reducer}.npz"
+                save_group_npz(npz_path, coord_payload, row)
+                print(f"[Output] saved NPZ: {npz_path}")
+            del coord_payload
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
